@@ -126,7 +126,7 @@ pub fn read_binary_bytes(il2cpp: &Il2Cpp, va: u64, size: usize) -> Option<Vec<u8
 
 pub fn analyze_field_layout(
     metadata: &Metadata,
-    il2cpp: &mut Il2Cpp,
+    il2cpp: &Il2Cpp,
     _type_def: &Il2CppTypeDefinition,
     type_def_index: usize,
     field_index_in_type: usize,

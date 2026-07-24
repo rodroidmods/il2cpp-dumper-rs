@@ -150,56 +150,98 @@ impl StructGenerator {
 
     fn build_script_json(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         config: &crate::config::Config,
         static_catalog: Option<&crate::output::static_field_exporter::StaticFieldCatalog>,
     ) -> Result<String> {
+        use rayon::prelude::*;
+
         let mut script = ScriptJson::new();
         let mut addresses_set: HashSet<u64> = HashSet::new();
-        let mut method_info_cache: HashSet<u64> = HashSet::new();
 
         let struct_name_dic = Self::build_struct_name_dic(executor, metadata, il2cpp);
         let type_def_image_names = Self::build_type_def_image_names(metadata);
 
-        let image_defs = metadata.image_defs.clone();
-        for image_def in &image_defs {
-            let image_name = metadata.get_string_from_index(image_def.name_index)?;
-            let type_end = image_def.type_start as usize + image_def.type_count as usize;
+        let type_jobs: Vec<(usize, String)> = metadata
+            .image_defs
+            .iter()
+            .flat_map(|image_def| {
+                let image_name = metadata
+                    .get_string_from_index(image_def.name_index)
+                    .unwrap_or_default();
+                let type_end = image_def.type_start as usize + image_def.type_count as usize;
+                (image_def.type_start as usize..type_end)
+                    .map(|type_def_index| (type_def_index, image_name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
-            for type_def_index in image_def.type_start as usize..type_end {
-                let type_def = metadata.type_defs[type_def_index].clone();
-                let type_name = executor.get_type_def_name(&type_def, type_def_index, metadata, il2cpp, true, true);
+        let chunks: Vec<(Vec<ScriptMethod>, HashSet<u64>)> = type_jobs
+            .par_iter()
+            .map(|(type_def_index, image_name)| {
+                let mut local_exec = Il2CppExecutor::new_for_worker(executor);
+                let mut methods = Vec::new();
+                let mut local_addrs = HashSet::new();
+
+                let type_def = metadata.type_defs[*type_def_index].clone();
+                let type_name = local_exec.get_type_def_name(
+                    &type_def,
+                    *type_def_index,
+                    metadata,
+                    il2cpp,
+                    true,
+                    true,
+                );
 
                 let method_end = type_def.method_start as usize + type_def.method_count as usize;
                 for method_index in type_def.method_start as usize..method_end {
                     let method_def = metadata.method_defs[method_index].clone();
-                    let method_name_raw = metadata.get_string_from_index(method_def.name_index as i32)?;
-                    let method_pointer = il2cpp.get_method_pointer(&image_name, &method_def);
+                    let method_name_raw = metadata
+                        .get_string_from_index(method_def.name_index as i32)
+                        .unwrap_or_default();
+                    let method_pointer = il2cpp.get_method_pointer(image_name, &method_def);
 
                     if method_pointer > 0 {
                         let rva = il2cpp.get_rva(method_pointer);
-                        addresses_set.insert(rva);
+                        local_addrs.insert(rva);
                         let method_full_name = format!("{}$${}", type_name, method_name_raw);
                         let mangled_name = if config.mangle_names {
                             MangledNameBuilder::mangle_method(
-                                executor, metadata, il2cpp, &type_def, type_def_index, &method_def,
+                                &mut local_exec,
+                                metadata,
+                                il2cpp,
+                                &type_def,
+                                *type_def_index,
+                                &method_def,
                             )
                         } else {
                             method_full_name.clone()
                         };
-                        
+
                         let (dotnet_sig, group) = if config.enhanced_ida_metadata {
-                            (Some(format!("{}::{}()", type_name, method_name_raw)),
-                             Some(format!("{}/{}", image_name.trim_end_matches(".dll"), type_name.replace('.', "/"))))
+                            (
+                                Some(format!("{}::{}()", type_name, method_name_raw)),
+                                Some(format!(
+                                    "{}/{}",
+                                    image_name.trim_end_matches(".dll"),
+                                    type_name.replace('.', "/")
+                                )),
+                            )
                         } else {
                             (None, None)
                         };
                         let (signature, type_sig) = Self::build_method_signature(
-                            executor, metadata, il2cpp, &method_def, &type_def,
-                            &method_full_name, &struct_name_dic, None,
+                            &mut local_exec,
+                            metadata,
+                            il2cpp,
+                            &method_def,
+                            &type_def,
+                            &method_full_name,
+                            &struct_name_dic,
+                            None,
                         );
-                        script.script_methods.push(ScriptMethod {
+                        methods.push(ScriptMethod {
                             address: rva,
                             name: mangled_name,
                             signature,
@@ -209,42 +251,70 @@ impl StructGenerator {
                         });
                     }
 
-                    if let Some(spec_indices) = il2cpp.method_definition_method_specs.get(&method_index).cloned() {
-                        for spec_idx in &spec_indices {
-                            let spec_ptr = il2cpp.method_spec_generic_method_pointers.get(spec_idx).copied().unwrap_or(0);
-                            if spec_ptr == 0 { continue; }
+                    if let Some(spec_indices) =
+                        il2cpp.method_definition_method_specs.get(&method_index)
+                    {
+                        for spec_idx in spec_indices {
+                            let spec_ptr = il2cpp
+                                .method_spec_generic_method_pointers
+                                .get(spec_idx)
+                                .copied()
+                                .unwrap_or(0);
+                            if spec_ptr == 0 {
+                                continue;
+                            }
                             let spec_rva = il2cpp.get_rva(spec_ptr);
-                            addresses_set.insert(spec_rva);
+                            local_addrs.insert(spec_rva);
 
-                            let _ = method_info_cache.insert(spec_ptr);
+                            let (spec_type_name, spec_method_name) = local_exec
+                                .get_method_spec_name(*spec_idx, metadata, il2cpp, true);
+                            let method_full_name =
+                                format!("{}$${}", spec_type_name, spec_method_name);
 
-                            let (spec_type_name, spec_method_name) = executor.get_method_spec_name(*spec_idx, metadata, il2cpp, true);
-                            let method_full_name = format!("{}$${}", spec_type_name, spec_method_name);
-
-                            let (class_inst, method_inst) = executor.get_method_spec_generic_context(*spec_idx, il2cpp);
-                            let generic_context = Il2CppGenericContext { class_inst, method_inst };
+                            let (class_inst, method_inst) =
+                                local_exec.get_method_spec_generic_context(*spec_idx, il2cpp);
+                            let generic_context =
+                                Il2CppGenericContext { class_inst, method_inst };
 
                             let mangled_name = if config.mangle_names {
                                 MangledNameBuilder::mangle_method_spec(
-                                    executor, metadata, il2cpp, &type_def, type_def_index, &method_def, &generic_context,
+                                    &mut local_exec,
+                                    metadata,
+                                    il2cpp,
+                                    &type_def,
+                                    *type_def_index,
+                                    &method_def,
+                                    &generic_context,
                                 )
                             } else {
                                 method_full_name.clone()
                             };
-                            
+
                             let (dotnet_sig, group) = if config.enhanced_ida_metadata {
-                                (Some(format!("{}::{}()", spec_type_name, spec_method_name)),
-                                 Some(format!("{}/{}", image_name.trim_end_matches(".dll"), spec_type_name.replace('.', "/"))))
+                                (
+                                    Some(format!("{}::{}()", spec_type_name, spec_method_name)),
+                                    Some(format!(
+                                        "{}/{}",
+                                        image_name.trim_end_matches(".dll"),
+                                        spec_type_name.replace('.', "/")
+                                    )),
+                                )
                             } else {
                                 (None, None)
                             };
 
                             let (signature, type_sig) = Self::build_method_signature(
-                                executor, metadata, il2cpp, &method_def, &type_def,
-                                &method_full_name, &struct_name_dic, Some(&generic_context),
+                                &mut local_exec,
+                                metadata,
+                                il2cpp,
+                                &method_def,
+                                &type_def,
+                                &method_full_name,
+                                &struct_name_dic,
+                                Some(&generic_context),
                             );
 
-                            script.script_methods.push(ScriptMethod {
+                            methods.push(ScriptMethod {
                                 address: spec_rva,
                                 name: mangled_name,
                                 signature,
@@ -255,15 +325,38 @@ impl StructGenerator {
                         }
                     }
                 }
-            }
+
+                (methods, local_addrs)
+            })
+            .collect();
+
+        for (methods, addrs) in chunks {
+            script.script_methods.extend(methods);
+            addresses_set.extend(addrs);
         }
 
         Self::collect_all_addresses(&mut addresses_set, executor, il2cpp);
 
         if il2cpp.version >= 27.0 {
-            Self::scan_v27_metadata_usages(&mut script, executor, metadata, il2cpp, &struct_name_dic, &type_def_image_names, config);
+            Self::scan_v27_metadata_usages(
+                &mut script,
+                executor,
+                metadata,
+                il2cpp,
+                &struct_name_dic,
+                &type_def_image_names,
+                config,
+            );
         } else if il2cpp.version > 16.0 {
-            Self::add_metadata_usages(&mut script, executor, metadata, il2cpp, &struct_name_dic, &type_def_image_names, config);
+            Self::add_metadata_usages(
+                &mut script,
+                executor,
+                metadata,
+                il2cpp,
+                &struct_name_dic,
+                &type_def_image_names,
+                config,
+            );
         }
 
         if let Some(catalog) = static_catalog {
@@ -320,8 +413,8 @@ impl StructGenerator {
 
     fn build_method_signature(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         method_def: &Il2CppMethodDefinition,
         type_def: &Il2CppTypeDefinition,
         method_full_name: &str,
@@ -394,7 +487,7 @@ impl StructGenerator {
     }
 
     fn resolve_generic_type_var(
-        il2cpp: &mut Il2Cpp,
+        il2cpp: &Il2Cpp,
         inst_addr: u64,
         param_num: u32,
     ) -> Option<Il2CppType> {
@@ -406,7 +499,7 @@ impl StructGenerator {
     }
 
     pub fn resolve_generic_type_var_pub(
-        il2cpp: &mut Il2Cpp,
+        il2cpp: &Il2Cpp,
         inst_addr: u64,
         param_num: u32,
     ) -> Option<Il2CppType> {
@@ -417,8 +510,8 @@ impl StructGenerator {
         il2cpp_type: &Il2CppType,
         struct_name_dic: &HashMap<usize, String>,
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         context: Option<&Il2CppGenericContext>,
         mut hdr_ctx: Option<&mut HeaderGenCtx>,
     ) -> String {
@@ -553,8 +646,8 @@ impl StructGenerator {
 
     fn build_struct_name_dic(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
     ) -> HashMap<usize, String> {
         let mut dic = HashMap::new();
         let mut name_set: HashSet<String> = HashSet::new();
@@ -575,13 +668,13 @@ impl StructGenerator {
 
     pub fn build_struct_name_dic_pub(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
     ) -> HashMap<usize, String> {
         Self::build_struct_name_dic(executor, metadata, il2cpp)
     }
 
-    fn build_type_def_image_names(metadata: &mut Metadata) -> HashMap<usize, String> {
+    fn build_type_def_image_names(metadata: &Metadata) -> HashMap<usize, String> {
         let mut dic = HashMap::new();
         let image_defs = metadata.image_defs.clone();
         for image_def in &image_defs {
@@ -594,7 +687,7 @@ impl StructGenerator {
         dic
     }
 
-    pub fn build_type_def_image_names_pub(metadata: &mut Metadata) -> HashMap<usize, String> {
+    pub fn build_type_def_image_names_pub(metadata: &Metadata) -> HashMap<usize, String> {
         Self::build_type_def_image_names(metadata)
     }
 
@@ -719,8 +812,8 @@ impl StructGenerator {
     fn add_metadata_usages(
         script: &mut ScriptJson,
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         struct_name_dic: &HashMap<usize, String>,
         _type_def_image_names: &HashMap<usize, String>,
         config: &crate::config::Config,
@@ -864,8 +957,8 @@ impl StructGenerator {
     fn scan_v27_metadata_usages(
         script: &mut ScriptJson,
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         struct_name_dic: &HashMap<usize, String>,
         type_def_image_names: &HashMap<usize, String>,
         config: &crate::config::Config,
@@ -877,14 +970,12 @@ impl StructGenerator {
             let sec_end = std::cmp::min(sec.offset_end, il2cpp.stream.len() as u64).saturating_sub(pointer_size);
             let mut pos = sec.offset;
             while pos < sec_end {
-                il2cpp.stream.set_position(pos);
                 let metadata_value = if il2cpp.is_32bit {
-                    il2cpp.stream.read_u32().unwrap_or(0) as u64
+                    il2cpp.stream.peek_u32_at(pos).unwrap_or(0) as u64
                 } else {
-                    il2cpp.stream.read_u64().unwrap_or(0)
+                    il2cpp.stream.peek_u64_at(pos).unwrap_or(0)
                 };
-                let saved_pos = il2cpp.stream.position();
-                pos = saved_pos;
+                pos += pointer_size;
 
                 if metadata_value >= u32::MAX as u64 { continue; }
                 let encoded_token = metadata_value as u32;
@@ -1065,10 +1156,6 @@ impl StructGenerator {
                     }
                     _ => {}
                 }
-
-                if il2cpp.stream.position() != saved_pos {
-                    il2cpp.stream.set_position(saved_pos);
-                }
             }
         }
     }
@@ -1091,7 +1178,7 @@ impl StructGenerator {
     fn get_il2cpp_struct_name(
         il2cpp_type: &Il2CppType,
         struct_name_dic: &HashMap<usize, String>,
-        il2cpp: &mut Il2Cpp,
+        il2cpp: &Il2Cpp,
         context: Option<&Il2CppGenericContext>,
     ) -> String {
         let te = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);
@@ -1161,8 +1248,8 @@ impl StructGenerator {
         element_type: &Il2CppType,
         struct_name_dic: &HashMap<usize, String>,
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         context: Option<&Il2CppGenericContext>,
     ) {
         let struct_name = Self::get_il2cpp_struct_name(element_type, struct_name_dic, il2cpp, context);
@@ -1175,13 +1262,17 @@ impl StructGenerator {
         writeln!(buf, "}};").ok();
     }
 
-    fn build_string_literal_json(metadata: &mut Metadata) -> Result<String> {
-        let mut entries = Vec::new();
-        for i in 0..metadata.string_literals.len() {
-            if let Ok(value) = metadata.get_string_literal_from_index(i) {
-                entries.push(StringLiteralEntry { index: i, value });
-            }
-        }
+    fn build_string_literal_json(metadata: &Metadata) -> Result<String> {
+        use rayon::prelude::*;
+        let entries: Vec<StringLiteralEntry> = (0..metadata.string_literals.len())
+            .into_par_iter()
+            .filter_map(|i| {
+                metadata
+                    .get_string_literal_from_index(i)
+                    .ok()
+                    .map(|value| StringLiteralEntry { index: i, value })
+            })
+            .collect();
         let json = serde_json::to_string_pretty(&entries)
             .map_err(|e| crate::error::Error::Other(e.to_string()))?;
         Ok(json)
@@ -1202,12 +1293,12 @@ impl StructGenerator {
             }
         };
 
+        use rayon::prelude::*;
+
         let struct_name_dic = Self::build_struct_name_dic(executor, metadata, il2cpp);
         let type_def_image_names = Self::build_type_def_image_names(metadata);
 
-        let mut struct_info_list: Vec<StructInfo> = Vec::new();
-        let mut array_class_header = String::with_capacity(1 << 14);
-        let mut array_class_set: HashSet<String> = HashSet::new();
+        let mut array_classes: HashMap<String, String> = HashMap::new();
 
         // Build genericClassStructNameDic (C# lines 58-73)
         let mut generic_class_struct_name_dic: HashMap<u64, String> = HashMap::new();
@@ -1242,29 +1333,64 @@ impl StructGenerator {
             }
         }
 
+        // Parallel StructInfo for non-generic type definitions (map-reduce array class fragments).
         let type_defs = metadata.type_defs.clone();
-        for (type_index, type_def) in type_defs.iter().enumerate() {
-            let type_name = match struct_name_dic.get(&type_index) {
-                Some(n) => n.clone(),
-                None => continue,
-            };
+        let base_results: Vec<(Option<StructInfo>, HashMap<String, String>)> = type_defs
+            .par_iter()
+            .enumerate()
+            .map(|(type_index, type_def)| {
+                let type_name = match struct_name_dic.get(&type_index) {
+                    Some(n) => n.clone(),
+                    None => return (None, HashMap::new()),
+                };
 
-            let mut info = StructInfo {
-                type_name,
-                is_value_type: type_def.is_value_type(),
-                parent: None,
-                fields: Vec::new(),
-                static_fields: Vec::new(),
-                vtable_methods: Vec::new(),
-                rgctxs: Vec::new(),
-            };
+                let mut local_exec = Il2CppExecutor::new_for_worker(executor);
+                let mut info = StructInfo {
+                    type_name,
+                    is_value_type: type_def.is_value_type(),
+                    parent: None,
+                    fields: Vec::new(),
+                    static_fields: Vec::new(),
+                    vtable_methods: Vec::new(),
+                    rgctxs: Vec::new(),
+                };
+                let mut local_arrays = HashMap::new();
 
-            Self::add_parent(il2cpp, type_def, &struct_name_dic, metadata, &mut info);
-            Self::add_fields(executor, metadata, il2cpp, type_def, &struct_name_dic, &mut info, &mut array_class_header, &mut array_class_set, None, None);
-            Self::add_vtable_methods(metadata, il2cpp, type_def, &mut info);
-            Self::add_rgctx(executor, metadata, il2cpp, type_def, type_index, &type_def_image_names, &mut info);
+                Self::add_parent(il2cpp, type_def, &struct_name_dic, metadata, &mut info);
+                Self::add_fields(
+                    &mut local_exec,
+                    metadata,
+                    il2cpp,
+                    type_def,
+                    &struct_name_dic,
+                    &mut info,
+                    &mut local_arrays,
+                    None,
+                    None,
+                );
+                Self::add_vtable_methods(metadata, il2cpp, type_def, &mut info);
+                Self::add_rgctx(
+                    &mut local_exec,
+                    metadata,
+                    il2cpp,
+                    type_def,
+                    type_index,
+                    &type_def_image_names,
+                    &mut info,
+                );
 
-            struct_info_list.push(info);
+                (Some(info), local_arrays)
+            })
+            .collect();
+
+        let mut struct_info_list: Vec<StructInfo> = Vec::with_capacity(base_results.len());
+        for (info_opt, local_arrays) in base_results {
+            if let Some(info) = info_opt {
+                struct_info_list.push(info);
+            }
+            for (name, frag) in local_arrays {
+                array_classes.entry(name).or_insert(frag);
+            }
         }
 
         // Process generic class instances using fixpoint loop
@@ -1323,7 +1449,17 @@ impl StructGenerator {
                     method_inst: generic_class.context.method_inst,
                 };
                 Self::add_parent(il2cpp, &type_def, &struct_name_dic, metadata, &mut info);
-                Self::add_fields(executor, metadata, il2cpp, &type_def, &struct_name_dic, &mut info, &mut array_class_header, &mut array_class_set, Some(&context), Some(&mut hdr_ctx));
+                Self::add_fields(
+                    executor,
+                    metadata,
+                    il2cpp,
+                    &type_def,
+                    &struct_name_dic,
+                    &mut info,
+                    &mut array_classes,
+                    Some(&context),
+                    Some(&mut hdr_ctx),
+                );
                 Self::add_vtable_methods(metadata, il2cpp, &type_def, &mut info);
                 struct_info_list.push(info);
             }
@@ -1404,48 +1540,89 @@ impl StructGenerator {
             legacy_buf
         };
 
-        let mut method_info_header = String::with_capacity(1 << 16);
+        // Parallel MethodInfo header fragments (dedupe by generic method pointer, first wins).
+        let method_info_jobs: Vec<(usize, String)> = metadata
+            .image_defs
+            .iter()
+            .flat_map(|image_def| {
+                let image_name = metadata
+                    .get_string_from_index(image_def.name_index)
+                    .unwrap_or_default();
+                let type_end = image_def.type_start as usize + image_def.type_count as usize;
+                (image_def.type_start as usize..type_end)
+                    .map(|type_def_index| (type_def_index, image_name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
-        let mut method_info_cache: HashSet<u64> = HashSet::new();
-
-        let image_defs = metadata.image_defs.clone();
-        for image_def in &image_defs {
-            let image_name = metadata.get_string_from_index(image_def.name_index).unwrap_or_default();
-            let type_end = image_def.type_start as usize + image_def.type_count as usize;
-            for type_def_index in image_def.type_start as usize..type_end {
-                let type_def = metadata.type_defs[type_def_index].clone();
-                let struct_type_name = match struct_name_dic.get(&type_def_index) {
+        let method_info_chunks: Vec<Vec<(u64, String)>> = method_info_jobs
+            .par_iter()
+            .map(|(type_def_index, image_name)| {
+                let struct_type_name = match struct_name_dic.get(type_def_index) {
                     Some(n) => n.clone(),
-                    None => continue,
+                    None => return Vec::new(),
                 };
+                let type_def = &metadata.type_defs[*type_def_index];
+                let mut local_exec = Il2CppExecutor::new_for_worker(executor);
+                let mut local = Vec::new();
                 let method_end = type_def.method_start as usize + type_def.method_count as usize;
                 for method_index in type_def.method_start as usize..method_end {
                     let method_def = metadata.method_defs[method_index].clone();
-                    if let Some(spec_indices) = il2cpp.method_definition_method_specs.get(&method_index).cloned() {
-                        for spec_idx in &spec_indices {
-                            if *spec_idx >= il2cpp.method_specs.len() { continue; }
-                            let _method_spec = il2cpp.method_specs[*spec_idx].clone();
-                            // Note: do NOT filter on method_index_index < 0 here.
-                            // C# generates MethodInfo for ALL method specs with genericMethodPointer > 0,
-                            // including those with only class-level generics (method_index_index == -1).
-
-                            let generic_method_pointer = il2cpp.method_spec_generic_method_pointers.get(spec_idx).copied().unwrap_or(0);
-                            if generic_method_pointer == 0 { continue; }
-                            let method_info_rva = il2cpp.get_rva(generic_method_pointer);
-                            let method_info_name = format!("MethodInfo_{:X}", method_info_rva);
-
-                            let (_spec_type_name, _spec_method_name) = executor.get_method_spec_name(*spec_idx, metadata, il2cpp, true);
-
-                            let method_rgctxs = Self::collect_rgctx_info_for_method(
-                                executor, metadata, il2cpp, &image_name, &method_def,
-                            );
-                            if method_info_cache.insert(generic_method_pointer) {
-                                Self::generate_method_info(&mut method_info_header, &method_info_name, &struct_type_name, &method_rgctxs, il2cpp.version);
-                            }
+                    let Some(spec_indices) = il2cpp.method_definition_method_specs.get(&method_index) else {
+                        continue;
+                    };
+                    for spec_idx in spec_indices {
+                        if *spec_idx >= il2cpp.method_specs.len() {
+                            continue;
                         }
+                        // Note: do NOT filter on method_index_index < 0 here.
+                        // C# generates MethodInfo for ALL method specs with genericMethodPointer > 0,
+                        // including those with only class-level generics (method_index_index == -1).
+                        let generic_method_pointer = il2cpp
+                            .method_spec_generic_method_pointers
+                            .get(spec_idx)
+                            .copied()
+                            .unwrap_or(0);
+                        if generic_method_pointer == 0 {
+                            continue;
+                        }
+                        let method_info_rva = il2cpp.get_rva(generic_method_pointer);
+                        let method_info_name = format!("MethodInfo_{:X}", method_info_rva);
+                        let method_rgctxs = Self::collect_rgctx_info_for_method(
+                            &mut local_exec,
+                            metadata,
+                            il2cpp,
+                            image_name,
+                            &method_def,
+                        );
+                        let mut frag = String::new();
+                        Self::generate_method_info(
+                            &mut frag,
+                            &method_info_name,
+                            &struct_type_name,
+                            &method_rgctxs,
+                            il2cpp.version,
+                        );
+                        local.push((generic_method_pointer, frag));
                     }
                 }
+                local
+            })
+            .collect();
+
+        let mut method_info_header = String::with_capacity(1 << 16);
+        let mut method_info_cache: HashSet<u64> = HashSet::new();
+        for chunk in method_info_chunks {
+            for (ptr, frag) in chunk {
+                if method_info_cache.insert(ptr) {
+                    method_info_header.push_str(&frag);
+                }
             }
+        }
+
+        let mut array_class_header = String::with_capacity(1 << 14);
+        for frag in array_classes.values() {
+            array_class_header.push_str(frag);
         }
 
         let mut buf = String::with_capacity(1 << 20);
@@ -1480,13 +1657,12 @@ impl StructGenerator {
 
     fn add_fields(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         struct_name_dic: &HashMap<usize, String>,
         info: &mut StructInfo,
-        array_class_header: &mut String,
-        array_class_set: &mut HashSet<String>,
+        array_classes: &mut HashMap<String, String>,
         context: Option<&Il2CppGenericContext>,
         mut hdr_ctx: Option<&mut HeaderGenCtx>,
     ) {
@@ -1507,8 +1683,18 @@ impl StructGenerator {
                     if let Some(element_type) = il2cpp.types.get(field_type.datapoint as usize).cloned() {
                         let elem_struct_name = Self::get_il2cpp_struct_name(&element_type, struct_name_dic, il2cpp, context);
                         let array_struct_name = format!("{}_array", elem_struct_name);
-                        if array_class_set.insert(array_struct_name) {
-                            Self::parse_array_class_struct(array_class_header, &element_type, struct_name_dic, executor, metadata, il2cpp, context);
+                        if !array_classes.contains_key(&array_struct_name) {
+                            let mut frag = String::new();
+                            Self::parse_array_class_struct(
+                                &mut frag,
+                                &element_type,
+                                struct_name_dic,
+                                executor,
+                                metadata,
+                                il2cpp,
+                                context,
+                            );
+                            array_classes.insert(array_struct_name, frag);
                         }
                     }
                 }
@@ -1547,7 +1733,7 @@ impl StructGenerator {
         }
     }
 
-    fn is_value_type_check(il2cpp_type: &Il2CppType, metadata: &Metadata, il2cpp: &mut Il2Cpp, executor: &Il2CppExecutor, context: Option<&Il2CppGenericContext>) -> bool {
+    fn is_value_type_check(il2cpp_type: &Il2CppType, metadata: &Metadata, il2cpp: &Il2Cpp, executor: &Il2CppExecutor, context: Option<&Il2CppGenericContext>) -> bool {
         match Il2CppTypeEnum::from_u8(il2cpp_type.type_enum) {
             Some(Il2CppTypeEnum::ValueType) => {
                 let klass_idx = il2cpp_type.klass_index() as usize;
@@ -1599,7 +1785,7 @@ impl StructGenerator {
         }
     }
 
-    fn is_custom_type_check(il2cpp_type: &Il2CppType, metadata: &Metadata, il2cpp: &mut Il2Cpp, executor: &Il2CppExecutor, context: Option<&Il2CppGenericContext>) -> bool {
+    fn is_custom_type_check(il2cpp_type: &Il2CppType, metadata: &Metadata, il2cpp: &Il2Cpp, executor: &Il2CppExecutor, context: Option<&Il2CppGenericContext>) -> bool {
         match Il2CppTypeEnum::from_u8(il2cpp_type.type_enum) {
             Some(Il2CppTypeEnum::Ptr) => {
                 if il2cpp_type.datapoint != 0 {
@@ -1672,7 +1858,7 @@ impl StructGenerator {
     }
 
     fn add_vtable_methods(
-        metadata: &mut Metadata,
+        metadata: &Metadata,
         il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         info: &mut StructInfo,
@@ -1727,8 +1913,8 @@ impl StructGenerator {
 
     fn add_rgctx(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         _type_index: usize,
         type_def_image_names: &HashMap<usize, String>,
@@ -1752,8 +1938,7 @@ impl StructGenerator {
                     def.constrained_data.as_ref().map(|d| d.type_index)
                 } else if def.data_va != 0 {
                     if let Ok(offset) = il2cpp.map_vatr(def.data_va) {
-                        il2cpp.stream.set_position(offset);
-                        il2cpp.stream.read_i32().ok()
+                        il2cpp.stream.peek_i32_at(offset).ok()
                     } else { None }
                 } else { None };
                 if let Some(data_index) = rgctx_data_type_index {
@@ -1976,8 +2161,8 @@ impl StructGenerator {
 
     fn collect_rgctx_info_for_method(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         image_name: &str,
         method_def: &Il2CppMethodDefinition,
     ) -> Vec<StructRGCTXInfo> {

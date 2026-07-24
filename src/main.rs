@@ -438,40 +438,56 @@ fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
     };
     sp.finish_and_clear();
 
-    if let Some(cr) = code_reg {
-        print_address("CodeRegistration", cr);
-    }
-    if let Some(mr) = metadata_reg {
-        print_address("MetadataRegistration", mr);
-    }
+    // Print CR/MR only once — after the strategy that actually succeeds
+    // (avoid printing a section-scan candidate, then printing again from ARM32/symbol).
+    let mut found = false;
+    let mut final_cr: Option<u64> = None;
+    let mut final_mr: Option<u64> = None;
+    let mut how = "";
 
-    let mut found = elf.auto_plus_init(code_reg, metadata_reg).unwrap_or(false);
+    if elf.auto_plus_init(code_reg, metadata_reg).unwrap_or(false) {
+        found = true;
+        final_cr = code_reg;
+        final_mr = metadata_reg;
+        how = "Section scan";
+    }
 
     if !found {
         if let Ok(Some((cr, mr))) = elf.symbol_search() {
-            print_detection("Symbol table");
-            print_address("CodeRegistration", cr);
-            print_address("MetadataRegistration", mr);
-            if elf.init(cr, mr).is_ok() {
+            if elf.init_with_auto_plus(cr, mr).is_ok() {
                 found = true;
+                final_cr = Some(cr);
+                final_mr = Some(mr);
+                how = "Symbol table";
             }
         }
     }
 
     if !found {
         if let Some((cr, mr)) = elf.search_arm32(version) {
-            print_detection("ARM32 search pattern");
-            print_address("CodeRegistration", cr);
-            print_address("MetadataRegistration", mr);
-            if elf.init(cr, mr).is_ok() {
+            if elf.init_with_auto_plus(cr, mr).is_ok() {
                 found = true;
+                final_cr = Some(cr);
+                final_mr = Some(mr);
+                how = "ARM32 search pattern";
             }
         }
     }
 
     if !found {
+        // prompt_manual_addresses already prints CR/MR once
         let (cr, mr) = prompt_manual_addresses()?;
-        elf.init(cr, mr)?;
+        elf.init_with_auto_plus(cr, mr)?;
+    } else {
+        if !how.is_empty() {
+            print_detection(how);
+        }
+        if let Some(cr) = final_cr {
+            print_address("CodeRegistration", cr);
+        }
+        if let Some(mr) = final_mr {
+            print_address("MetadataRegistration", mr);
+        }
     }
 
     let elf_exports = elf.list_exported_symbols().unwrap_or_default();
@@ -565,7 +581,7 @@ fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp
     } else {
         il2cpp_dumper::disassembler::Architecture::X64
     });
-    il2cpp.init(cr_addr, mr_addr, &|addr| pe.map_vatr(addr))?;
+    il2cpp.init_with_auto_plus(cr_addr, mr_addr, &|addr| pe.map_vatr(addr), false)?;
     il2cpp.data_sections = pe.data_search_sections();
     if let Ok(exports) = pe.list_exported_symbols() {
         il2cpp.exported_symbols = exports.iter().map(|(n, _)| n.clone()).collect();
@@ -626,6 +642,7 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
     };
 
     macho.stream.version = version;
+    macho.stream.is_32bit = macho.is_32bit;
     print_info("IL2CPP Version", &version.to_string());
 
     let sp = spinner("Searching for registrations...");
@@ -702,7 +719,7 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
         let mut il2cpp = Il2Cpp::new(macho.stream.clone(), version, macho.is_32bit);
         il2cpp.va_segments = va_segments.clone();
         il2cpp.codm = resolve_codm(config, metadata);
-        il2cpp.init(cr, mr, &|addr| macho.map_vatr(addr))?;
+        il2cpp.init_with_auto_plus(cr, mr, &|addr| macho.map_vatr(addr), false)?;
         Ok(il2cpp)
     };
 
@@ -757,6 +774,8 @@ fn init_nso(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
         metadata.version
     };
 
+    nso.stream.version = version;
+    nso.stream.is_32bit = nso.is_32bit;
     print_info("IL2CPP Version", &version.to_string());
 
     let sp = spinner("Searching for registrations...");
@@ -782,7 +801,7 @@ fn init_nso(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
     let mut il2cpp = Il2Cpp::new(nso.stream.clone(), version, nso.is_32bit);
     il2cpp.va_segments = vec![VaSegment { vaddr: 0, memsz: stream_len, offset: 0 }];
     il2cpp.codm = resolve_codm(config, metadata);
-    il2cpp.init(cr_addr, mr_addr, &|addr| nso.map_vatr(addr))?;
+    il2cpp.init_with_auto_plus(cr_addr, mr_addr, &|addr| nso.map_vatr(addr), false)?;
     il2cpp.data_sections = nso.data_search_sections();
 
     if let Ok(nso_exports) = nso.list_exported_symbols() {
@@ -801,7 +820,7 @@ fn init_nso(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
 fn init_wasm(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp> {
     print_detection("WebAssembly (WASM) format");
 
-    let wasm = Wasm::new(data)?;
+    let mut wasm = Wasm::new(data)?;
 
     let version = if config.force_il2cpp_version {
         config.force_version
@@ -809,6 +828,8 @@ fn init_wasm(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2C
         metadata.version
     };
 
+    wasm.stream.version = version;
+    wasm.stream.is_32bit = wasm.is_32bit;
     print_info("IL2CPP Version", &version.to_string());
 
     let sp = spinner("Searching for registrations...");
@@ -834,7 +855,7 @@ fn init_wasm(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2C
     let mut il2cpp = Il2Cpp::new(wasm.stream.clone(), version, wasm.is_32bit);
     il2cpp.va_segments = vec![VaSegment { vaddr: 0, memsz: stream_len, offset: 0 }];
     il2cpp.codm = resolve_codm(config, metadata);
-    il2cpp.init(cr_addr, mr_addr, &|addr| wasm.map_vatr(addr))?;
+    il2cpp.init_with_auto_plus(cr_addr, mr_addr, &|addr| wasm.map_vatr(addr), true)?;
     il2cpp.data_sections = wasm.data_search_sections();
     Ok(il2cpp)
 }
@@ -953,9 +974,18 @@ fn run() -> Result<()> {
                     style(&scheme).yellow().bold()
                 );
             }
-            None => return Err(il2cpp_dumper::error::Error::Other(
-                format!("Invalid metadata file (magic: 0x{metadata_magic:08X}). Encryption not recognized.")
-            )),
+            None => {
+                let b0 = (metadata_magic & 0xFF) as u8;
+                let b1 = ((metadata_magic >> 8) & 0xFF) as u8;
+                let b2 = ((metadata_magic >> 16) & 0xFF) as u8;
+                let b3 = ((metadata_magic >> 24) & 0xFF) as u8;
+                return Err(il2cpp_dumper::error::Error::InvalidMetadata(format!(
+                    "Wrong magic 0x{metadata_magic:08X} (bytes {b0:02X} {b1:02X} {b2:02X} {b3:02X}). \
+                     Expected AF 1B B1 FA. File is likely encrypted, obfuscated, truncated, or not \
+                     global-metadata.dat. Encryption scheme not recognized by built-in decryptors. \
+                     Protected games often need a runtime memory dump of decrypted metadata."
+                )));
+            }
         }
     }
 

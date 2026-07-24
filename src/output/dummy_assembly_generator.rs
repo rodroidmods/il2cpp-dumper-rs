@@ -140,12 +140,14 @@ fn field_accessibility_from_attrs(attrs: u32) -> dotnetdll::resolved::Accessibil
 }
 
 pub fn generate_dummy_dlls(
-    executor: &mut Il2CppExecutor,
-    metadata: &mut Metadata,
-    il2cpp: &mut Il2Cpp,
+    executor: &Il2CppExecutor,
+    metadata: &Metadata,
+    il2cpp: &Il2Cpp,
     config: &Config,
     output_dir: &str,
 ) -> Result<()> {
+    use rayon::prelude::*;
+
     let dummy_dir = Path::new(output_dir).join("DummyDll");
     fs::create_dir_all(&dummy_dir)
         .map_err(|e| crate::error::Error::Other(format!("Failed to create DummyDll dir: {e}")))?;
@@ -166,7 +168,6 @@ pub fn generate_dummy_dlls(
     let types_all = il2cpp.types.clone();
     let _version = metadata.version;
 
-    let mut dll_outputs: Vec<(String, Vec<u8>)> = Vec::new();
     let mut global_type_map: HashMap<usize, (usize, usize)> = HashMap::new();
 
     for (img_idx, image_def) in image_defs.iter().enumerate() {
@@ -177,7 +178,7 @@ pub fn generate_dummy_dlls(
         }
     }
 
-    for (img_idx, image_def) in image_defs.iter().enumerate() {
+    let dll_outputs: Vec<(String, Vec<u8>)> = image_defs.par_iter().enumerate().filter_map(|(img_idx, image_def)| {
         let image_name = metadata.get_string_from_index(image_def.name_index)
             .unwrap_or_else(|_| format!("Assembly-{img_idx}.dll"));
 
@@ -860,16 +861,14 @@ pub fn generate_dummy_dlls(
         };
 
         match resolution.write(Default::default()) {
-            Ok(bytes) => {
-                dll_outputs.push((dll_name, bytes));
-            }
+            Ok(bytes) => Some((dll_name, bytes)),
             Err(e) => {
                 eprintln!("WARNING: Failed to serialize {dll_name}: {e:?}");
+                None
             }
         }
-    }
+    }).collect();
 
-    use rayon::prelude::*;
     dll_outputs.par_iter().for_each(|(name, bytes)| {
         let dll_path = dummy_dir.join(name);
         if let Err(e) = fs::write(&dll_path, bytes) {
@@ -897,7 +896,7 @@ fn make_stub_event_method<'a>(name: &str, etype: &MemberType, skip_body: bool) -
 }
 
 fn add_attribute_attributes<'a>(
-    metadata: &mut Metadata,
+    metadata: &Metadata,
     il2cpp: &Il2Cpp,
     executor: &Il2CppExecutor,
     image_index: usize,
@@ -966,9 +965,8 @@ fn add_attribute_attributes<'a>(
             return;
         }
 
-        metadata.stream.set_position(data_offset);
-        let data = match metadata.stream.read_bytes(data_size) {
-            Ok(d) => d,
+        let data = match metadata.peek_bytes_at(data_offset, data_size) {
+            Ok(d) => d.to_vec(),
             Err(_) => return,
         };
 
@@ -995,7 +993,7 @@ fn add_attribute_attributes<'a>(
 
 fn get_type_name_from_il2cpp_type(
     il2cpp_type: &Il2CppType,
-    metadata: &mut Metadata,
+    metadata: &Metadata,
     type_defs: &[Il2CppTypeDefinition],
 ) -> String {
     let te = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);

@@ -97,8 +97,8 @@ impl Il2CppExecutor {
     pub fn get_type_name(
         &mut self,
         il2cpp_type: &Il2CppType,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         add_namespace: bool,
         is_nested: bool,
     ) -> String {
@@ -115,8 +115,8 @@ impl Il2CppExecutor {
     fn get_type_name_impl(
         &mut self,
         il2cpp_type: &Il2CppType,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         add_namespace: bool,
         is_nested: bool,
     ) -> String {
@@ -160,14 +160,7 @@ impl Il2CppExecutor {
                     let gc = if let Some(cached) = self.generic_class_cache.get(&gc_addr) {
                         cached.clone()
                     } else {
-                        let gc_result = match il2cpp.map_vatr(gc_addr) {
-                            Ok(offset) => {
-                                il2cpp.stream.set_position(offset);
-                                Il2CppGenericClass::read(&mut il2cpp.stream, il2cpp.version)
-                            }
-                            Err(_) => return "object".to_string(),
-                        };
-                        match gc_result {
+                        match il2cpp.peek_generic_class(gc_addr) {
                             Ok(gc) => {
                                 self.generic_class_cache.insert(gc_addr, gc.clone());
                                 gc
@@ -221,14 +214,7 @@ impl Il2CppExecutor {
                     let gi = if let Some(cached) = self.generic_inst_cache.get(&gi_addr) {
                         cached.clone()
                     } else {
-                        let gi_result = match il2cpp.map_vatr(gi_addr) {
-                            Ok(offset) => {
-                                il2cpp.stream.set_position(offset);
-                                Il2CppGenericInst::read(&mut il2cpp.stream)
-                            }
-                            Err(_) => return result,
-                        };
-                        match gi_result {
+                        match il2cpp.peek_generic_inst(gi_addr) {
                             Ok(gi) => {
                                 self.generic_inst_cache.insert(gi_addr, gi.clone());
                                 gi
@@ -271,8 +257,8 @@ impl Il2CppExecutor {
         &mut self,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         add_namespace: bool,
         generic_parameter: bool,
     ) -> String {
@@ -320,8 +306,8 @@ impl Il2CppExecutor {
     pub fn get_generic_inst_params(
         &mut self,
         generic_inst: &Il2CppGenericInst,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
     ) -> String {
         let cache_key = (generic_inst.type_argv, generic_inst.type_argc);
         if let Some(cached) = self.generic_inst_params_cache.get(&cache_key) {
@@ -330,18 +316,14 @@ impl Il2CppExecutor {
 
         let mut param_names = Vec::new();
 
-        let argv_offset = match il2cpp.map_vatr(generic_inst.type_argv) {
-            Ok(offset) => offset,
+        let pointers = match il2cpp.peek_ptr_array(generic_inst.type_argv, generic_inst.type_argc) {
+            Ok(p) => p,
             Err(_) => {
                 let result = "<>".to_string();
                 self.generic_inst_params_cache.insert(cache_key, result.clone());
                 return result;
             }
         };
-        il2cpp.stream.set_position(argv_offset);
-        let pointers: Vec<u64> = (0..generic_inst.type_argc)
-            .filter_map(|_| il2cpp.stream.read_ptr().ok())
-            .collect();
 
         for ptr in pointers {
             if let Some(t) = il2cpp.get_il2cpp_type(ptr).cloned() {
@@ -359,7 +341,7 @@ impl Il2CppExecutor {
     pub fn get_generic_container_params(
         &mut self,
         generic_container: &Il2CppGenericContainer,
-        metadata: &mut Metadata,
+        metadata: &Metadata,
     ) -> String {
         let cache_key = (generic_container.generic_parameter_start, generic_container.type_argc);
         if let Some(cached) = self.generic_container_params_cache.get(&cache_key) {
@@ -384,8 +366,8 @@ impl Il2CppExecutor {
     pub fn get_method_spec_name(
         &mut self,
         method_spec_index: usize,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         add_namespace: bool,
     ) -> (String, String) {
         let method_spec = il2cpp.method_specs[method_spec_index].clone();
@@ -435,7 +417,7 @@ impl Il2CppExecutor {
         &self,
         type_index: i32,
         data_index: i32,
-        metadata: &mut Metadata,
+        metadata: &Metadata,
         il2cpp: &Il2Cpp,
     ) -> std::result::Result<DefaultValue, u64> {
         let pointer = metadata.get_default_value_offset(data_index);
@@ -444,72 +426,84 @@ impl Il2CppExecutor {
             None => return Err(pointer),
         };
 
-        metadata.stream.set_position(pointer);
-
+        let mut r = metadata.stream.slice_reader_at(pointer);
         let type_enum = Il2CppTypeEnum::from_u8(default_value_type.type_enum);
 
         match type_enum {
             Some(Il2CppTypeEnum::Boolean) => {
-                metadata.stream.read_bool().map(DefaultValue::Bool).map_err(|_| pointer)
+                r.read_bool().map(DefaultValue::Bool).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::U1) => {
-                metadata.stream.read_u8().map(DefaultValue::U8).map_err(|_| pointer)
+                r.read_u8().map(DefaultValue::U8).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::I1) => {
-                metadata.stream.read_i8().map(DefaultValue::I8).map_err(|_| pointer)
+                r.read_i8().map(DefaultValue::I8).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::Char) => {
-                metadata.stream.read_u16()
+                r.read_u16()
                     .map(|v| DefaultValue::Char(char::from_u32(v as u32).unwrap_or('\0')))
                     .map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::U2) => {
-                metadata.stream.read_u16().map(DefaultValue::U16).map_err(|_| pointer)
+                r.read_u16().map(DefaultValue::U16).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::I2) => {
-                metadata.stream.read_i16().map(DefaultValue::I16).map_err(|_| pointer)
+                r.read_i16().map(DefaultValue::I16).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::U4) => {
                 if il2cpp.version >= 29.0 {
-                    metadata.stream.read_compressed_u32().map(DefaultValue::U32).map_err(|_| pointer)
+                    r.read_compressed_u32().map(DefaultValue::U32).map_err(|_| pointer)
                 } else {
-                    metadata.stream.read_u32().map(DefaultValue::U32).map_err(|_| pointer)
+                    r.read_u32().map(DefaultValue::U32).map_err(|_| pointer)
                 }
             }
             Some(Il2CppTypeEnum::I4) => {
                 if il2cpp.version >= 29.0 {
-                    metadata.stream.read_compressed_i32().map(DefaultValue::I32).map_err(|_| pointer)
+                    r.read_compressed_i32().map(DefaultValue::I32).map_err(|_| pointer)
                 } else {
-                    metadata.stream.read_i32().map(DefaultValue::I32).map_err(|_| pointer)
+                    r.read_i32().map(DefaultValue::I32).map_err(|_| pointer)
                 }
             }
             Some(Il2CppTypeEnum::U8) => {
-                metadata.stream.read_u64().map(DefaultValue::U64).map_err(|_| pointer)
+                r.read_u64().map(DefaultValue::U64).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::I8) => {
-                metadata.stream.read_i64().map(DefaultValue::I64).map_err(|_| pointer)
+                r.read_i64().map(DefaultValue::I64).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::R4) => {
-                metadata.stream.read_f32().map(DefaultValue::F32).map_err(|_| pointer)
+                r.read_f32().map(DefaultValue::F32).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::R8) => {
-                metadata.stream.read_f64().map(DefaultValue::F64).map_err(|_| pointer)
+                r.read_f64().map(DefaultValue::F64).map_err(|_| pointer)
             }
             Some(Il2CppTypeEnum::String) => {
                 if il2cpp.version >= 29.0 {
-                    let length = metadata.stream.read_compressed_i32().map_err(|_| pointer)?;
+                    let length = r.read_compressed_i32().map_err(|_| pointer)?;
                     if length == -1 {
                         return Ok(DefaultValue::Null);
                     }
-                    let bytes = metadata.stream.read_bytes(length as usize).map_err(|_| pointer)?;
-                    Ok(DefaultValue::String(String::from_utf8_lossy(&bytes).to_string()))
+                    let bytes = r.read_bytes(length as usize).map_err(|_| pointer)?;
+                    Ok(DefaultValue::String(String::from_utf8_lossy(bytes).to_string()))
                 } else {
-                    let length = metadata.stream.read_i32().map_err(|_| pointer)?;
-                    let s = metadata.stream.read_string(length as usize).map_err(|_| pointer)?;
+                    let length = r.read_i32().map_err(|_| pointer)?;
+                    let s = r.read_string(length as usize).map_err(|_| pointer)?;
                     Ok(DefaultValue::String(s))
                 }
             }
             _ => Err(pointer),
+        }
+    }
+
+    pub fn new_for_worker(base: &Il2CppExecutor) -> Self {
+        Self {
+            custom_attribute_generators: base.custom_attribute_generators.clone(),
+            type_name_cache: HashMap::new(),
+            type_def_name_cache: HashMap::new(),
+            generic_class_cache: HashMap::new(),
+            generic_inst_cache: HashMap::new(),
+            generic_inst_params_cache: HashMap::new(),
+            generic_container_params_cache: HashMap::new(),
+            modifier_cache: HashMap::new(),
         }
     }
 

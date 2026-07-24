@@ -415,6 +415,17 @@ impl Elf {
             let bloom_word_size = if self.is_32bit { 4u64 } else { 8 };
             let buckets_address = addr + 16 + (bloom_word_size * bloom_size as u64);
 
+            let max_buckets = self.stream.remaining_from(buckets_address) / 4;
+            if nbuckets as u64 > max_buckets || nbuckets as u64 > crate::io::MAX_BINARY_ARRAY_ELEMS as u64 {
+                return Err(Error::InvalidArraySize {
+                    count: nbuckets as u64,
+                    elem_size: 4,
+                    context: format!(
+                        "DT_GNU_HASH nbuckets invalid (max from remaining={max_buckets})"
+                    ),
+                });
+            }
+
             self.stream.set_position(buckets_address);
             let mut buckets = Vec::with_capacity(nbuckets as usize);
             for _ in 0..nbuckets {
@@ -775,6 +786,17 @@ impl Elf {
         if addr == 0 || count == 0 {
             return Ok(Vec::new());
         }
+        let elem = self.stream.pointer_size() as u64;
+        let max_by_file = self.stream.len() / elem.max(1);
+        if count > max_by_file || count > crate::io::MAX_BINARY_ARRAY_ELEMS as u64 {
+            return Err(Error::InvalidArraySize {
+                count,
+                elem_size: elem as usize,
+                context: format!(
+                    "map_vatr_array: count looks invalid (addr=0x{addr:x}, max_by_file={max_by_file})"
+                ),
+            });
+        }
         let offset = self.map_vatr(addr)?;
         self.stream.read_ptr_array(offset, count as usize)
     }
@@ -782,6 +804,16 @@ impl Elf {
     pub fn map_vatr_u32_array(&mut self, addr: u64, count: u64) -> Result<Vec<u32>> {
         if addr == 0 || count == 0 {
             return Ok(Vec::new());
+        }
+        let max_by_file = self.stream.len() / 4;
+        if count > max_by_file || count > crate::io::MAX_BINARY_ARRAY_ELEMS as u64 {
+            return Err(Error::InvalidArraySize {
+                count,
+                elem_size: 4,
+                context: format!(
+                    "map_vatr_u32_array: count looks invalid (addr=0x{addr:x}, max_by_file={max_by_file})"
+                ),
+            });
         }
         let offset = self.map_vatr(addr)?;
         self.stream.read_u32_array(offset, count as usize)
@@ -1220,22 +1252,35 @@ impl Elf {
         if mr.type_definitions_sizes > 0 && mr.type_definitions_sizes_count > 0 {
             if self.codm_diag {
                 if let Ok(sizes_offset) = self.map_vatr(mr.type_definitions_sizes) {
-                    self.stream.set_position(sizes_offset);
-                    self.type_definition_sizes.clear();
-                    self.type_definition_sizes.reserve(mr.type_definitions_sizes_count as usize);
-                    for _ in 0..mr.type_definitions_sizes_count {
-                        match Il2CppTypeDefinitionSizes::read(&mut self.stream) {
-                            Ok(s) => self.type_definition_sizes.push(s),
-                            Err(_) => break,
+                    if let Ok(n) = crate::io::checked_array_len(
+                        mr.type_definitions_sizes_count,
+                        std::mem::size_of::<Il2CppTypeDefinitionSizes>().max(1),
+                        Some(self.stream.remaining_from(sizes_offset)),
+                        "type_definition_sizes(codm)",
+                    ) {
+                        self.stream.set_position(sizes_offset);
+                        self.type_definition_sizes.clear();
+                        self.type_definition_sizes.reserve(n);
+                        for _ in 0..n {
+                            match Il2CppTypeDefinitionSizes::read(&mut self.stream) {
+                                Ok(s) => self.type_definition_sizes.push(s),
+                                Err(_) => break,
+                            }
                         }
                     }
                 }
             } else {
                 let sizes_offset = self.map_vatr(mr.type_definitions_sizes)?;
+                let n = crate::io::checked_array_len(
+                    mr.type_definitions_sizes_count,
+                    std::mem::size_of::<Il2CppTypeDefinitionSizes>().max(1),
+                    Some(self.stream.remaining_from(sizes_offset)),
+                    "type_definition_sizes",
+                )?;
                 self.stream.set_position(sizes_offset);
                 self.type_definition_sizes.clear();
-                self.type_definition_sizes.reserve(mr.type_definitions_sizes_count as usize);
-                for _ in 0..mr.type_definitions_sizes_count {
+                self.type_definition_sizes.reserve(n);
+                for _ in 0..n {
                     self.type_definition_sizes.push(Il2CppTypeDefinitionSizes::read(&mut self.stream)?);
                 }
             }
@@ -1362,8 +1407,18 @@ impl Elf {
             let module_name = self.stream.read_string_to_null_at(name_offset)?;
 
             let method_ptrs = if module.method_pointer_count > 0 && module.method_pointers > 0 {
-                self.map_vatr_array(module.method_pointers, module.method_pointer_count as u64)
-                    .unwrap_or_else(|_| vec![0; module.method_pointer_count as usize])
+                match self.map_vatr_array(module.method_pointers, module.method_pointer_count as u64) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let n = module.method_pointer_count as u64;
+                        let max = self.stream.len() / self.stream.pointer_size() as u64;
+                        if n > 0 && n <= max && n <= crate::io::MAX_BINARY_ARRAY_ELEMS as u64 {
+                            vec![0u64; n as usize]
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -1453,43 +1508,58 @@ impl Elf {
     }
 
     pub fn auto_plus_init(&mut self, code_reg: Option<u64>, metadata_reg: Option<u64>) -> Result<bool> {
-        let mut code_registration = code_reg.unwrap_or(0);
+        let code_registration = code_reg.unwrap_or(0);
         let metadata_registration = metadata_reg.unwrap_or(0);
-        let version = self.stream.version;
-
-        if code_registration != 0 && version >= 24.2 {
-            let cr_offset = self.map_vatr(code_registration)?;
-            self.stream.set_position(cr_offset);
-            let cr = Il2CppCodeRegistration::read(&mut self.stream, version)?;
-            let limit = 0x50000u64;
-            let ptr_size = self.stream.pointer_size() as u64;
-
-            if version == 31.0 && cr.generic_method_pointers_count > limit {
-                code_registration -= ptr_size * 2;
-            } else if version == 29.0 && cr.generic_method_pointers_count > limit {
-                self.stream.version = 29.1;
-                code_registration -= ptr_size * 2;
-            } else if version == 27.0 && cr.reverse_pinvoke_wrapper_count > limit {
-                self.stream.version = 27.1;
-                code_registration -= ptr_size;
-            } else if version == 24.4 {
-                code_registration -= ptr_size * 2;
-                if cr.reverse_pinvoke_wrapper_count > limit {
-                    self.stream.version = 24.5;
-                    code_registration -= ptr_size;
-                }
-            } else if version == 24.2 && cr.interop_data_count == 0 {
-                self.stream.version = 24.3;
-                code_registration -= ptr_size * 2;
+        if code_registration == 0 || metadata_registration == 0 {
+            return Ok(false);
+        }
+        match self.init_with_auto_plus(code_registration, metadata_registration) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                eprintln!(
+                    "[WARN] Registration init failed at CR=0x{code_registration:x} MR=0x{metadata_registration:x}: {e}"
+                );
+                Ok(false)
             }
         }
+    }
 
-        if code_registration != 0 && metadata_registration != 0 {
-            self.init(code_registration, metadata_registration)?;
-            return Ok(true);
+    pub fn init_with_auto_plus(
+        &mut self,
+        code_registration: u64,
+        metadata_registration: u64,
+    ) -> Result<()> {
+        let orig_version = self.stream.version;
+        let limit = crate::il2cpp::auto_plus_count_limit(false);
+        let cr = if code_registration != 0 && self.stream.version >= 24.2 {
+            match self.map_vatr(code_registration) {
+                Ok(cr_offset) => {
+                    self.stream.set_position(cr_offset);
+                    match Il2CppCodeRegistration::read(&mut self.stream, orig_version) {
+                        Ok(cr_struct) => crate::il2cpp::apply_auto_plus_heuristics(
+                            &mut self.stream,
+                            code_registration,
+                            &cr_struct,
+                            limit,
+                        ),
+                        Err(_) => code_registration,
+                    }
+                }
+                Err(_) => code_registration,
+            }
+        } else {
+            code_registration
+        };
+
+        match self.init(cr, metadata_registration) {
+            Ok(()) => Ok(()),
+            Err(e) if orig_version == 31.0 && self.stream.version != 29.0 => {
+                self.stream.version = 29.0;
+                eprintln!("Info: Retry init with il2cpp version 29 ({e})");
+                self.init(cr, metadata_registration)
+            }
+            Err(e) => Err(e),
         }
-
-        Ok(false)
     }
 
     /// ARM32 pattern search from __mod_init_func / executable segments.

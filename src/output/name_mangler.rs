@@ -80,8 +80,8 @@ impl MangledNameBuilder {
         &mut self,
         td: &Il2CppTypeDefinition,
         _td_index: usize,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         executor: &mut Il2CppExecutor,
         generic_inst: Option<&Il2CppGenericInst>,
     ) {
@@ -134,8 +134,8 @@ impl MangledNameBuilder {
         &mut self,
         td: &Il2CppTypeDefinition,
         td_index: usize,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         executor: &mut Il2CppExecutor,
         generic_inst: Option<&Il2CppGenericInst>,
     ) {
@@ -177,8 +177,8 @@ impl MangledNameBuilder {
     fn write_generic_inst(
         &mut self,
         inst: &Il2CppGenericInst,
-        il2cpp: &mut Il2Cpp,
-        metadata: &mut Metadata,
+        il2cpp: &Il2Cpp,
+        metadata: &Metadata,
         executor: &mut Il2CppExecutor,
     ) {
         self.begin_generics();
@@ -197,8 +197,8 @@ impl MangledNameBuilder {
     fn write_type(
         &mut self,
         il2cpp_type: &Il2CppType,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         executor: &mut Il2CppExecutor,
     ) {
         let te = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);
@@ -321,8 +321,8 @@ impl MangledNameBuilder {
 
     pub fn mangle_method(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
         method_def: &Il2CppMethodDefinition,
@@ -334,8 +334,8 @@ impl MangledNameBuilder {
 
     pub fn mangle_method_info(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
         method_def: &Il2CppMethodDefinition,
@@ -347,8 +347,8 @@ impl MangledNameBuilder {
 
     pub fn mangle_method_spec(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
         method_def: &Il2CppMethodDefinition,
@@ -362,8 +362,8 @@ impl MangledNameBuilder {
 
     pub fn mangle_type_info(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
     ) -> String {
@@ -372,8 +372,8 @@ impl MangledNameBuilder {
 
     pub fn mangle_type_ref(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
     ) -> String {
@@ -382,8 +382,8 @@ impl MangledNameBuilder {
 
     fn mangle_data(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
         prefix: &str,
@@ -410,8 +410,8 @@ impl MangledNameBuilder {
 
     fn mangle_method_inner(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
         method_def: &Il2CppMethodDefinition,

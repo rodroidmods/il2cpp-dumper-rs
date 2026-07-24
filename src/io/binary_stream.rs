@@ -2,6 +2,246 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use byteorder::{LittleEndian, BigEndian, ReadBytesExt, WriteBytesExt};
 use crate::error::{Error, Result};
 
+pub const MAX_BINARY_ARRAY_ELEMS: usize = 50_000_000;
+
+pub fn checked_array_len(
+    count: u64,
+    elem_size: usize,
+    available_bytes: Option<u64>,
+    context: &str,
+) -> Result<usize> {
+    if count == 0 {
+        return Ok(0);
+    }
+    if elem_size == 0 {
+        return Err(Error::InvalidArraySize {
+            count,
+            elem_size,
+            context: format!("{context}: element size is 0"),
+        });
+    }
+
+    let count_usize = usize::try_from(count).map_err(|_| Error::InvalidArraySize {
+        count,
+        elem_size,
+        context: format!("{context}: count does not fit usize"),
+    })?;
+
+    if count_usize > MAX_BINARY_ARRAY_ELEMS {
+        return Err(Error::InvalidArraySize {
+            count,
+            elem_size,
+            context: format!(
+                "{context}: count exceeds MAX_BINARY_ARRAY_ELEMS ({MAX_BINARY_ARRAY_ELEMS})"
+            ),
+        });
+    }
+
+    let max_for_elem = (isize::MAX as usize) / elem_size;
+    if count_usize > max_for_elem {
+        return Err(Error::InvalidArraySize {
+            count,
+            elem_size,
+            context: format!("{context}: would overflow Vec capacity (capacity overflow)"),
+        });
+    }
+
+    let needed = (count_usize as u64)
+        .checked_mul(elem_size as u64)
+        .ok_or_else(|| Error::InvalidArraySize {
+            count,
+            elem_size,
+            context: format!("{context}: size multiplication overflow"),
+        })?;
+
+    if let Some(avail) = available_bytes {
+        if needed > avail {
+            return Err(Error::InvalidArraySize {
+                count,
+                elem_size,
+                context: format!(
+                    "{context}: needs {needed} bytes but only {avail} available"
+                ),
+            });
+        }
+    }
+
+    Ok(count_usize)
+}
+
+pub fn signed_size_to_u64(size: i32, context: &str) -> Result<u64> {
+    if size < 0 {
+        return Err(Error::InvalidMetadata(format!(
+            "{context}: negative size field ({size})"
+        )));
+    }
+    Ok(size as u64)
+}
+
+#[derive(Clone, Copy)]
+pub struct SliceReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    pub is_32bit: bool,
+    pub is_big_endian: bool,
+}
+
+impl<'a> SliceReader<'a> {
+    pub fn new(data: &'a [u8], offset: u64, is_32bit: bool, is_big_endian: bool) -> Self {
+        Self {
+            data,
+            pos: offset as usize,
+            is_32bit,
+            is_big_endian,
+        }
+    }
+
+    pub fn position(&self) -> u64 {
+        self.pos as u64
+    }
+
+    pub fn set_position(&mut self, pos: u64) {
+        self.pos = pos as usize;
+    }
+
+    fn need(&self, n: usize) -> Result<()> {
+        if self.pos.checked_add(n).map(|e| e > self.data.len()).unwrap_or(true) {
+            Err(Error::OutOfBounds {
+                offset: self.pos as u64,
+                size: n,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn read_u8(&mut self) -> Result<u8> {
+        self.need(1)?;
+        let v = self.data[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+
+    pub fn read_i8(&mut self) -> Result<i8> {
+        Ok(self.read_u8()? as i8)
+    }
+
+    pub fn read_bool(&mut self) -> Result<bool> {
+        Ok(self.read_u8()? != 0)
+    }
+
+    pub fn read_u16(&mut self) -> Result<u16> {
+        self.need(2)?;
+        let b = [self.data[self.pos], self.data[self.pos + 1]];
+        self.pos += 2;
+        Ok(if self.is_big_endian {
+            u16::from_be_bytes(b)
+        } else {
+            u16::from_le_bytes(b)
+        })
+    }
+
+    pub fn read_i16(&mut self) -> Result<i16> {
+        Ok(self.read_u16()? as i16)
+    }
+
+    pub fn read_u32(&mut self) -> Result<u32> {
+        self.need(4)?;
+        let b = [
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ];
+        self.pos += 4;
+        Ok(if self.is_big_endian {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        })
+    }
+
+    pub fn read_i32(&mut self) -> Result<i32> {
+        Ok(self.read_u32()? as i32)
+    }
+
+    pub fn read_u64(&mut self) -> Result<u64> {
+        self.need(8)?;
+        let b = [
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+            self.data[self.pos + 4],
+            self.data[self.pos + 5],
+            self.data[self.pos + 6],
+            self.data[self.pos + 7],
+        ];
+        self.pos += 8;
+        Ok(if self.is_big_endian {
+            u64::from_be_bytes(b)
+        } else {
+            u64::from_le_bytes(b)
+        })
+    }
+
+    pub fn read_i64(&mut self) -> Result<i64> {
+        Ok(self.read_u64()? as i64)
+    }
+
+    pub fn read_f32(&mut self) -> Result<f32> {
+        Ok(f32::from_bits(self.read_u32()?))
+    }
+
+    pub fn read_f64(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(self.read_u64()?))
+    }
+
+    pub fn read_ptr(&mut self) -> Result<u64> {
+        if self.is_32bit {
+            self.read_u32().map(u64::from)
+        } else {
+            self.read_u64()
+        }
+    }
+
+    pub fn read_bytes(&mut self, count: usize) -> Result<&'a [u8]> {
+        self.need(count)?;
+        let start = self.pos;
+        self.pos += count;
+        Ok(&self.data[start..self.pos])
+    }
+
+    pub fn read_string(&mut self, length: usize) -> Result<String> {
+        let bytes = self.read_bytes(length)?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    pub fn read_compressed_u32(&mut self) -> Result<u32> {
+        let b = self.read_u8()? as u32;
+        if (b & 0x80) == 0 {
+            Ok(b)
+        } else if (b & 0x40) == 0 {
+            let b2 = self.read_u8()? as u32;
+            Ok(((b & 0x3F) << 8) | b2)
+        } else {
+            let b2 = self.read_u8()? as u32;
+            let b3 = self.read_u8()? as u32;
+            let b4 = self.read_u8()? as u32;
+            Ok(((b & 0x1F) << 24) | (b2 << 16) | (b3 << 8) | b4)
+        }
+    }
+
+    pub fn read_compressed_i32(&mut self) -> Result<i32> {
+        let encoded = self.read_compressed_u32()?;
+        if encoded & 1 != 0 {
+            Ok(-((encoded >> 1) as i32) - 1)
+        } else {
+            Ok((encoded >> 1) as i32)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BinaryStream {
     cursor: Cursor<Vec<u8>>,
@@ -51,22 +291,75 @@ impl BinaryStream {
     }
 
     pub fn read_bytes(&mut self, count: usize) -> Result<Vec<u8>> {
+        let pos = self.cursor.position();
+        let remaining = self.len().saturating_sub(pos);
+        checked_array_len(count as u64, 1, Some(remaining), "read_bytes")?;
         let mut buf = vec![0u8; count];
         self.cursor
             .read_exact(&mut buf)
             .map_err(|_| Error::OutOfBounds {
-                offset: self.cursor.position(),
+                offset: pos,
                 size: count,
             })?;
         Ok(buf)
     }
 
+    pub fn remaining_from(&self, offset: u64) -> u64 {
+        self.len().saturating_sub(offset)
+    }
+
+    pub fn slice_reader_at(&self, offset: u64) -> SliceReader<'_> {
+        SliceReader::new(self.data(), offset, self.is_32bit, self.is_big_endian)
+    }
+
+    pub fn peek_string_to_null_at(&self, offset: u64) -> Result<String> {
+        let data = self.data();
+        let mut i = offset as usize;
+        if i >= data.len() {
+            return Err(Error::OutOfBounds { offset, size: 1 });
+        }
+        let start = i;
+        while i < data.len() && data[i] != 0 {
+            i += 1;
+        }
+        Ok(String::from_utf8_lossy(&data[start..i]).into_owned())
+    }
+
+    pub fn peek_bytes_at(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        let s = offset as usize;
+        let data = self.data();
+        if s.checked_add(len).map(|e| e > data.len()).unwrap_or(true) {
+            return Err(Error::OutOfBounds { offset, size: len });
+        }
+        Ok(&data[s..s + len])
+    }
+
+    pub fn peek_i32_at(&self, offset: u64) -> Result<i32> {
+        Ok(self.peek_u32_at(offset)? as i32)
+    }
+
+    fn map_read_err(e: std::io::Error, pos: u64, size: usize) -> Error {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof
+            || e.to_string().contains("fill whole buffer")
+        {
+            Error::OutOfBounds { offset: pos, size }
+        } else {
+            Error::Io(e)
+        }
+    }
+
     pub fn read_u8(&mut self) -> Result<u8> {
-        self.cursor.read_u8().map_err(Error::Io)
+        let pos = self.cursor.position();
+        self.cursor
+            .read_u8()
+            .map_err(|e| Self::map_read_err(e, pos, 1))
     }
 
     pub fn read_i8(&mut self) -> Result<i8> {
-        self.cursor.read_i8().map_err(Error::Io)
+        let pos = self.cursor.position();
+        self.cursor
+            .read_i8()
+            .map_err(|e| Self::map_read_err(e, pos, 1))
     }
 
     pub fn read_bool(&mut self) -> Result<bool> {
@@ -74,66 +367,106 @@ impl BinaryStream {
     }
 
     pub fn read_u16(&mut self) -> Result<u16> {
+        let pos = self.cursor.position();
         if self.is_big_endian {
-            self.cursor.read_u16::<BigEndian>().map_err(Error::Io)
+            self.cursor
+                .read_u16::<BigEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 2))
         } else {
-            self.cursor.read_u16::<LittleEndian>().map_err(Error::Io)
+            self.cursor
+                .read_u16::<LittleEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 2))
         }
     }
 
     pub fn read_i16(&mut self) -> Result<i16> {
+        let pos = self.cursor.position();
         if self.is_big_endian {
-            self.cursor.read_i16::<BigEndian>().map_err(Error::Io)
+            self.cursor
+                .read_i16::<BigEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 2))
         } else {
-            self.cursor.read_i16::<LittleEndian>().map_err(Error::Io)
+            self.cursor
+                .read_i16::<LittleEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 2))
         }
     }
 
     pub fn read_u32(&mut self) -> Result<u32> {
+        let pos = self.cursor.position();
         if self.is_big_endian {
-            self.cursor.read_u32::<BigEndian>().map_err(Error::Io)
+            self.cursor
+                .read_u32::<BigEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 4))
         } else {
-            self.cursor.read_u32::<LittleEndian>().map_err(Error::Io)
+            self.cursor
+                .read_u32::<LittleEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 4))
         }
     }
 
     pub fn read_i32(&mut self) -> Result<i32> {
+        let pos = self.cursor.position();
         if self.is_big_endian {
-            self.cursor.read_i32::<BigEndian>().map_err(Error::Io)
+            self.cursor
+                .read_i32::<BigEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 4))
         } else {
-            self.cursor.read_i32::<LittleEndian>().map_err(Error::Io)
+            self.cursor
+                .read_i32::<LittleEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 4))
         }
     }
 
     pub fn read_u64(&mut self) -> Result<u64> {
+        let pos = self.cursor.position();
         if self.is_big_endian {
-            self.cursor.read_u64::<BigEndian>().map_err(Error::Io)
+            self.cursor
+                .read_u64::<BigEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 8))
         } else {
-            self.cursor.read_u64::<LittleEndian>().map_err(Error::Io)
+            self.cursor
+                .read_u64::<LittleEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 8))
         }
     }
 
     pub fn read_i64(&mut self) -> Result<i64> {
+        let pos = self.cursor.position();
         if self.is_big_endian {
-            self.cursor.read_i64::<BigEndian>().map_err(Error::Io)
+            self.cursor
+                .read_i64::<BigEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 8))
         } else {
-            self.cursor.read_i64::<LittleEndian>().map_err(Error::Io)
+            self.cursor
+                .read_i64::<LittleEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 8))
         }
     }
 
     pub fn read_f32(&mut self) -> Result<f32> {
+        let pos = self.cursor.position();
         if self.is_big_endian {
-            self.cursor.read_f32::<BigEndian>().map_err(Error::Io)
+            self.cursor
+                .read_f32::<BigEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 4))
         } else {
-            self.cursor.read_f32::<LittleEndian>().map_err(Error::Io)
+            self.cursor
+                .read_f32::<LittleEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 4))
         }
     }
 
     pub fn read_f64(&mut self) -> Result<f64> {
+        let pos = self.cursor.position();
         if self.is_big_endian {
-            self.cursor.read_f64::<BigEndian>().map_err(Error::Io)
+            self.cursor
+                .read_f64::<BigEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 8))
         } else {
-            self.cursor.read_f64::<LittleEndian>().map_err(Error::Io)
+            self.cursor
+                .read_f64::<LittleEndian>()
+                .map_err(|e| Self::map_read_err(e, pos, 8))
         }
     }
 
@@ -220,6 +553,12 @@ impl BinaryStream {
         if count == 0 {
             return Ok(Vec::new());
         }
+        let count = checked_array_len(
+            count as u64,
+            4,
+            Some(self.remaining_from(offset)),
+            "read_u32_array",
+        )?;
         self.set_position(offset);
         let mut result = Vec::with_capacity(count);
         for _ in 0..count {
@@ -232,6 +571,12 @@ impl BinaryStream {
         if count == 0 {
             return Ok(Vec::new());
         }
+        let count = checked_array_len(
+            count as u64,
+            4,
+            Some(self.remaining_from(offset)),
+            "read_i32_array",
+        )?;
         self.set_position(offset);
         let mut result = Vec::with_capacity(count);
         for _ in 0..count {
@@ -244,6 +589,12 @@ impl BinaryStream {
         if count == 0 {
             return Ok(Vec::new());
         }
+        let count = checked_array_len(
+            count as u64,
+            8,
+            Some(self.remaining_from(offset)),
+            "read_u64_array",
+        )?;
         self.set_position(offset);
         let mut result = Vec::with_capacity(count);
         for _ in 0..count {
@@ -256,6 +607,13 @@ impl BinaryStream {
         if count == 0 {
             return Ok(Vec::new());
         }
+        let elem = self.pointer_size();
+        let count = checked_array_len(
+            count as u64,
+            elem,
+            Some(self.remaining_from(offset)),
+            "read_ptr_array",
+        )?;
         self.set_position(offset);
         let mut result = Vec::with_capacity(count);
         for _ in 0..count {
@@ -265,6 +623,14 @@ impl BinaryStream {
     }
 
     pub fn read_ptr_array_inline(&mut self, count: usize) -> Result<Vec<u64>> {
+        let elem = self.pointer_size();
+        let pos = self.position();
+        let count = checked_array_len(
+            count as u64,
+            elem,
+            Some(self.remaining_from(pos)),
+            "read_ptr_array_inline",
+        )?;
         let mut result = Vec::with_capacity(count);
         for _ in 0..count {
             result.push(self.read_ptr()?);
@@ -273,11 +639,28 @@ impl BinaryStream {
     }
 
     pub fn read_u32_array_inline(&mut self, count: usize) -> Result<Vec<u32>> {
+        let pos = self.position();
+        let count = checked_array_len(
+            count as u64,
+            4,
+            Some(self.remaining_from(pos)),
+            "read_u32_array_inline",
+        )?;
         let mut result = Vec::with_capacity(count);
         for _ in 0..count {
             result.push(self.read_u32()?);
         }
         Ok(result)
+    }
+
+    pub fn alloc_vec_capacity<T>(&self, count: usize, context: &str) -> Result<Vec<T>> {
+        let n = checked_array_len(
+            count as u64,
+            std::mem::size_of::<T>().max(1),
+            None,
+            context,
+        )?;
+        Ok(Vec::with_capacity(n))
     }
 
     pub fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
@@ -367,6 +750,45 @@ impl BinaryStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_checked_array_len_rejects_capacity_overflow() {
+        let huge = (isize::MAX as u64 / 8) + 1;
+        let err = checked_array_len(huge, 8, None, "test").unwrap_err();
+        match err {
+            Error::InvalidArraySize { .. } => {}
+            other => panic!("expected InvalidArraySize, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_checked_array_len_rejects_beyond_available() {
+        let err = checked_array_len(100, 8, Some(50), "test").unwrap_err();
+        match err {
+            Error::InvalidArraySize { .. } => {}
+            other => panic!("expected InvalidArraySize, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_checked_array_len_ok() {
+        assert_eq!(checked_array_len(10, 4, Some(100), "test").unwrap(), 10);
+        assert_eq!(checked_array_len(0, 4, None, "test").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_signed_size_rejects_negative() {
+        assert!(signed_size_to_u64(-1, "x").is_err());
+        assert_eq!(signed_size_to_u64(42, "x").unwrap(), 42);
+    }
+
+    #[test]
+    fn test_read_ptr_array_rejects_huge_count() {
+        let mut stream = BinaryStream::new(vec![0u8; 64]);
+        stream.is_32bit = true;
+        let result = stream.read_ptr_array(0, usize::MAX / 2);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_read_primitives() {

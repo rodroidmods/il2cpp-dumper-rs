@@ -3,6 +3,7 @@ mod x86;
 
 use std::collections::{HashMap, HashSet, BTreeMap};
 use std::fmt;
+use std::sync::Arc;
 
 const RIP_PSEUDO_REG: u16 = u16::MAX;
 
@@ -122,24 +123,39 @@ impl fmt::Display for DisassembledInstruction {
 }
 
 pub struct DisassemblyContext {
-    pub field_offsets: HashMap<i32, String>,
-    pub string_literals: HashMap<u64, String>,
-    pub type_names: HashMap<u64, String>,
-    pub method_refs: HashMap<u64, String>,
-    pub field_refs: HashMap<u64, String>,
-    pub vtable_methods: HashMap<i32, String>,
+    /// Shared across methods of the same type (Arc so per-method ctx is cheap).
+    pub field_offsets: Arc<HashMap<i32, String>>,
+    pub string_literals: Arc<HashMap<u64, String>>,
+    pub type_names: Arc<HashMap<u64, String>>,
+    pub method_refs: Arc<HashMap<u64, String>>,
+    pub field_refs: Arc<HashMap<u64, String>>,
+    pub vtable_methods: Arc<HashMap<i32, String>>,
+    /// Per-method register aliases (this, params) — not shared.
     pub register_names: HashMap<String, String>,
 }
 
 impl DisassemblyContext {
     pub fn new() -> Self {
         Self {
-            field_offsets: HashMap::new(),
-            string_literals: HashMap::new(),
-            type_names: HashMap::new(),
-            method_refs: HashMap::new(),
-            field_refs: HashMap::new(),
-            vtable_methods: HashMap::new(),
+            field_offsets: Arc::new(HashMap::new()),
+            string_literals: Arc::new(HashMap::new()),
+            type_names: Arc::new(HashMap::new()),
+            method_refs: Arc::new(HashMap::new()),
+            field_refs: Arc::new(HashMap::new()),
+            vtable_methods: Arc::new(HashMap::new()),
+            register_names: HashMap::new(),
+        }
+    }
+
+    /// Clone shared maps via Arc; start with empty per-method register names.
+    pub fn share_maps_from(base: &Self) -> Self {
+        Self {
+            field_offsets: Arc::clone(&base.field_offsets),
+            string_literals: Arc::clone(&base.string_literals),
+            type_names: Arc::clone(&base.type_names),
+            method_refs: Arc::clone(&base.method_refs),
+            field_refs: Arc::clone(&base.field_refs),
+            vtable_methods: Arc::clone(&base.vtable_methods),
             register_names: HashMap::new(),
         }
     }

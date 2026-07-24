@@ -39,6 +39,6 @@
   "useTopologicalSort": true,
   "codm": false,
   "dumpStaticFieldMetadata": false,
-  "dumpFieldRvaData": true,
+  "dumpFieldRvaData": false,
   "maxFieldRvaDumpBytes": 4096
 }

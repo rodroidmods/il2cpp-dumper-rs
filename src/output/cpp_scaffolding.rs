@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
+use rayon::prelude::*;
 use crate::error::Result;
 use crate::il2cpp::base::*;
 use crate::il2cpp::metadata::Metadata;
@@ -29,42 +30,68 @@ impl CppScaffolding {
         let struct_name_dic = StructGenerator::build_struct_name_dic_pub(executor, metadata, il2cpp);
         let type_def_image_names = StructGenerator::build_type_def_image_names_pub(metadata);
 
-        let mut entries: Vec<FuncEntry> = Vec::new();
-        let mut seen_rvas: HashSet<u64> = HashSet::new();
         let mut method_info_map: HashMap<(usize, usize), u64> = HashMap::new();
 
         Self::collect_method_info_addresses(
             &mut method_info_map, executor, metadata, il2cpp, &type_def_image_names,
         );
 
-        let image_defs = metadata.image_defs.clone();
-        for image_def in &image_defs {
-            let image_name = metadata.get_string_from_index(image_def.name_index).unwrap_or_default();
-            let type_end = image_def.type_start as usize + image_def.type_count as usize;
+        // Parallel per-type entry collection; sequential dedupe by RVA (first wins, type order).
+        let type_jobs: Vec<(usize, String)> = metadata
+            .image_defs
+            .iter()
+            .flat_map(|image_def| {
+                let image_name = metadata
+                    .get_string_from_index(image_def.name_index)
+                    .unwrap_or_default();
+                let type_end = image_def.type_start as usize + image_def.type_count as usize;
+                (image_def.type_start as usize..type_end)
+                    .map(|type_def_index| (type_def_index, image_name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
-            for type_def_index in image_def.type_start as usize..type_end {
-                let type_def = metadata.type_defs[type_def_index].clone();
-                let type_name = executor.get_type_def_name(&type_def, type_def_index, metadata, il2cpp, true, true);
-
+        let per_type_entries: Vec<Vec<FuncEntry>> = type_jobs
+            .par_iter()
+            .map(|(type_def_index, image_name)| {
+                let mut local_exec = Il2CppExecutor::new_for_worker(executor);
+                let type_def = metadata.type_defs[*type_def_index].clone();
+                let type_name = local_exec.get_type_def_name(
+                    &type_def,
+                    *type_def_index,
+                    metadata,
+                    il2cpp,
+                    true,
+                    true,
+                );
+                let mut entries = Vec::new();
                 let method_end = type_def.method_start as usize + type_def.method_count as usize;
+
                 for method_index in type_def.method_start as usize..method_end {
                     let method_def = metadata.method_defs[method_index].clone();
-                    let method_name_raw = metadata.get_string_from_index(method_def.name_index as i32).unwrap_or_default();
-                    let method_pointer = il2cpp.get_method_pointer(&image_name, &method_def);
-
-                    let mi_rva = method_info_map.get(&(type_def_index, method_index)).copied();
+                    let method_name_raw = metadata
+                        .get_string_from_index(method_def.name_index as i32)
+                        .unwrap_or_default();
+                    let method_pointer = il2cpp.get_method_pointer(image_name, &method_def);
+                    let mi_rva = method_info_map.get(&(*type_def_index, method_index)).copied();
 
                     if method_pointer > 0 {
                         let rva = il2cpp.get_rva(method_pointer);
-                        if !seen_rvas.insert(rva) { continue; }
-
-                        let func_name = format!("{}$${}", fix_name_scaffold(&type_name), fix_name_scaffold(&method_name_raw));
-
-                        let (return_type, params) = Self::build_func_signature(
-                            executor, metadata, il2cpp, &method_def, &type_def,
-                            type_def_index, &struct_name_dic, None,
+                        let func_name = format!(
+                            "{}$${}",
+                            fix_name_scaffold(&type_name),
+                            fix_name_scaffold(&method_name_raw)
                         );
-
+                        let (return_type, params) = Self::build_func_signature(
+                            &mut local_exec,
+                            metadata,
+                            il2cpp,
+                            &method_def,
+                            &type_def,
+                            *type_def_index,
+                            &struct_name_dic,
+                            None,
+                        );
                         entries.push(FuncEntry {
                             rva,
                             return_type,
@@ -73,13 +100,21 @@ impl CppScaffolding {
                             method_info_rva: mi_rva,
                         });
                     } else if mi_rva.is_some() {
-                        let func_name = format!("{}$${}", fix_name_scaffold(&type_name), fix_name_scaffold(&method_name_raw));
-
-                        let (return_type, params) = Self::build_func_signature(
-                            executor, metadata, il2cpp, &method_def, &type_def,
-                            type_def_index, &struct_name_dic, None,
+                        let func_name = format!(
+                            "{}$${}",
+                            fix_name_scaffold(&type_name),
+                            fix_name_scaffold(&method_name_raw)
                         );
-
+                        let (return_type, params) = Self::build_func_signature(
+                            &mut local_exec,
+                            metadata,
+                            il2cpp,
+                            &method_def,
+                            &type_def,
+                            *type_def_index,
+                            &struct_name_dic,
+                            None,
+                        );
                         entries.push(FuncEntry {
                             rva: 0,
                             return_type,
@@ -89,24 +124,40 @@ impl CppScaffolding {
                         });
                     }
 
-                    if let Some(spec_indices) = il2cpp.method_definition_method_specs.get(&method_index).cloned() {
-                        for spec_idx in &spec_indices {
-                            let spec_ptr = il2cpp.method_spec_generic_method_pointers.get(spec_idx).copied().unwrap_or(0);
-                            if spec_ptr == 0 { continue; }
+                    if let Some(spec_indices) = il2cpp.method_definition_method_specs.get(&method_index) {
+                        for spec_idx in spec_indices {
+                            let spec_ptr = il2cpp
+                                .method_spec_generic_method_pointers
+                                .get(spec_idx)
+                                .copied()
+                                .unwrap_or(0);
+                            if spec_ptr == 0 {
+                                continue;
+                            }
                             let spec_rva = il2cpp.get_rva(spec_ptr);
-                            if !seen_rvas.insert(spec_rva) { continue; }
-
-                            let (spec_type_name, spec_method_name) = executor.get_method_spec_name(*spec_idx, metadata, il2cpp, true);
-                            let func_name = format!("{}$${}", fix_name_scaffold(&spec_type_name), fix_name_scaffold(&spec_method_name));
-
-                            let (class_inst, method_inst) = executor.get_method_spec_generic_context(*spec_idx, il2cpp);
-                            let generic_context = Il2CppGenericContext { class_inst, method_inst };
-
-                            let (return_type, params) = Self::build_func_signature(
-                                executor, metadata, il2cpp, &method_def, &type_def,
-                                type_def_index, &struct_name_dic, Some(&generic_context),
+                            let (spec_type_name, spec_method_name) =
+                                local_exec.get_method_spec_name(*spec_idx, metadata, il2cpp, true);
+                            let func_name = format!(
+                                "{}$${}",
+                                fix_name_scaffold(&spec_type_name),
+                                fix_name_scaffold(&spec_method_name)
                             );
-
+                            let (class_inst, method_inst) =
+                                local_exec.get_method_spec_generic_context(*spec_idx, il2cpp);
+                            let generic_context = Il2CppGenericContext {
+                                class_inst,
+                                method_inst,
+                            };
+                            let (return_type, params) = Self::build_func_signature(
+                                &mut local_exec,
+                                metadata,
+                                il2cpp,
+                                &method_def,
+                                &type_def,
+                                *type_def_index,
+                                &struct_name_dic,
+                                Some(&generic_context),
+                            );
                             entries.push(FuncEntry {
                                 rva: spec_rva,
                                 return_type,
@@ -117,6 +168,18 @@ impl CppScaffolding {
                         }
                     }
                 }
+                entries
+            })
+            .collect();
+
+        let mut entries: Vec<FuncEntry> = Vec::new();
+        let mut seen_rvas: HashSet<u64> = HashSet::new();
+        for local in per_type_entries {
+            for entry in local {
+                if entry.rva > 0 && !seen_rvas.insert(entry.rva) {
+                    continue;
+                }
+                entries.push(entry);
             }
         }
 
@@ -256,8 +319,8 @@ impl CppScaffolding {
 
     fn build_func_signature(
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         method_def: &Il2CppMethodDefinition,
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
@@ -324,8 +387,8 @@ impl CppScaffolding {
         il2cpp_type: &Il2CppType,
         struct_name_dic: &HashMap<usize, String>,
         executor: &mut Il2CppExecutor,
-        metadata: &mut Metadata,
-        il2cpp: &mut Il2Cpp,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
         context: Option<&Il2CppGenericContext>,
     ) -> String {
         let te = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);

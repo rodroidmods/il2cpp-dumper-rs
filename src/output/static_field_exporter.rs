@@ -359,8 +359,8 @@ impl StaticFieldExporter {
 pub fn write_dump_cs_field_annotations(
     buf: &mut String,
     executor: &mut Il2CppExecutor,
-    metadata: &mut Metadata,
-    il2cpp: &mut Il2Cpp,
+    metadata: &Metadata,
+    il2cpp: &Il2Cpp,
     config: &Config,
     type_def: &Il2CppTypeDefinition,
     type_def_index: usize,

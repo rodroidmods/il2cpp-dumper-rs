@@ -45,7 +45,7 @@ impl CustomAttributeDataReader {
         if pos >= self.data_len { 0 } else { self.data_len - pos }
     }
 
-    pub fn get_string_custom_attribute_data(&mut self, metadata: &mut Metadata) -> Result<String> {
+    pub fn get_string_custom_attribute_data(&mut self, metadata: &Metadata) -> Result<String> {
         if self.remaining() == 0 {
             return Err(crate::error::Error::Other("No data remaining".into()));
         }
@@ -124,7 +124,7 @@ impl CustomAttributeDataReader {
         }
     }
 
-    pub fn get_ctor_type_name(&mut self, metadata: &mut Metadata) -> Result<String> {
+    pub fn get_ctor_type_name(&mut self, metadata: &Metadata) -> Result<String> {
         if self.remaining() == 0 {
             return Err(crate::error::Error::Other("No data remaining".into()));
         }
@@ -298,7 +298,7 @@ impl CustomAttributeDataReader {
 
 pub fn format_custom_attribute_data(
     buf: &mut String,
-    metadata: &mut Metadata,
+    metadata: &Metadata,
     attr_idx: usize,
     padding: &str,
 ) -> bool {
@@ -322,9 +322,8 @@ pub fn format_custom_attribute_data(
         return false;
     }
 
-    metadata.stream.set_position(data_offset);
-    let data = match metadata.stream.read_bytes(data_size) {
-        Ok(d) => d,
+    let data = match metadata.peek_bytes_at(data_offset, data_size) {
+        Ok(d) => d.to_vec(),
         Err(_) => return false,
     };
 

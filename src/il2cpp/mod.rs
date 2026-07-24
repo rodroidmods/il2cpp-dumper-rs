@@ -5,5 +5,7 @@ pub mod base;
 pub mod field_layout;
 
 pub use metadata::Metadata;
-pub use base::Il2Cpp;
+pub use base::{
+    apply_auto_plus_heuristics, auto_plus_count_limit, refine_code_registration, Il2Cpp,
+};
 pub use field_layout::*;

@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
 </p>
 
-<h1 align="center">🛡️ Rodroid Il2CppDumper V6.1</h1>
+<h1 align="center">🛡️ Rodroid Il2CppDumper V7.0</h1>
 
 <p align="center">
   <b>A blazing-fast, cross-platform IL2CPP binary dumper written in Rust.</b><br/>
@@ -55,7 +55,11 @@
 | **WASM (WebGL)** | ✅ Yes | ✅ Yes | ✅ Yes |
 | **Dump file support** | ❌ No | ✅ Yes | ✅ Yes (+ ELF reload) |
 | **v27+ ImageBase fix** | ❌ No | ✅ Yes | ✅ Yes |
-| **Parallel I/O (`rayon`)** | ❌ No | ❌ No | ✅ **Yes** |
+| **Parallel dump / DummyDLL / script.json / structs (`rayon`)** | ❌ No | ❌ No | ✅ **Yes** |
+| **Safe capacity checks (no alloc panic)** | ❌ No | ❌ No | ✅ **Yes** |
+| **Clear metadata protection errors** | ⚠️ Generic | ⚠️ Generic | ✅ **Yes** |
+| **AutoPlus version refine (e.g. metadata 31 → CR layout 29)** | ❌ No | ⚠️ Manual | ✅ **Yes (all formats)** |
+| **Duplicate metadata key tolerance** | ❌ Crashes | ❌ Crashes | ✅ **Yes** |
 | **Auto-numbered output dirs** | ❌ No | ❌ No | ✅ **Dump0/, Dump1/...** |
 | **Modern CLI UI (spinners, colors, prompts)** | ❌ No | ❌ No | ✅ **Yes** |
 | **Cross-platform binary** | ⚠️ Needs Python | ⚠️ Needs .NET | ✅ **Standalone** |
@@ -77,12 +81,12 @@
 | Metadata loading | ~3.7s | ~2s | **~0.5s** |
 | Binary loading | ~5.2s | ~3s | **~0.8s** |
 | Search & Init | ~5.4s | ~2s | **~0.3s** |
-| dump.cs | ~14s | ~5s | **~2s** |
-| Struct generation | ~6.4s | ~5s | **~3.5s** |
-| DummyDLL | ❌ N/A | ~3s | **~1.5s** |
-| **Total** | **~35s** | **~20s** | **~5–8s** |
+| dump.cs | ~14s | ~5s | **~1–3s** (parallel; +disasm scales with max insn) |
+| Struct generation | ~6.4s | ~5s | **~2–4s** (parallel headers / script) |
+| DummyDLL | ❌ N/A | ~3s | **~1–2s** (parallel) |
+| **Total** | **~35s** | **~20s** | **~4–12s** (disasm-heavy dumps still multi-core) |
 
-> **4× faster than Python, 2.4× faster than C#** — on the same binary.
+> **Often 3–5× faster than C# / Python** on multi-core — same dump logic, map-reduce with `rayon`.
 
 ---
 
@@ -151,6 +155,35 @@
   3. Current `type_enum` invalid + XOR'd `type_enum` valid (catches obfuscator-only patterns like `0x27 → Class`, `0x24 → ValueType`)
 - ~95 % of encrypted Il2CppType entries recovered (class names, value types, generic instances, field type references). The remaining ~5 % are **intentional decoy fields** with the `LITERAL` (0x40) attribute flag set on real instance fields — same limitation as the C# CODM dumper; not an encryption gap.
 - Toggle via `--codm` flag or `Codm: true` in config — additive code path, leaves standard Unity games untouched
+
+### What's new in v7.0
+
+#### Stability & correctness
+- 🐛 **Fixed `capacity overflow` panic** — untrusted counts from metadata/registration no longer call `Vec::with_capacity` with huge values; invalid sizes return a clear error instead of crashing
+- 🐛 **Fixed duplicate-key crash on metadata init** — same class of bug as C# `System.ArgumentException: An item with the same key has already been added` on `fieldDefaultValues` / attribute tokens; we dedupe (keep last) and continue (Steam / Windows games)
+- 🐛 **AutoPlus version refine (metadata vs CodeRegistration layout)** — some games report metadata version **31** while native CR/MR still use a **29-era** layout. Manual “fix version” in other dumpers is not required: we refine version from registration counts / heuristics and apply it on **all formats** (ELF / PE / Mach-O / NSO / WASM), CLI + Android + Tauri
+- 🛡️ **Safer array reads** — signed size validation, file-bounds checks, ELF hash bucket / registration count caps
+- 🛡️ **Single CR/MR log** — no more double-print of CodeRegistration when section scan fails and ARM32/symbol path succeeds
+
+#### Better errors (encrypted / protected games)
+- 📣 **Actionable metadata failures** — wrong magic shows hex bytes + expected `AF 1B B1 FA`; truncated/encrypted files no longer look like raw `IO error: failed to fill whole buffer`
+- 📣 **Header range validation** — section offset+size checked against file length before table parse
+- 📣 **`Error::user_message()` / `with_metadata_context()`** — clear hints for Android / Tauri UI and CLI (encryption, truncation, wrong file)
+
+#### Performance (real multi-core, same dump logic)
+- ⚡ **Parallel `dump.cs` type dumping** — rayon map over types; merge preserves order
+- ⚡ **Parallel method disassembly** — function-boundary map-reduce of method bodies inside large types (≥4 bodies); shared flat+DiffableCs ASM cache
+- ⚡ **Parallel DummyDLL** — each image assembly built concurrently
+- ⚡ **Parallel `script.json` / MethodInfo / scaffolding entries** — map-reduce with worker executors
+- ⚡ **Parallel `il2cpp.h` StructInfo** — non-generic type defs + MethodInfo fragments; array classes map-reduced
+- ⚡ **Parallel generics dump sections** — RGCTX, method specs, attributes, strings, vtables, interfaces
+- ⚡ **Parallel annotation build for disasm** — legacy usage table + v27 data-section scan
+- ⚡ **Cheap disasm context** — field/vtable maps shared via `Arc` (no heavy clone per method)
+
+#### Concurrency foundation
+- `SliceReader` / peek APIs for thread-safe binary reads without shared cursor fights
+- Thread-safe string cache; field offsets / generic peeks on shared `&Il2Cpp`
+- Worker `Il2CppExecutor::new_for_worker` for parallel name caches
 
 ### What's new in v6.1
 
@@ -250,7 +283,7 @@ il2cpp_dumper UnityFramework global-metadata.dat
     ╦╦  ╔═╗╔═╗╔═╗  ╔╦╗╦ ╦╔╦╗╔═╗╔═╗╦═╗
     ║║  ╠═╝║  ╠═╝   ║║║ ║║║║╠═╝║╣ ╠╦╝
     ╩╩═╝╚  ╚═╝╩    ═╩╝╚═╝╩ ╩╩  ╚═╝╩╚═
-    Version v0.6.0
+    Version v0.7.0
   ─────────────────────────────────────
 
   📂 Output .\Dump0
