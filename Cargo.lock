@@ -385,7 +385,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "il2cpp_dumper"
-version = "8.0.0"
+version = "8.5.0"
 dependencies = [
  "byteorder",
  "clap",
