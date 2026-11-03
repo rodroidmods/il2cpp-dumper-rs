@@ -75,7 +75,7 @@
 //! `__unknown`/`__abi` markers already say the same thing where the value
 //! really is unknown.
 
-use super::{ctor_type_name, is_ctor_name, list_mentions_deep, walk_mut, Expr, Stmt};
+use super::{Expr, Stmt, ctor_type_name, is_ctor_name, list_mentions_deep, walk_mut};
 
 /// Is `t` a delegate type name? Uses the simple (unqualified) name so
 /// `System.Action`, `UnityAction`-style suffixes and the BCL delegate families
@@ -111,9 +111,9 @@ fn delegate_alloc(e: &Expr) -> Option<&Vec<Expr>> {
 /// The `MethodGroup` a local provably holds at `at`, if any.
 fn bound_method_group(list: &[Stmt], at: usize, local: &str) -> Option<Expr> {
     // The nearest preceding assignment to `local` in this list …
-    let bind = (0..at).rev().find(|&p| {
-        matches!(&list[p], Stmt::Assign(n, _, _) if n == local)
-    })?;
+    let bind = (0..at)
+        .rev()
+        .find(|&p| matches!(&list[p], Stmt::Assign(n, _, _) if n == local))?;
     let Stmt::Assign(_, _, Expr::MethodGroup(m)) = &list[bind] else {
         return None;
     };
@@ -202,9 +202,9 @@ fn fold_list(list: &mut Vec<Stmt>) -> usize {
             Stmt::Return(Some(e)) => Some(e),
             Stmt::Throw(e) => Some(e),
             Stmt::YieldReturn(e) => Some(e),
-            Stmt::If { cond, .. }
-            | Stmt::While { cond, .. }
-            | Stmt::DoWhile { cond, .. } => Some(cond),
+            Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } => {
+                Some(cond)
+            }
             Stmt::For { cond: Some(c), .. } => Some(c),
             _ => None,
         };
@@ -319,7 +319,11 @@ mod tests {
             },
             Stmt::Assign("d".to_string(), None, ctor(var("v12"))),
         ];
-        assert_eq!(apply(&mut stmts), 0, "a conditional re-assignment is invisible to a neighbour scan");
+        assert_eq!(
+            apply(&mut stmts),
+            0,
+            "a conditional re-assignment is invisible to a neighbour scan"
+        );
     }
 
     /// A construction whose callee carries no type is not provably a delegate.

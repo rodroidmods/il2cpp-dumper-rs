@@ -33,13 +33,13 @@
 //! the existing verify aggregate.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::cfg::Cfg;
 use super::ir::{Insn, Op, Operand};
-use super::verify::{ledger_has, DecodedInsn, InsnClass};
+use super::verify::{DecodedInsn, InsnClass, ledger_has};
 
 // ---------------------------------------------------------------------------
 // Defect classes
@@ -108,7 +108,9 @@ impl DefectClass {
     pub fn name(self) -> &'static str {
         match self {
             DefectClass::CallDuplicated => "call duplicated (one bl, two calls)",
-            DefectClass::CondDropped => "condition dropped (conditional branch lowered unconditional)",
+            DefectClass::CondDropped => {
+                "condition dropped (conditional branch lowered unconditional)"
+            }
             DefectClass::ReturnLost => "return lost (native ret, no Return in IR)",
             DefectClass::WidthMismatch => "access width mismatch (ldrb/strh rendered differently)",
             DefectClass::IndexDropped => "index dropped ([base,index] lost its index)",
@@ -248,17 +250,19 @@ fn ir_is_terminator(op: &Op) -> bool {
 /// Does the IR at this address perform an access of `width` bytes?
 fn ir_has_width(insns_at: &[&Insn], width: u8) -> bool {
     insns_at.iter().any(|i| {
-        i.operands.iter().any(|o| {
-            matches!(o, Operand::Memory { width: w, .. } if *w == width)
-        })
+        i.operands
+            .iter()
+            .any(|o| matches!(o, Operand::Memory { width: w, .. } if *w == width))
     })
 }
 
 /// Does the IR at this address contain any memory operand at all?
 fn ir_has_memory(insns_at: &[&Insn]) -> bool {
-    insns_at
-        .iter()
-        .any(|i| i.operands.iter().any(|o| matches!(o, Operand::Memory { .. })))
+    insns_at.iter().any(|i| {
+        i.operands
+            .iter()
+            .any(|o| matches!(o, Operand::Memory { .. }))
+    })
 }
 
 /// The "the index did not really vanish" escape hatches: forms the lifter
@@ -512,7 +516,10 @@ pub fn analyze(
                     .collect();
                 (
                     !oob.is_empty(),
-                    format!("switch targets [{}] exceed listing length {n}", oob.join(",")),
+                    format!(
+                        "switch targets [{}] exceed listing length {n}",
+                        oob.join(",")
+                    ),
                 )
             }
             _ => (false, String::new()),
@@ -559,7 +566,12 @@ fn append_jsonl(method_rva: u64, findings: &[(DefectClass, u64, String)]) {
         .iter()
         .map(|(c, a, d)| {
             let d = d.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("{{\"class\":\"{}\",\"addr\":{:#x},\"detail\":\"{}\"}}", c.name(), a, d)
+            format!(
+                "{{\"class\":\"{}\",\"addr\":{:#x},\"detail\":\"{}\"}}",
+                c.name(),
+                a,
+                d
+            )
         })
         .collect();
     let _ = writeln!(
@@ -600,7 +612,11 @@ pub fn report() -> String {
 
     let mut s = format!(
         "\n[conform] {checked} methods checked, {conformant} structurally conformant ({}%), {} CLASSES WITH DEFECTS",
-        if checked == 0 { 0 } else { conformant * 100 / checked },
+        if checked == 0 {
+            0
+        } else {
+            conformant * 100 / checked
+        },
         rows.len()
     );
     if rows.is_empty() {
@@ -632,7 +648,7 @@ pub fn report() -> String {
 mod tests {
     use super::super::cfg::{Block, Cfg};
     use super::super::ir::{ArithKind, Insn, Op, Operand};
-    use super::super::verify::{ledger_clear, DecodedInsn, InsnClass, NativeFacts};
+    use super::super::verify::{DecodedInsn, InsnClass, NativeFacts, ledger_clear};
     use super::*;
 
     fn decoded(addr: u64, mnemonic: &str, class: InsnClass, facts: NativeFacts) -> DecodedInsn {
@@ -678,7 +694,10 @@ mod tests {
                 ..Default::default()
             },
         )];
-        let ir = vec![Insn::new(Op::Jump(1), vec![], 0x1000), Insn::new(Op::Return, vec![], 0x1004)];
+        let ir = vec![
+            Insn::new(Op::Jump(1), vec![], 0x1000),
+            Insn::new(Op::Return, vec![], 0x1004),
+        ];
         let f = analyze(&dec, &ir, None);
         assert!(
             classes(&f).contains(&DefectClass::CondDropped),

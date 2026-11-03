@@ -1,13 +1,13 @@
-pub mod structures;
-pub mod enums;
-pub mod metadata;
 pub mod base;
+pub mod dump_scan;
+pub mod enums;
 pub mod field_layout;
 pub mod layout;
-pub mod dump_scan;
+pub mod metadata;
+pub mod structures;
 
-pub use metadata::Metadata;
 pub use base::{
-    apply_auto_plus_heuristics, auto_plus_count_limit, refine_code_registration, Il2Cpp,
+    Il2Cpp, apply_auto_plus_heuristics, auto_plus_count_limit, refine_code_registration,
 };
 pub use field_layout::*;
+pub use metadata::Metadata;

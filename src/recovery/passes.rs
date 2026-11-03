@@ -22,9 +22,13 @@ use super::ir::{ArithKind, CompareKind, Insn, Op, Operand};
 /// written by ordinary arithmetic is NOT stale — SSA renamed it — and treating
 /// it as stale is what cost `OutBounce`@0x14D6330 its parameter (see
 /// [`slot_write_reaches`]).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SlotValue {
-    value: u32,
+    /// The value a read should see. A scalar return is `Local(call_dest)`;
+    /// an HFA component is `call_dest.<field>` — a DISTINCT value per
+    /// register. Binding every component to the same local destroyed the
+    /// distinction (`Vector3` distance code became `(z - z)`).
+    value: Operand,
     def: Option<usize>,
     from_call: bool,
 }
@@ -141,7 +145,11 @@ pub fn bind_fp_returns(
     let mut cur: HashMap<String, SlotValue> = HashMap::new();
     cur.insert(
         target.to_string(),
-        SlotValue { value: entry, def: None, from_call: false },
+        SlotValue {
+            value: Operand::Local(entry),
+            def: None,
+            from_call: false,
+        },
     );
     for (idx, insn) in insns.iter_mut().enumerate() {
         if matches!(insn.op, Op::Return) {
@@ -149,8 +157,10 @@ pub fn bind_fp_returns(
                 if let Some(sv) = cur.get(target) {
                     // Only a value that PROVABLY reaches this Return may replace
                     // what it reads; see [`slot_write_reaches`].
-                    if sv.value != *d && slot_write_reaches(&block_of, &dom, sv.def, idx) {
-                        insn.operands[0] = Operand::Local(sv.value);
+                    if sv.value != Operand::Local(*d)
+                        && slot_write_reaches(&block_of, &dom, sv.def, idx)
+                    {
+                        insn.operands[0] = sv.value.clone();
                     }
                 }
             }
@@ -159,7 +169,11 @@ pub fn bind_fp_returns(
             if let Some(slot) = version_slot.get(dst) {
                 cur.insert(
                     slot.clone(),
-                    SlotValue { value: *dst, def: Some(idx), from_call: false },
+                    SlotValue {
+                        value: Operand::Local(*dst),
+                        def: Some(idx),
+                        from_call: false,
+                    },
                 );
             }
         }
@@ -219,7 +233,8 @@ pub fn bind_fp_returns(
 pub fn bind_fp_call_returns(
     insns: &mut [Insn],
     version_slot: &HashMap<u32, String>,
-    hfa_components: impl Fn(&super::types::ManagedType) -> usize,
+    hfa_stride: usize,
+    hfa_fields: impl Fn(&super::types::ManagedType) -> Vec<super::types::FieldRef>,
 ) -> usize {
     use super::types::{ManagedType, PrimKind};
     let arm = version_slot
@@ -232,10 +247,7 @@ pub fn bind_fp_call_returns(
     // in an FP result slot can never enter the rebind path at all — the walk
     // would be a no-op, and half the dump would pay for a graph it cannot use.
     let in_fp_slot = |s: &String| {
-        s.as_str() == s_slot
-            || s.as_str() == d_slot
-            || s.starts_with("vs")
-            || s.starts_with("vd")
+        s.as_str() == s_slot || s.as_str() == d_slot || s.starts_with("vs") || s.starts_with("vd")
     };
     if !version_slot.values().any(in_fp_slot) {
         return 0;
@@ -272,10 +284,10 @@ pub fn bind_fp_call_returns(
                             // write that cannot reach this read, is a wrong
                             // value.
                             if sv.from_call
-                                && sv.value != *u
+                                && sv.value != Operand::Local(*u)
                                 && slot_write_reaches(&block_of, &dom, sv.def, idx)
                             {
-                                insn.operands[i] = Operand::Local(sv.value);
+                                insn.operands[i] = sv.value.clone();
                                 changed += 1;
                             }
                         }
@@ -288,10 +300,23 @@ pub fn bind_fp_call_returns(
         // written by ordinary arithmetic is already the version SSA chose.
         if let Some(Operand::Local(d)) = insn.dest() {
             if let Some(slot) = version_slot.get(d) {
-                if slot == s_slot || slot == d_slot {
+                // Retire the binding for ANY slot the walk is currently
+                // holding, not just the scalar result slot. `cur` is seeded
+                // with one entry per HFA component (`vs0`, `vs4`, `vs8`, ...)
+                // at the call, so testing only `s_slot`/`d_slot` left
+                // `cur["vs4"]` and `cur["vs8"]` pointing at the call forever:
+                // every later read of ANY version of those slots was rewritten
+                // to `call.y`/`call.z`, including versions defined by fsub/fmul.
+                // On 0x1530F2C that produced `Sqrt(t2.y + (t.x-t2.x)*(t.x-t2.x)
+                // + t2.y)` where x is right precisely because vs0 was tracked.
+                if slot == s_slot || slot == d_slot || cur.contains_key(slot) {
                     cur.insert(
                         slot.clone(),
-                        SlotValue { value: *d, def: Some(idx), from_call: false },
+                        SlotValue {
+                            value: Operand::Local(*d),
+                            def: Some(idx),
+                            from_call: false,
+                        },
                     );
                 }
             }
@@ -301,21 +326,49 @@ pub fn bind_fp_call_returns(
         // 32-bit field — s0,s1,s2 for a Vector3 — named `vs0,vs1,…`, the same
         // scalar names `fp_pair_of` gives the spill pair that carries them.
         if matches!(insn.op, Op::Call) {
-            let slots: Vec<String> = match insn.dest_type.clone() {
-                Some(ManagedType::Primitive(PrimKind::R4)) => vec![s_slot.to_string()],
-                Some(ManagedType::Primitive(PrimKind::R8)) => vec![d_slot.to_string()],
-                Some(ty @ ManagedType::Class(_)) => {
-                    (0..hfa_components(&ty)).map(|k| format!("vs{k}")).collect()
+            // (slot, value the read must see)
+            let mut binds: Vec<(String, Operand)> = Vec::new();
+            match insn.dest_type.clone() {
+                Some(ManagedType::Primitive(PrimKind::R4)) => {
+                    binds.push((s_slot.to_string(), Operand::Local(0)));
                 }
-                _ => Vec::new(),
-            };
+                Some(ManagedType::Primitive(PrimKind::R8)) => {
+                    binds.push((d_slot.to_string(), Operand::Local(0)));
+                }
+                Some(ty @ ManagedType::Class(_)) => {
+                    let fields = hfa_fields(&ty);
+                    for (k, field) in fields.into_iter().enumerate() {
+                        // ARM64: component k is v<k>.s0 → slot `vs{4k}`.
+                        // ARM32: components are s0,s1,… → `vs{k}`.
+                        binds.push((format!("vs{}", k * hfa_stride), Operand::Local(0)));
+                        if let Some((slot, value)) = binds.last_mut() {
+                            *value = Operand::InstanceField {
+                                base: Box::new(Operand::Local(0)),
+                                field,
+                            };
+                            let _ = slot;
+                        }
+                    }
+                }
+                _ => {}
+            }
             if let Some(Operand::Local(d)) = insn.operands.get(1).cloned() {
-                for slot in slots {
-                    // THIS is the value a stale read after the call must see,
-                    // and the only one this pass may substitute.
+                for (slot, mut value) in binds {
+                    // Every component of the returned struct is a FIELD of the
+                    // call's result local — distinct per register, and typed
+                    // from the field metadata.
+                    if let Operand::InstanceField { base, .. } = &mut value {
+                        **base = Operand::Local(d);
+                    } else if let Operand::Local(v) = &mut value {
+                        *v = d;
+                    }
                     cur.insert(
                         slot,
-                        SlotValue { value: d, def: Some(idx), from_call: true },
+                        SlotValue {
+                            value,
+                            def: Some(idx),
+                            from_call: true,
+                        },
                     );
                 }
             }
@@ -381,6 +434,16 @@ fn insn_operands_reference(insn: &Insn, local: u32) -> bool {
 }
 
 fn collect_locals(op: &Operand, out: &mut Vec<u32>) {
+    // EXHAUSTIVE ON PURPOSE. This match is the only thing that tells
+    // `dead_code_elimination` which locals an instruction reads, and it is
+    // private to this pass — nothing else would notice if a new operand
+    // variant started carrying a sub-operand and this walker did not descend
+    // into it. That is precisely how `InstanceField` was missed: the base was
+    // a real use, the walker did not see it, the def that computed the
+    // receiver was Nop'd as dead, and the surviving read printed as
+    // `in_xN` (an ABI name for a value the method itself defines). Do not
+    // replace this with `_ => {}`: a new variant must be a compile error
+    // here so that whoever adds it decides, explicitly, whether it reads.
     match op {
         Operand::Local(l) => out.push(*l),
         Operand::Memory { base, index, .. } => {
@@ -394,7 +457,19 @@ fn collect_locals(op: &Operand, out: &mut Vec<u32>) {
             collect_locals(array, out);
             collect_locals(index, out);
         }
-        _ => {}
+        // The receiver of a field access is READ by it.
+        Operand::InstanceField { base, .. } => collect_locals(base, out),
+        // Leaves: no nested operand, so no local can hide inside.
+        Operand::Register(_)
+        | Operand::Immediate(_)
+        | Operand::FloatLiteral(_)
+        | Operand::DoubleLiteral(_)
+        | Operand::StringLiteral { .. }
+        | Operand::Method(_)
+        | Operand::Field(_)
+        | Operand::Type(_)
+        | Operand::MissingAbiArg
+        | Operand::Unknown => {}
     }
 }
 
@@ -416,14 +491,20 @@ fn collect_locals(op: &Operand, out: &mut Vec<u32>) {
 /// at the def point become Nops; cascades are re-run to a fixpoint.
 pub fn liveness_dce(insns: &mut [Insn]) -> usize {
     let mut removed_total = 0usize;
+    // The CFG is INVARIANT across the fixpoint: only `is_removable_if_dead`
+    // instructions are Nop'd, and that predicate excludes every terminator
+    // (ir.rs), so leaders/successors never change. Rebuild it once instead of
+    // once per outer round.
+    let cfg = super::ssa::rebuild_cfg(insns);
+    let n = cfg.blocks.len();
+    if n == 0 {
+        return 0;
+    }
     loop {
-        let cfg = super::ssa::rebuild_cfg(insns);
-        let n = cfg.blocks.len();
-        if n == 0 {
-            break;
-        }
-        let mut live_in: Vec<std::collections::HashSet<u32>> = vec![std::collections::HashSet::new(); n];
-        let mut live_out: Vec<std::collections::HashSet<u32>> = vec![std::collections::HashSet::new(); n];
+        let mut live_in: Vec<std::collections::HashSet<u32>> =
+            vec![std::collections::HashSet::new(); n];
+        let mut live_out: Vec<std::collections::HashSet<u32>> =
+            vec![std::collections::HashSet::new(); n];
         let mut changed = true;
         let mut iters = 0usize;
         while changed && iters < 128 {
@@ -547,6 +628,21 @@ pub fn liveness_dce(insns: &mut [Insn]) -> usize {
 /// fails CLOSED, keeping the bare local — a wrong value is the only outcome
 /// worse than a visible undefined `vN`.
 pub fn copy_and_constant_propagation(insns: &mut [Insn]) -> usize {
+    // Locals whose STORAGE is addressed anywhere are mutable through that
+    // address. One textual store does not determine a later read: IL2CPP
+    // initialises an `out` cell (`v = 0`), passes `&v` to the callee, and the
+    // callee writes the real value. Forwarding the initialiser invented a
+    // null token at 0x18A3A1C (`TryGetValue(key, &cell)`), which folded the
+    // null check to `true` and made the whole update block — a field store
+    // and `UpdateProbability` — unreachable. Exclude these locals from the
+    // value map, and refuse to propagate a COPY of one (a snapshot becomes a
+    // re-read of the mutated cell).
+    let mut addressed: HashSet<u32> = HashSet::new();
+    for insn in insns.iter() {
+        for op in &insn.operands {
+            collect_addressed_locals(op, &mut addressed);
+        }
+    }
     // def counts per local
     let mut def_count: HashMap<u32, usize> = HashMap::new();
     let mut value_of: HashMap<u32, Operand> = HashMap::new();
@@ -570,9 +666,13 @@ pub fn copy_and_constant_propagation(insns: &mut [Insn]) -> usize {
                 // forwardable values: locals and constants only
                 let forwardable = matches!(
                     src,
-                    Operand::Local(_) | Operand::Immediate(_) | Operand::StringLiteral { .. }
-                        | Operand::FloatLiteral(_) | Operand::DoubleLiteral(_)
-                        | Operand::Method(_) | Operand::Field(_)
+                    Operand::Local(_)
+                        | Operand::Immediate(_)
+                        | Operand::StringLiteral { .. }
+                        | Operand::FloatLiteral(_)
+                        | Operand::DoubleLiteral(_)
+                        | Operand::Method(_)
+                        | Operand::Field(_)
                 );
                 // The source must not depend on `d` ITSELF, even through the
                 // forward chain: `v0 = v3` with `v3 = [v0 +0x28]` is a
@@ -582,7 +682,11 @@ pub fn copy_and_constant_propagation(insns: &mut [Insn]) -> usize {
                 // been advanced — `Exception.GetBaseException` returned the
                 // field of the updated pointer instead of the value captured
                 // before the update.
-                if forwardable && !reads_local_transitively(src, d, &def_of, insns) {
+                if forwardable
+                    && !addressed.contains(&d)
+                    && !matches!(src, Operand::Local(w) if addressed.contains(w))
+                    && !reads_local_transitively(src, d, &def_of, insns)
+                {
                     value_of.insert(d, src.clone());
                     def_index.insert(d, i);
                 }
@@ -618,9 +722,9 @@ pub fn copy_and_constant_propagation(insns: &mut [Insn]) -> usize {
         (b, Some(d))
     };
     let loop_carried = |v: u32, use_i: usize| -> bool {
-        def_index.get(&v).is_some_and(|&d| {
-            d > use_i && block_of.get(d).copied() == block_of.get(use_i).copied()
-        })
+        def_index
+            .get(&v)
+            .is_some_and(|&d| d > use_i && block_of.get(d).copied() == block_of.get(use_i).copied())
     };
     // May the definition `value_of[v]` was taken from PROVABLY reach the use at
     // `use_i`? Without this a hop can carry a value out of an arm that cannot
@@ -706,6 +810,54 @@ pub fn copy_and_constant_propagation(insns: &mut [Insn]) -> usize {
     replaced
 }
 
+/// Collect every local whose storage is addressed by `op`, recursively
+/// through compound operands. `&local` and `&*(local)` both make the local a
+/// mutable cell: a callee can write it.
+fn collect_addressed_locals(op: &Operand, out: &mut HashSet<u32>) {
+    // Exhaustive for the same reason as `collect_locals`: a catch-all here
+    // would silently stop descending into whatever sub-operand a future
+    // variant introduces, and escape analysis would then call a live cell
+    // unaddressed.
+    match op {
+        Operand::AddressOf(inner) => {
+            // `&local` and `&*(local)` both name a cell directly; any deeper
+            // shape is just a value whose address is taken, and the recursion
+            // below still walks it.
+            let cell = match inner.as_ref() {
+                Operand::Memory { base, .. } => base.as_ref(),
+                other => other,
+            };
+            if let Operand::Local(v) = cell {
+                out.insert(*v);
+            }
+            collect_addressed_locals(inner, out);
+        }
+        Operand::ArrayLength(inner) => collect_addressed_locals(inner, out),
+        Operand::Memory { base, index, .. } => {
+            collect_addressed_locals(base, out);
+            if let Some(i) = index {
+                collect_addressed_locals(i, out);
+            }
+        }
+        Operand::ArrayAccess { array, index } => {
+            collect_addressed_locals(array, out);
+            collect_addressed_locals(index, out);
+        }
+        Operand::InstanceField { base, .. } => collect_addressed_locals(base, out),
+        Operand::Register(_)
+        | Operand::Local(_)
+        | Operand::Immediate(_)
+        | Operand::FloatLiteral(_)
+        | Operand::DoubleLiteral(_)
+        | Operand::StringLiteral { .. }
+        | Operand::Method(_)
+        | Operand::Field(_)
+        | Operand::Type(_)
+        | Operand::MissingAbiArg
+        | Operand::Unknown => {}
+    }
+}
+
 /// Does the VALUE of `op` depend on `local` — directly, or through the def
 /// chain of any local it mentions (`def_of`: local → the instruction that
 /// defines it)? Bounded, and conservative (`true`) when the budget runs out:
@@ -759,30 +911,46 @@ pub fn constant_folding(insns: &mut [Insn]) -> usize {
         );
 
         let result: Option<Operand> = match (&op, a, b) {
-            (Op::Arith(ArithKind::Add), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
-                Some(Operand::Immediate(x.wrapping_add(y)))
-            }
-            (Op::Arith(ArithKind::Sub), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
-                Some(Operand::Immediate(x.wrapping_sub(y)))
-            }
-            (Op::Arith(ArithKind::Mul), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
-                Some(Operand::Immediate(x.wrapping_mul(y)))
-            }
-            (Op::Arith(ArithKind::And), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
-                Some(Operand::Immediate(x & y))
-            }
-            (Op::Arith(ArithKind::Or), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
-                Some(Operand::Immediate(x | y))
-            }
-            (Op::Arith(ArithKind::Xor), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
-                Some(Operand::Immediate(x ^ y))
-            }
-            (Op::Arith(ArithKind::Shl), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
-                Some(Operand::Immediate(x.wrapping_shl(y.clamp(0, 63) as u32)))
-            }
-            (Op::Arith(ArithKind::Shr), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
-                Some(Operand::Immediate(x.wrapping_shr(y.clamp(0, 63) as u32)))
-            }
+            (
+                Op::Arith(ArithKind::Add),
+                Some(Operand::Immediate(x)),
+                Some(Operand::Immediate(y)),
+            ) => Some(Operand::Immediate(x.wrapping_add(y))),
+            (
+                Op::Arith(ArithKind::Sub),
+                Some(Operand::Immediate(x)),
+                Some(Operand::Immediate(y)),
+            ) => Some(Operand::Immediate(x.wrapping_sub(y))),
+            (
+                Op::Arith(ArithKind::Mul),
+                Some(Operand::Immediate(x)),
+                Some(Operand::Immediate(y)),
+            ) => Some(Operand::Immediate(x.wrapping_mul(y))),
+            (
+                Op::Arith(ArithKind::And),
+                Some(Operand::Immediate(x)),
+                Some(Operand::Immediate(y)),
+            ) => Some(Operand::Immediate(x & y)),
+            (
+                Op::Arith(ArithKind::Or),
+                Some(Operand::Immediate(x)),
+                Some(Operand::Immediate(y)),
+            ) => Some(Operand::Immediate(x | y)),
+            (
+                Op::Arith(ArithKind::Xor),
+                Some(Operand::Immediate(x)),
+                Some(Operand::Immediate(y)),
+            ) => Some(Operand::Immediate(x ^ y)),
+            (
+                Op::Arith(ArithKind::Shl),
+                Some(Operand::Immediate(x)),
+                Some(Operand::Immediate(y)),
+            ) => Some(Operand::Immediate(x.wrapping_shl(y.clamp(0, 63) as u32))),
+            (
+                Op::Arith(ArithKind::Shr),
+                Some(Operand::Immediate(x)),
+                Some(Operand::Immediate(y)),
+            ) => Some(Operand::Immediate(x.wrapping_shr(y.clamp(0, 63) as u32))),
             (Op::Compare(k), Some(Operand::Immediate(x)), Some(Operand::Immediate(y))) => {
                 let b = match k {
                     CompareKind::Equal => x == y,
@@ -889,71 +1057,69 @@ pub fn resolve_cross_block_conditions(insns: &mut [Insn], graph: &Cfg) -> usize 
 
     // Transfer one block, returning the state at its end and recording every
     // consumer `Compare` whose Unknown operands the reaching state can fill.
-    let transfer = |bi: usize,
-                    mut state: Flags,
-                    rewrites: &mut HashMap<usize, (Operand, Operand)>|
-     -> Flags {
-        let b = graph.blocks[bi];
-        for i in b.start..b.end {
-            let ins = &insns[i];
-            match &ins.op {
-                // A call, a multiply or a `clz` can write the flags and is not
-                // a tracked def, so the carried value stops here.
-                //
-                // `Op::Arith` is deliberately NOT here even though an s-form
-                // data-processing op writes APSR: the IR has no s bit, so it
-                // also covers `mvn` (`Arith(Xor) r, #0, #-1`) and every plain
-                // `add`/`and`, which PRESERVE the flags. Killing on all of them
-                // discarded exactly the live compares this pass exists to find
-                // (`mvn r5, #0; ble L` is the 0x64c424 site). The s-forms are
-                // not lost by the omission: an s-form that sets the flags the
-                // target reads materializes a REAL `Compare` there (the linear
-                // `pending_cmp` is not killed between the two), so the target
-                // is not `Unknown` and this pass never touches it.
-                Op::MulAcc { .. }
-                | Op::Clz
-                | Op::Call
-                | Op::CallVoid
-                | Op::IndirectCall
-                | Op::Return
-                | Op::Throw
-                | Op::NewObj(_)
-                | Op::NewArr(_)
-                | Op::Box(_)
-                | Op::ObjcMsgSend { .. } => state = None,
-                Op::Compare(_) => {
-                    if let Some(Operand::Local(v)) = ins.operands.first() {
-                        if consumed.contains(v) {
-                            let lhs = ins.operands.get(1);
-                            let rhs = ins.operands.get(2);
-                            let unknown = matches!(lhs, Some(Operand::Unknown))
-                                || matches!(lhs, Some(Operand::MissingAbiArg));
-                            if !unknown {
-                                if let (Some(l), Some(r)) = (lhs, rhs) {
-                                    state = Some((l.clone(), r.clone()));
+    let transfer =
+        |bi: usize, mut state: Flags, rewrites: &mut HashMap<usize, (Operand, Operand)>| -> Flags {
+            let b = graph.blocks[bi];
+            for i in b.start..b.end {
+                let ins = &insns[i];
+                match &ins.op {
+                    // A call, a multiply or a `clz` can write the flags and is not
+                    // a tracked def, so the carried value stops here.
+                    //
+                    // `Op::Arith` is deliberately NOT here even though an s-form
+                    // data-processing op writes APSR: the IR has no s bit, so it
+                    // also covers `mvn` (`Arith(Xor) r, #0, #-1`) and every plain
+                    // `add`/`and`, which PRESERVE the flags. Killing on all of them
+                    // discarded exactly the live compares this pass exists to find
+                    // (`mvn r5, #0; ble L` is the 0x64c424 site). The s-forms are
+                    // not lost by the omission: an s-form that sets the flags the
+                    // target reads materializes a REAL `Compare` there (the linear
+                    // `pending_cmp` is not killed between the two), so the target
+                    // is not `Unknown` and this pass never touches it.
+                    Op::MulAcc { .. }
+                    | Op::Clz
+                    | Op::Call
+                    | Op::CallVoid
+                    | Op::IndirectCall
+                    | Op::Return
+                    | Op::Throw
+                    | Op::NewObj(_)
+                    | Op::NewArr(_)
+                    | Op::Box(_)
+                    | Op::ObjcMsgSend { .. } => state = None,
+                    Op::Compare(_) => {
+                        if let Some(Operand::Local(v)) = ins.operands.first() {
+                            if consumed.contains(v) {
+                                let lhs = ins.operands.get(1);
+                                let rhs = ins.operands.get(2);
+                                let unknown = matches!(lhs, Some(Operand::Unknown))
+                                    || matches!(lhs, Some(Operand::MissingAbiArg));
+                                if !unknown {
+                                    if let (Some(l), Some(r)) = (lhs, rhs) {
+                                        state = Some((l.clone(), r.clone()));
+                                    }
+                                } else if let Some((l, r)) = state.clone() {
+                                    rewrites.entry(i).or_insert((l, r));
                                 }
-                            } else if let Some((l, r)) = state.clone() {
-                                rewrites.entry(i).or_insert((l, r));
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            }
-            // A redefinition of an operand register makes the carried pair
-            // stale at every later use, so it cannot be forwarded.
-            if let Some(Operand::Register(name)) = ins.dest() {
-                if let Some((l, r)) = &state {
-                    let hit = matches!(l, Operand::Register(n) if n == name)
-                        || matches!(r, Operand::Register(n) if n == name);
-                    if hit {
-                        state = None;
+                // A redefinition of an operand register makes the carried pair
+                // stale at every later use, so it cannot be forwarded.
+                if let Some(Operand::Register(name)) = ins.dest() {
+                    if let Some((l, r)) = &state {
+                        let hit = matches!(l, Operand::Register(n) if n == name)
+                            || matches!(r, Operand::Register(n) if n == name);
+                        if hit {
+                            state = None;
+                        }
                     }
                 }
             }
-        }
-        state
-    };
+            state
+        };
 
     let mut queued = vec![true; nblocks];
     let mut wl: VecDeque<usize> = (0..nblocks).collect();
@@ -1032,15 +1198,15 @@ pub fn simplify_boolean_flags(insns: &mut [Insn]) -> usize {
                     for j in (0..i).rev().take(16) {
                         if let Some(Operand::Local(dv)) = insns[j].dest() {
                             if *dv == inner_v {
-                                if let Op::Compare(inner_kind @ (CompareKind::Equal | CompareKind::NotEqual)) =
-                                    insns[j].op
+                                if let Op::Compare(
+                                    inner_kind @ (CompareKind::Equal | CompareKind::NotEqual),
+                                ) = insns[j].op
                                 {
                                     insns[j].op = Op::Compare(match inner_kind {
                                         CompareKind::Equal => CompareKind::NotEqual,
                                         _ => CompareKind::Equal,
                                     });
-                                    insns[j].dest_type =
-                                        insns[i].dest_type.clone();
+                                    insns[j].dest_type = insns[i].dest_type.clone();
                                     super::verify::ledger_note(
                                         insns[i].address,
                                         super::verify::LedgerKind::FoldedBranch,
@@ -1071,7 +1237,9 @@ pub fn remove_null_check_guards(insns: &mut [Insn], cfg: &Cfg) -> usize {
             continue;
         };
         // condition must be "x != 0" style null check
-        let Some(cmp_idx) = last.checked_sub(1) else { continue };
+        let Some(cmp_idx) = last.checked_sub(1) else {
+            continue;
+        };
         if !matches!(insns[cmp_idx].op, Op::Compare(CompareKind::NotEqual)) {
             continue;
         }
@@ -1081,22 +1249,26 @@ pub fn remove_null_check_guards(insns: &mut [Insn], cfg: &Cfg) -> usize {
         // only ≤4-insn bare-throw blocks matched, so the stub's
         // `throw X.GetSystem<object>()` garbage survived into every
         // null-guarded method.
-        let is_throw_block = cfg.blocks.get(taken).map(|tb| {
-            let (s, e) = (tb.start, tb.end);
-            if e <= s || insns[e - 1].op != Op::Throw || e - s > 8 {
-                return false;
-            }
-            let mut calls = 0usize;
-            insns[s..e].iter().all(|i| match i.op {
-                Op::Throw => true,
-                Op::Call | Op::CallVoid | Op::IndirectCall | Op::NewObj(_) => {
-                    calls += 1;
-                    calls <= 1
+        let is_throw_block = cfg
+            .blocks
+            .get(taken)
+            .map(|tb| {
+                let (s, e) = (tb.start, tb.end);
+                if e <= s || insns[e - 1].op != Op::Throw || e - s > 8 {
+                    return false;
                 }
-                Op::Move | Op::Nop | Op::Arith(_) | Op::Phi => true,
-                _ => false, // any control flow / real logic → not a stub
+                let mut calls = 0usize;
+                insns[s..e].iter().all(|i| match i.op {
+                    Op::Throw => true,
+                    Op::Call | Op::CallVoid | Op::IndirectCall | Op::NewObj(_) => {
+                        calls += 1;
+                        calls <= 1
+                    }
+                    Op::Move | Op::Nop | Op::Arith(_) | Op::Phi => true,
+                    _ => false, // any control flow / real logic → not a stub
+                })
             })
-        }).unwrap_or(false);
+            .unwrap_or(false);
         if is_throw_block {
             super::verify::ledger_note(
                 insns[last].address,
@@ -1113,10 +1285,7 @@ pub fn remove_null_check_guards(insns: &mut [Insn], cfg: &Cfg) -> usize {
             // though it can never execute.
             if let Some(tb) = cfg.blocks.get(taken) {
                 for i in insns[tb.start..tb.end].iter() {
-                    super::verify::ledger_note(
-                        i.address,
-                        super::verify::LedgerKind::GuardExcision,
-                    );
+                    super::verify::ledger_note(i.address, super::verify::LedgerKind::GuardExcision);
                 }
                 for i in insns[tb.start..tb.end].iter_mut() {
                     *i = Insn::nop(i.address);
@@ -1132,19 +1301,25 @@ pub fn remove_null_check_guards(insns: &mut [Insn], cfg: &Cfg) -> usize {
 /// and unconditional `Jump`s — stopping at the first instruction with any
 /// effect. Used by [`drop_vacuous_cond_branches`]; bounded so a cycle of empty
 /// blocks cannot hang the walk.
-fn resolve_past_nops(insns: &[Insn], mut i: usize) -> usize {
+fn resolve_past_nops(insns: &[Insn], mut i: usize) -> Option<usize> {
     let n = insns.len();
-    for _ in 0..=n {
+    let mut visited = vec![false; n];
+    loop {
         if i >= n {
-            return i;
+            return Some(i);
         }
+        if visited[i] {
+            // Cycle detected — refuse to resolve rather than return a
+            // potentially wrong index that could silently corrupt control flow.
+            return None;
+        }
+        visited[i] = true;
         match &insns[i].op {
             Op::Nop => i += 1,
             Op::Jump(t) => i = *t,
-            _ => return i,
+            _ => return Some(i),
         }
     }
-    i
 }
 
 /// A conditional branch whose two arms go to the same place is not a branch.
@@ -1181,8 +1356,13 @@ pub fn drop_vacuous_cond_branches(insns: &mut [Insn]) -> usize {
         let Op::CondJump(taken) = insns[i].op else {
             continue;
         };
-        if resolve_past_nops(insns, taken) == resolve_past_nops(insns, i + 1) {
-            vacuous.push(i);
+        if let (Some(t), Some(f)) = (
+            resolve_past_nops(insns, taken),
+            resolve_past_nops(insns, i + 1),
+        ) {
+            if t == f {
+                vacuous.push(i);
+            }
         }
     }
     let mut removed = 0;
@@ -1235,7 +1415,7 @@ pub fn trim_call_arguments(insns: &mut [Insn]) -> usize {
             // An UNRESOLVED call target carries no signature to trim against,
             // but a TRAILING `MissingAbiArg` still cannot mean anything. That
             // operand is the position fact "the ABI had no live register for
-            // this slot"; with no declared parameter for the slot to 
+            // this slot"; with no declared parameter for the slot to
             // correspond to, printing it emits a bare `__abi` in an argument
             // list — 25,668 of them binary-wide, all of them trailing, and all
             // of them the renderer reporting a hole it was handed rather than
@@ -1253,10 +1433,9 @@ pub fn trim_call_arguments(insns: &mut [Insn]) -> usize {
                 continue;
             }
         };
-        let this_count = usize::from(matches!(
-            insn.op,
-            Op::Call | Op::CallVoid | Op::IndirectCall
-        ) && params.is_some());
+        let this_count = usize::from(
+            matches!(insn.op, Op::Call | Op::CallVoid | Op::IndirectCall) && params.is_some(),
+        );
         // `Op::Call` ALWAYS carries a destination slot at operand 1: every
         // `bl`/`blr` arm of the lifter allocates x0 there, `dest_position`
         // reports `Some(1)` for it, and both `call_parts` and the statement
@@ -1508,7 +1687,8 @@ pub fn recover_tail_calls(
             // trailing: `this.target.set_pitch()` for
             // `set_pitch(float)`. Only registers the method actually declares
             // are kept after alignment; the rest are scrubbed as ABI filler.
-            for r in ["vs0", "vs1", "vs2", "vs3", "vs4", "vs5", "vs6", "vs7"] {
+            // Flattened lane-0 names for s0..s7 (see lift::scalar_s_name):
+            for r in ["vs0", "vs4", "vs8", "vs12", "vs16", "vs20", "vs24", "vs28"] {
                 ops.push(Operand::reg(r));
             }
             out.push(Insn::new(Op::Call, ops, a));
@@ -1558,7 +1738,8 @@ pub fn recover_tail_calls(
         // FP argument registers (see the indirect tail call above): a value
         // carried unchanged into a tail-called callee lives in s0..s7 and a
         // bare `b` records nothing about it.
-        for r in ["vs0", "vs1", "vs2", "vs3", "vs4", "vs5", "vs6", "vs7"] {
+        // Flattened lane-0 names for s0..s7 (see lift::scalar_s_name):
+            for r in ["vs0", "vs4", "vs8", "vs12", "vs16", "vs20", "vs24", "vs28"] {
             ops.push(Operand::reg(r));
         }
         out.push(Insn::new(Op::Call, ops, a));
@@ -1662,6 +1843,9 @@ fn guard_region_def(insn: &Insn) -> Option<u32> {
 /// Does this operand read local `v`? Recurses into addressing sub-operands —
 /// a phi feeding an `arr[i]` index is still a use.
 fn guard_operand_reads(op: &Operand, v: u32) -> bool {
+    // Exhaustive, like `collect_locals`: a guard whose only mention of a
+    // local is as a field base is still a READ of it, and answering `false`
+    // here lets `remove_init_guards` delete a live check.
     match op {
         Operand::Local(l) => *l == v,
         Operand::Memory { base, index, .. } => {
@@ -1673,7 +1857,17 @@ fn guard_operand_reads(op: &Operand, v: u32) -> bool {
             guard_operand_reads(array, v) || guard_operand_reads(index, v)
         }
         Operand::ArrayLength(inner) => guard_operand_reads(inner, v),
-        _ => false,
+        Operand::InstanceField { base, .. } => guard_operand_reads(base, v),
+        Operand::Register(_)
+        | Operand::Immediate(_)
+        | Operand::FloatLiteral(_)
+        | Operand::DoubleLiteral(_)
+        | Operand::StringLiteral { .. }
+        | Operand::Method(_)
+        | Operand::Field(_)
+        | Operand::Type(_)
+        | Operand::MissingAbiArg
+        | Operand::Unknown => false,
     }
 }
 
@@ -1681,7 +1875,7 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
     let mut removed = 0usize;
     // ILR_GCENSUS=1: per-method rejection-reason tally (aggregated over the
     // whole method, printed once at exit)
-    let gc = std::env::var("ILR_GCENSUS").is_ok();
+    let gc = crate::recovery::env_flags::flag("ILR_GCENSUS");
     let mut g: std::collections::HashMap<&'static str, u64> = std::collections::HashMap::new();
     macro_rules! mark {
         ($r:expr) => {{
@@ -1769,15 +1963,14 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
         // structure, never by the compare kind.
         const CHAIN_LIMIT: usize = 12;
         let fall = j + 1;
-        let Op::CondJump(taken) = insns[j].op.clone() else { unreachable!() };
+        let Op::CondJump(taken) = insns[j].op.clone() else {
+            unreachable!()
+        };
 
         // Walk a side forward: stop at any control op. Returns where the
         // walk stopped, how many call-like ops it saw, and the terminal
         // Jump target when the walk stopped AT a Jump.
-        fn chain_walk(
-            insns: &[Insn],
-            mut cur: usize,
-        ) -> (usize, usize, Option<usize>) {
+        fn chain_walk(insns: &[Insn], mut cur: usize) -> (usize, usize, Option<usize>) {
             let mut calls = 0usize;
             for _ in 0..CHAIN_LIMIT {
                 if cur >= insns.len() {
@@ -1802,7 +1995,10 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
                     // it can never be the "pure" side of a guard.
                     Op::Throw => return (cur, calls + 1, None),
                     Op::CondJump(_) | Op::Return => return (cur, calls, None),
-                    Op::Call | Op::CallVoid | Op::IndirectCall | Op::NewObj(_)
+                    Op::Call
+                    | Op::CallVoid
+                    | Op::IndirectCall
+                    | Op::NewObj(_)
                     | Op::ObjcMsgSend { .. } => calls += 1,
                     _ => {}
                 }
@@ -1836,9 +2032,7 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
                 }
             }
         }
-        if merge_idx == usize::MAX && taken_calls >= 1 && taken_jump.is_none()
-            && fall_calls == 0
-        {
+        if merge_idx == usize::MAX && taken_calls >= 1 && taken_jump.is_none() && fall_calls == 0 {
             // taken-slow WITHOUT a terminal Jump: the init chain runs on
             // past the linear walk and falls through into the shared code
             // the fast arm also reaches. Find that join in the CFG: walk
@@ -1934,14 +2128,16 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
                     };
                     nxt.filter(|&nb| nb > head && reachable(nb))
                 });
-                    if let Some(mb) = merge_b {
+                if let Some(mb) = merge_b {
                     let m = cfg2.blocks[mb].start;
                     if m > taken && m <= and_idx + 96 {
                         slow_start = taken;
                         slow_erase_end = m;
                         merge_idx = m;
                     } else if gc {
-                        eprintln!("[gcen] cfg merge mb={mb} m={m} taken={taken} and={and_idx} out-of-range");
+                        eprintln!(
+                            "[gcen] cfg merge mb={mb} m={m} taken={taken} and={and_idx} out-of-range"
+                        );
                     }
                 } else if gc {
                     eprintln!(
@@ -2102,8 +2298,7 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
                         if !matches!(&insns[k].op, Op::Move) {
                             return false;
                         }
-                        let Some(Operand::Memory { addend, .. }) = insns[k].operands.first()
-                        else {
+                        let Some(Operand::Memory { addend, .. }) = insns[k].operands.first() else {
                             return false;
                         };
                         if *addend != guard_addend.unwrap_or(i64::MIN) {
@@ -2121,8 +2316,8 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
                             _ => false,
                         }
                     };
-                    let store_proof = guard_addend.is_some()
-                        && (slow_start..c).any(|k| nonzero_store(k));
+                    let store_proof =
+                        guard_addend.is_some() && (slow_start..c).any(|k| nonzero_store(k));
                     if head_ok
                         && store_proof
                         && matches!(kind, CompareKind::Equal)
@@ -2180,7 +2375,9 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
                 if !matches!(insns[k].op, Op::Move) {
                     continue;
                 }
-                let Some(d) = insns[k].dest().and_then(|d| d.as_local()) else { continue };
+                let Some(d) = insns[k].dest().and_then(|d| d.as_local()) else {
+                    continue;
+                };
                 if feeders.contains(&d) {
                     super::verify::ledger_note(
                         insns[k].address,
@@ -2236,7 +2433,10 @@ pub fn remove_init_guards(insns: &mut [Insn], _cfg: &mut Cfg) -> usize {
         v.sort_by(|a, b| b.1.cmp(a.1));
         eprintln!(
             "[gcen] removed={removed} {}",
-            v.iter().map(|(k, c)| format!("{k}={c}")).collect::<Vec<_>>().join(" ")
+            v.iter()
+                .map(|(k, c)| format!("{k}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
     }
     removed
@@ -2315,9 +2515,9 @@ fn const_value(insns: &[Insn], at: usize, op: &Operand) -> Option<u64> {
         match op {
             Operand::Immediate(v) => Some(*v as u64),
             Operand::Register(name) => {
-                let def = (0..at).rev().find(|&k| {
-                    matches!(insns[k].dest(), Some(Operand::Register(n)) if *n == *name)
-                })?;
+                let def = (0..at).rev().find(
+                    |&k| matches!(insns[k].dest(), Some(Operand::Register(n)) if *n == *name),
+                )?;
                 match insns[def].op {
                     Op::Move => walk(insns, def, insns[def].operands.get(1)?, d + 1),
                     Op::Arith(ArithKind::Add) => {
@@ -2329,7 +2529,9 @@ fn const_value(insns: &[Insn], at: usize, op: &Operand) -> Option<u64> {
                 }
             }
             Operand::Local(v) => {
-                let def = (0..at).rev().find(|&k| insns[k].dest().and_then(|x| x.as_local()) == Some(*v))?;
+                let def = (0..at)
+                    .rev()
+                    .find(|&k| insns[k].dest().and_then(|x| x.as_local()) == Some(*v))?;
                 match insns[def].op {
                     Op::Move => walk(insns, def, insns[def].operands.get(1)?, d + 1),
                     Op::Arith(ArithKind::Add) => {
@@ -2367,12 +2569,12 @@ fn const_value(insns: &[Insn], at: usize, op: &Operand) -> Option<u64> {
 /// lookup — with `ILR_SWGAPS` listing what was rejected — not this helper.
 fn def_at(insns: &[Insn], op: &Operand, before: usize) -> Option<usize> {
     match op {
-        Operand::Local(v) => (0..before).rev().find(|&k| {
-            insns[k].dest().and_then(|d| d.as_local()) == Some(*v)
-        }),
-        Operand::Register(n) => (0..before).rev().find(|&k| {
-            matches!(insns[k].dest(), Some(Operand::Register(m)) if m == n)
-        }),
+        Operand::Local(v) => (0..before)
+            .rev()
+            .find(|&k| insns[k].dest().and_then(|d| d.as_local()) == Some(*v)),
+        Operand::Register(n) => (0..before)
+            .rev()
+            .find(|&k| matches!(insns[k].dest(), Some(Operand::Register(m)) if m == n)),
         _ => None,
     }
 }
@@ -2383,6 +2585,46 @@ fn as_value(op: &Operand) -> Option<&Operand> {
         Operand::Local(_) | Operand::Register(_) => Some(op),
         _ => None,
     }
+}
+
+/// Chase a pure register-copy chain backwards (`mov w8, w24`) and return the
+/// value the copy was made from.
+///
+/// LLVM always materialises the switch index into a fresh register before
+/// indexing the jump table, so a bounds guard and the table load never name the
+/// same physical register:
+///
+/// ```text
+/// 17ecf80: cmp  w24, #0x8        <- guard names w24
+/// 17ecf84: b.hi default
+/// 17ecf8c: mov  w8, w24          <- index copied to a fresh register
+/// 17ecf98: ldrb w11, [x9, x8]    <- load names x8
+/// ```
+///
+/// Correlating guard to load on raw register identity therefore never matched:
+/// measured over the corpus, 0 of 219 dispatch sites have the guard on the
+/// load's own register and 215 of 219 name a different one. Chasing the copy
+/// chain on both sides restores the correlation. Bounded to 4 hops; every
+/// result is still validated by the table read itself.
+fn canonical_value(insns: &[Insn], op: &Operand, before: usize) -> Operand {
+    let mut cur = op.clone();
+    for _ in 0..4 {
+        let Some(def_i) = def_at(insns, &cur, before) else {
+            break;
+        };
+        let ins = &insns[def_i];
+        if !matches!(ins.op, Op::Move) {
+            break;
+        }
+        let Some(src) = ins.operands.get(1).and_then(as_value) else {
+            break;
+        };
+        if *src == cur {
+            break;
+        }
+        cur = src.clone();
+    }
+    cur
 }
 
 /// Chase a switch-value chain back to its indexed memory load.
@@ -2423,6 +2665,31 @@ fn chase_table_load(insns: &[Insn], start: &Operand, at: usize) -> Option<(usize
     None
 }
 
+/// What a jump-table recognizer proved about one dispatch.
+///
+/// `targets` alone is not the whole fact. The guard that bounds the table
+/// (`cmp idx, #N; b.hi default`) names the **default target** — the block a C#
+/// `switch` reaches when no case matches — and the table load names the
+/// **discriminant** (the value being switched on). Both used to be discarded:
+/// the switch instruction was rebuilt with an EMPTY operand vector, so the
+/// renderer could only emit the case arms and had to guess the discriminant by
+/// scanning back for any `Compare`. Measured before the fix: 0 of 222 switches
+/// carried a `default:` and 37 printed the literal `switchValue`.
+///
+/// `default` is the guard's taken-target **RVA** (not an instruction index):
+/// `ssa::transform` remaps `Jump`/`CondJump`/`Switch` targets because it
+/// inserts phi-copy instructions, and anything stored in `operands` is not
+/// remapped. An RVA survives.
+struct TableRecovery {
+    /// Case target RVAs; index == case value.
+    targets: Vec<u64>,
+    /// The guard's taken-target RVA, when the bound compare feeds a
+    /// conditional branch (the only shape that proves a default exists).
+    default: Option<u64>,
+    /// The canonical table-index operand — the value the switch dispatches on.
+    disc: Option<Operand>,
+}
+
 /// LLVM/Clang ARM64 anchored jump table (16- or 32-bit entries):
 ///
 /// ```text
@@ -2442,7 +2709,7 @@ fn anchor_table_targets(
     lo: u64,
     hi: u64,
     read_u32: &dyn Fn(u64) -> Option<u32>,
-) -> Option<Vec<u64>> {
+) -> Option<TableRecovery> {
     let c = as_value(insns[i].operands.first()?)?.clone();
     let add_i = def_at(insns, &c, i)?;
     if !matches!(insns[add_i].op, Op::Arith(ArithKind::Add)) {
@@ -2504,49 +2771,90 @@ fn anchor_table_targets(
     // (adjacent jump tables / pointers), whose entries also happen to land
     // inside the method span and invent phantom switch arms.
     let mut max_case: u64 = 1023;
-    // Find `cmp idx, #N` in the guard region right before the dispatch.
+    // Find the `cmp idx, #N` guard that bounds the table, right before the dispatch.
     //
     // NEAREST FIRST. Scanning forward took the EARLIEST `cmp reg, #imm` that
-    // mentioned the index register — an unrelated check earlier in the method,
-    // usually `cmp x0, #0` — and capped the table there. On 0x1cfbc6c that set
-    // `max_case = 0`, so only one entry was read, `out.len() >= 2` failed and
-    // the whole 6-arm switch fell back to `IndirectCall`: its case bodies were
-    // never walked and all 61 native conditions plus 31 calls inside them were
-    // reported as lost. The real bound is the LAST such compare before the
-    // dispatch.
+    // mentioned the index register - an unrelated check earlier in the method,
+    // usually `cmp x0, #0` - and capped the table there. On 0x1cfbc6c that set
+    // `max_case = 0`, so only one entry was read, `out.len() >= 2` failed and the
+    // whole 6-arm switch fell back to `IndirectCall`: its case bodies were never
+    // walked and all 61 native conditions plus 31 calls inside them were reported
+    // as lost. The real bound is the LAST such compare before the dispatch.
+    //
+    // CORRELATION BY VALUE, NOT BY REGISTER NAME. The guard names the original
+    // index register while the table load names a fresh copy of it (see
+    // `canonical_value`). Matching on register identity alone never fires, which
+    // leaves `max_case` at its 1023 initialiser and makes the scan read whatever
+    // follows the real table: NGUIMath.ResizeWidget @0x17ECE8C has a 9-entry
+    // table and emitted 479 phantom cases.
+    let want = index.as_deref().map(|ix| canonical_value(insns, ix, load_i));
+    // Strict shape first (`cmp` feeding a `b.cond`), then a lenient fallback so
+    // sites that previously matched on an unusual guard shape keep their bound.
+    //
+    // The strict shape is ALSO the only evidence of a default arm: `b.hi` is
+    // taken exactly when the index is out of range, so its target is the block
+    // C# would write under `default:`. It is captured here instead of being
+    // dropped on the floor.
+    let mut strict: Option<(u64, u64)> = None;
+    let mut lenient: Option<u64> = None;
     for k in (i.saturating_sub(40)..i).rev() {
         if !matches!(insns[k].op, Op::Compare(_)) {
             continue;
         }
         let op1 = insns[k].operands.get(1);
         let op2 = insns[k].operands.get(2);
-        let idx_hit = |o: Option<&Operand>| {
-            match (index.as_deref(), o) {
-                (Some(Operand::Local(ix)), Some(Operand::Local(v))) => ix == v,
-                (Some(Operand::Register(ix)), Some(Operand::Register(v))) => ix == v,
-                _ => false,
-            }
-        };
         let imm_of = |o: Option<&Operand>| match o {
             Some(Operand::Immediate(n)) if *n >= 0 && *n < 1024 => Some(*n as u64),
             _ => None,
         };
-        if idx_hit(op1) {
-            if let Some(n) = imm_of(op2) {
-                max_case = n;
-                break;
+        let bound_for = |reg: Option<&Operand>, imm: Option<&Operand>| -> Option<u64> {
+            let (reg, imm) = (reg?, imm?);
+            match want.as_ref() {
+                // No index operand to correlate against: keep the old
+                // register-identity rule so behaviour is unchanged there.
+                None => match (index.as_deref(), reg) {
+                    (Some(Operand::Local(ix)), Operand::Local(v)) if ix == v => {}
+                    (Some(Operand::Register(ix)), Operand::Register(v)) if ix == v => {}
+                    _ => return None,
+                },
+                Some(w) => {
+                    if canonical_value(insns, reg, k) != *w {
+                        return None;
+                    }
+                }
             }
-        }
-        if idx_hit(op2) {
-            if let Some(n) = imm_of(op1) {
-                max_case = n;
-                break;
+            imm_of(Some(imm))
+        };
+        if let Some(n) = bound_for(op1, op2).or_else(|| bound_for(op2, op1)) {
+            // The default target is the branch this compare guards. At this
+            // point (step 1.5, before `Cfg::build`) a `CondJump` still holds
+            // an RVA, which is exactly the form the renderer can resolve
+            // without depending on instruction numbering.
+            match insns.get(k + 1).map(|x| &x.op) {
+                Some(Op::CondJump(t)) => {
+                    strict = Some((n, *t as u64));
+                    break;
+                }
+                _ => {
+                    if lenient.is_none() {
+                        lenient = Some(n);
+                    }
+                }
             }
         }
     }
+    // A lenient bound still caps the table, but it proves nothing about a
+    // default arm (no branch consumes the compare), so `default` stays None.
+    let default = strict.map(|(_, d)| d);
+    match (strict, lenient) {
+        (Some((n, _)), _) => max_case = n,
+        (None, Some(n)) => max_case = n,
+        (None, None) => {}
+    }
+
     let tbl = const_value(insns, load_i, base)?.wrapping_add(*addend as u64);
     let mul = 1u64 << shift;
-    if std::env::var("ILR_SWDBG").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_SWDBG") {
         eprintln!(
             "[anchor] @{:#x} anchor={:#x} load_i={} shift={} stride={} entry_bits={} max_case={} tbl={:#x} first_read={:?} lo={:#x} hi={:#x}",
             insns[i].address,
@@ -2588,7 +2896,11 @@ fn anchor_table_targets(
         }
         out.push(tgt);
     }
-    (out.len() >= 2).then_some(out)
+    (out.len() >= 2).then_some(TableRecovery {
+        targets: out,
+        default,
+        disc: want,
+    })
 }
 
 /// `ILR_SWGAPS=<path>` — append every dispatch (`br Xn`) that the recognizer
@@ -2606,7 +2918,11 @@ fn swgap_dump(insns: &[Insn], i: usize, why: &str) {
     let Some(p) = PATH.get_or_init(|| std::env::var("ILR_SWGAPS").ok().map(Into::into)) else {
         return;
     };
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) else {
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+    else {
         return;
     };
     let _ = writeln!(
@@ -2652,7 +2968,10 @@ fn arm32_table_targets(
         return None;
     }
     let Operand::Memory {
-        base, index, addend, ..
+        base,
+        index,
+        addend,
+        ..
     } = insns[load_i].operands.get(1)?
     else {
         return None;
@@ -2702,18 +3021,26 @@ pub fn recover_switch_tables(
         if !matches!(insns[i].op, Op::IndirectCall) {
             continue;
         }
-        if std::env::var("ILR_SWDBG").is_ok() {
-            eprintln!("[sw] @{:#x} IndirectCall op0={:?}", insns[i].address, insns[i].operands.first());
+        if crate::recovery::env_flags::flag("ILR_SWDBG") {
+            eprintln!(
+                "[sw] @{:#x} IndirectCall op0={:?}",
+                insns[i].address,
+                insns[i].operands.first()
+            );
             for k in i.saturating_sub(14)..i {
-                eprintln!("   [{k}] @{:#x}: op={:?} operands={:?}", insns[k].address, insns[k].op, insns[k].operands);
+                eprintln!(
+                    "   [{k}] @{:#x}: op={:?} operands={:?}",
+                    insns[k].address, insns[k].op, insns[k].operands
+                );
             }
         }
 
         // Shape 1: LLVM anchored table (16/32-bit entries + ADR anchor).
-        let targets_rva = anchor_table_targets(insns, i, lo, hi, read_u32);
+        let recovery = anchor_table_targets(insns, i, lo, hi, read_u32);
         // Shape 2 (legacy): scale-4 word table whose base is immediate-
         // derived; entries are absolute RVAs or byte offsets from table base.
-        let targets_rva = targets_rva.or_else(|| {
+        // This shape has no guard correlation, so it proves no default arm.
+        let recovery = recovery.or_else(|| {
             let mut load_idx = None;
             for k in i.saturating_sub(12)..i {
                 let has_dest = matches!(
@@ -2723,8 +3050,11 @@ pub fn recover_switch_tables(
                 if !has_dest || !matches!(insns[k].op, Op::Move) {
                     continue;
                 }
-                if let Some(Operand::Memory { index: Some(_), scale, .. }) =
-                    insns[k].operands.get(1)
+                if let Some(Operand::Memory {
+                    index: Some(_),
+                    scale,
+                    ..
+                }) = insns[k].operands.get(1)
                 {
                     if *scale == 4 {
                         load_idx = Some(k);
@@ -2742,7 +3072,9 @@ pub fn recover_switch_tables(
             let table_addr = table_addr.wrapping_add(*addend as u64);
             let mut out = Vec::new();
             for case in 0..1024u64 {
-                let Some(raw) = read_u32(table_addr.wrapping_add(case * 4)) else { break };
+                let Some(raw) = read_u32(table_addr.wrapping_add(case * 4)) else {
+                    break;
+                };
                 let candidate = raw as u64;
                 if (lo..=hi).contains(&candidate) {
                     out.push(candidate);
@@ -2752,14 +3084,23 @@ pub fn recover_switch_tables(
                     break;
                 }
             }
-            (out.len() >= 2).then_some(out)
+            (out.len() >= 2).then_some(out).map(|targets| TableRecovery {
+                targets,
+                default: None,
+                disc: None,
+            })
         });
 
         // Shape 3: ARM32 word-offset table (see `arm32_table_targets`).
-        let targets_rva =
-            targets_rva.or_else(|| arm32_table_targets(insns, i, lo, hi, read_u32));
+        let recovery = recovery.or_else(|| {
+            arm32_table_targets(insns, i, lo, hi, read_u32).map(|targets| TableRecovery {
+                targets,
+                default: None,
+                disc: None,
+            })
+        });
 
-        let Some(targets_rva) = targets_rva else {
+        let Some(recovery) = recovery else {
             // A dispatch we could not resolve. The ARM32 lifter marks a
             // PC-dispatch (`add pc, …` / `mov pc, …`) with a trailing
             // `Immediate(-1)` sentinel, so it is distinguishable from a
@@ -2767,20 +3108,35 @@ pub fn recover_switch_tables(
             // unresolved PC-dispatch renders a garbage `fnptr_…()` and flags
             // the whole method `suspect`; an exit is the honest best we can do —
             // the targets are unknown either way.
-            let pc_dispatch =
-                matches!(insns[i].operands.last(), Some(Operand::Immediate(-1)));
+            let pc_dispatch = matches!(insns[i].operands.last(), Some(Operand::Immediate(-1)));
             if pc_dispatch {
                 insns[i] = Insn::new(Op::Jump(usize::MAX), vec![], insns[i].address);
             }
             swgap_dump(insns, i, "no-shape");
             continue;
         };
-        // convert to instruction indices; drop unresolved (default arm)
-        let mut targets = Vec::with_capacity(targets_rva.len());
-        for rva in &targets_rva {
+        // Convert case targets to instruction indices. A target that does not
+        // land on an instruction boundary is kept as `usize::MAX` (an exit);
+        // the boundary check inside the recognizer already refuses to read past
+        // the table, so this only catches an entry the reader accepted.
+        let mut targets = Vec::with_capacity(recovery.targets.len());
+        for rva in &recovery.targets {
             targets.push(addr_to_idx.get(rva).copied().unwrap_or(usize::MAX));
         }
-        insns[i] = Insn::new(Op::Switch(targets), vec![], insns[i].address);
+        // Carry the two facts the case list cannot express. Before this, the
+        // switch instruction was rebuilt with an EMPTY operand vector and the
+        // renderer had to guess the discriminant (37 of 222 printed the literal
+        // `switchValue`) and could not emit a `default:` at all (0 of 222).
+        //
+        // Layout is fixed so a reader does not have to sniff it:
+        //   operands[0] = discriminant (`Unknown` when the table load named no
+        //                 index, i.e. shapes 2/3)
+        //   operands[1] = default target RVA, or `Immediate(-1)` for "none"
+        // `ssa::use_slots` walks every operand, so the discriminant is renamed
+        // to its SSA version for free and DCE keeps the value the switch reads.
+        let disc = recovery.disc.unwrap_or(Operand::Unknown);
+        let default = Operand::Immediate(recovery.default.map(|d| d as i64).unwrap_or(-1));
+        insns[i] = Insn::new(Op::Switch(targets), vec![disc, default], insns[i].address);
         recovered += 1;
     }
 
@@ -2788,4 +3144,231 @@ pub fn recover_switch_tables(
         dead_code_elimination(insns);
     }
     recovered
+}
+
+/// Regression tests for the private operand walkers in this module.
+///
+/// These live here rather than in `tests.rs` because the walkers are private:
+/// the point of the test is the walker itself, not a pipeline effect, and
+/// widening their visibility to reach them from a sibling module would be a
+/// worse trade than a four-line test module.
+#[cfg(test)]
+mod walker_tests {
+    use super::*;
+    use crate::recovery::{FieldRef, ManagedType, PrimKind};
+
+    fn ifield(base: Operand) -> Operand {
+        Operand::InstanceField {
+            base: Box::new(base),
+            field: FieldRef {
+                type_def_index: 1,
+                field_index: 2,
+                name: "_setting".into(),
+                declaring_type_name: "Setting".into(),
+                field_type: ManagedType::Primitive(PrimKind::Boolean),
+                is_static: false,
+            },
+        }
+    }
+
+    /// `remove_init_guards` erases an init region only when nothing the region
+    /// defines is read outside it, and it asks this predicate. A field base is
+    /// a READ: without the `InstanceField` arm the predicate answered `false`
+    /// for `v._field`, the region was judged unread and a live value was
+    /// erased with it.
+    #[test]
+    fn a_field_base_reads_its_receiver() {
+        assert!(guard_operand_reads(&ifield(Operand::Local(7)), 7));
+        assert!(!guard_operand_reads(&ifield(Operand::Local(7)), 8));
+        // nested: a field of a field of a memory load off the local
+        let deep = ifield(Operand::Memory {
+            base: Box::new(Operand::Local(7)),
+            index: None,
+            scale: 1,
+            addend: 0x30,
+            width: 0,
+        });
+        assert!(guard_operand_reads(&deep, 7));
+    }
+
+    /// Same contract for the DCE use-count walker, at nesting depth 2.
+    #[test]
+    fn a_nested_field_base_is_collected_once_per_mention() {
+        let mut out = Vec::new();
+        collect_locals(&ifield(ifield(Operand::Local(7))), &mut out);
+        assert_eq!(out, vec![7]);
+    }
+
+    // ----------------------------------------------------------------------
+    // S2/S3: the switch instruction must carry the facts the case list cannot.
+    // ----------------------------------------------------------------------
+
+    /// Build the S1 jump-table fixture (byte table at `TBL`, anchor `ANCHOR`,
+    /// index copied into a fresh register) and return the instruction list.
+    ///
+    /// `guard` selects the shape in front of the table:
+    ///   `Guard::Strict`  — `cmp x8,#3; b.hi 0x1050` (the LLVM bound + default)
+    ///   `Guard::Lenient` — `cmp x8,#3` with no branch consuming it
+    ///   `Guard::None`    — no compare at all
+    fn switch_fixture(guard: Guard) -> Vec<Insn> {
+        const TBL: u64 = 0x5000;
+        const ANCHOR: u64 = 0x1020;
+        let mut insns: Vec<Insn> = Vec::new();
+        for k in 0..12u64 {
+            insns.push(Insn::new(Op::Nop, vec![], 0x1000 + k * 4));
+        }
+        match guard {
+            Guard::Strict => {
+                insns.push(Insn::new(
+                    Op::Compare(CompareKind::GreaterThan),
+                    vec![Operand::Local(9), Operand::reg("x8"), Operand::imm(3)],
+                    0x1030,
+                ));
+                // The branch a `cmp; b.hi` pair puts here. Its operand is an
+                // RVA at this stage (step 1.5, before `Cfg::build`).
+                insns.push(Insn::new(Op::CondJump(0x1050), vec![Operand::Local(9)], 0x1034));
+            }
+            Guard::Lenient => {
+                insns.push(Insn::new(
+                    Op::Compare(CompareKind::GreaterThan),
+                    vec![Operand::Local(9), Operand::reg("x8"), Operand::imm(3)],
+                    0x1030,
+                ));
+                // Not a branch: this compare proves a bound but no default arm.
+                insns.push(Insn::new(Op::Nop, vec![], 0x1034));
+            }
+            Guard::None => {}
+        }
+        // The table is indexed by x7, a COPY of x8 — the S1 shape.
+        insns.push(Insn::move_(Operand::reg("x7"), Operand::reg("x8"), 0x1038));
+        insns.push(Insn::move_(Operand::reg("x9"), Operand::imm(TBL as i64), 0x103c));
+        insns.push(Insn::new(
+            Op::Arith(ArithKind::Add),
+            vec![Operand::reg("x9"), Operand::reg("x9"), Operand::imm(0)],
+            0x1040,
+        ));
+        insns.push(Insn::move_(Operand::reg("x10"), Operand::imm(ANCHOR as i64), 0x1044));
+        insns.push(Insn::move_(
+            Operand::reg("x11"),
+            Operand::Memory {
+                width: 1,
+                base: Box::new(Operand::reg("x9")),
+                index: Some(Box::new(Operand::reg("x7"))),
+                scale: 1,
+                addend: 0,
+            },
+            0x1048,
+        ));
+        insns.push(Insn::new(
+            Op::Arith(ArithKind::Shl),
+            vec![Operand::reg("xt0"), Operand::reg("x11"), Operand::imm(2)],
+            0x104c,
+        ));
+        insns.push(Insn::new(
+            Op::Arith(ArithKind::Add),
+            vec![Operand::reg("x10"), Operand::reg("x10"), Operand::reg("xt0")],
+            0x1050,
+        ));
+        insns.push(Insn::new(Op::IndirectCall, vec![Operand::reg("x10")], 0x1054));
+        insns
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Guard {
+        Strict,
+        Lenient,
+        None,
+    }
+
+    /// Run `recover_switch_tables` over the fixture and return the recovered
+    /// switch instruction's operands.
+    fn switch_operands(guard: Guard) -> (Vec<usize>, Vec<Operand>) {
+        const TBL: u64 = 0x5000;
+        let mut insns = switch_fixture(guard);
+        let addresses: Vec<u64> = insns.iter().map(|i| i.address).collect();
+        // 4 real entries, then garbage that still lands in span: only the
+        // guard can tell them apart.
+        let bytes: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0xff, 0xff, 0xff];
+        let read = move |a: u64| -> Option<u32> {
+            if a < TBL || a + 4 > TBL + bytes.len() as u64 {
+                return None;
+            }
+            let i = (a - TBL) as usize;
+            Some(u32::from_le_bytes([
+                bytes[i],
+                bytes[i + 1],
+                bytes[i + 2],
+                bytes[i + 3],
+            ]))
+        };
+        let n = recover_switch_tables(&mut insns, &addresses, &read);
+        assert_eq!(n, 1, "the table must be recovered");
+        insns
+            .iter()
+            .find_map(|i| match &i.op {
+                Op::Switch(t) => Some((t.clone(), i.operands.clone())),
+                _ => None,
+            })
+            .expect("switch")
+    }
+
+    /// The guard's taken target IS the default arm, and the case list cannot
+    /// express it. Before the fix the switch was rebuilt with `vec![]`, so the
+    /// renderer had no way to emit `default:` (measured: 0 of 222 switches).
+    ///
+    /// NEUTRALISATION: restore `vec![]` in `recover_switch_tables` and this
+    /// assertion panics on the empty operand list.
+    #[test]
+    fn switch_default_target_reaches_the_ir() {
+        let (targets, operands) = switch_operands(Guard::Strict);
+        assert_eq!(targets.len(), 4, "the guard bounds the table at 4 entries");
+        assert_eq!(
+            operands.get(1),
+            Some(&Operand::Immediate(0x1050)),
+            "operands[1] must be the guard's taken-target RVA (the default arm)"
+        );
+    }
+
+    /// The discriminant must be the CANONICAL table index, not the fresh
+    /// register the load names: the guard and the load never share a register,
+    /// and the renderer used to guess the value by scanning back for any
+    /// `Compare` (37 of 222 switches printed the literal `switchValue`).
+    ///
+    /// NEUTRALISATION: store `index` instead of `want` and this asserts `x7`.
+    #[test]
+    fn switch_discriminant_is_the_canonical_index() {
+        let (_, operands) = switch_operands(Guard::Strict);
+        assert_eq!(
+            operands.first(),
+            Some(&Operand::reg("x8")),
+            "operands[0] must be the canonical index (x8), not the load's copy (x7)"
+        );
+    }
+
+    /// No guard means no default. The recognizer still recovers the table (the
+    /// read stops when an entry leaves the method span), but it must not
+    /// invent a default arm.
+    #[test]
+    fn no_guard_means_no_default() {
+        let (targets, operands) = switch_operands(Guard::None);
+        assert!(targets.len() >= 2, "the table is still recovered");
+        assert_eq!(
+            operands.get(1),
+            Some(&Operand::Immediate(-1)),
+            "Immediate(-1) is the \"no default\" sentinel"
+        );
+    }
+
+    /// A bound compare that no branch consumes caps the table but proves
+    /// nothing about a default arm: the lenient path must leave it unset.
+    #[test]
+    fn lenient_bound_is_not_a_default() {
+        let (targets, operands) = switch_operands(Guard::Lenient);
+        assert_eq!(targets.len(), 4, "the lenient bound still caps the table");
+        assert_eq!(
+            operands.get(1),
+            Some(&Operand::Immediate(-1)),
+            "a compare with no branch behind it is not evidence of a default"
+        );
+    }
 }

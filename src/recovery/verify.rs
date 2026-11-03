@@ -662,16 +662,14 @@ pub struct DecodedInsn {
 fn classify_arm64(mnemonic: &str) -> InsnClass {
     match mnemonic {
         "bl" | "blr" => InsnClass::Call,
-        "b" | "b.eq" | "b.ne" | "b.hs" | "b.lo" | "b.mi" | "b.pl" | "b.vs" | "b.vc"
-        | "b.hi" | "b.ls" | "b.ge" | "b.lt" | "b.gt" | "b.le" | "b.al" | "cbz" | "cbnz"
-        | "tbz" | "tbnz" | "ret" | "br" => InsnClass::Branch,
-        "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldrsb" | "ldrsh"
-        | "ldrsw" | "ldp" | "stp" | "ldnp" | "stnp" | "ldur" | "stur" | "ldurb"
-        | "sturb" | "ldurh" | "sturh" | "prfm" => InsnClass::LoadStore,
-        "nop" | "brk" | "udf" | "dmb" | "dsb" | "isb" | "hint" | "msr" | "mrs"
-        | "adr" | "adrp" | "svc" | "hvc" | "smc" | "wfe" | "wfi" | "sev" | "yield" => {
-            InsnClass::Pseudo
-        }
+        "b" | "b.eq" | "b.ne" | "b.hs" | "b.lo" | "b.mi" | "b.pl" | "b.vs" | "b.vc" | "b.hi"
+        | "b.ls" | "b.ge" | "b.lt" | "b.gt" | "b.le" | "b.al" | "cbz" | "cbnz" | "tbz" | "tbnz"
+        | "ret" | "br" => InsnClass::Branch,
+        "ldr" | "str" | "ldrb" | "strb" | "ldrh" | "strh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldp"
+        | "stp" | "ldnp" | "stnp" | "ldur" | "stur" | "ldurb" | "sturb" | "ldurh" | "sturh"
+        | "prfm" => InsnClass::LoadStore,
+        "nop" | "brk" | "udf" | "dmb" | "dsb" | "isb" | "hint" | "msr" | "mrs" | "adr" | "adrp"
+        | "svc" | "hvc" | "smc" | "wfe" | "wfi" | "sev" | "yield" => InsnClass::Pseudo,
         // `fcmpe`/`fccmp`/`fccmpe` belong here with `fcmp`: they are the FP
         // compares (the `-e` suffix only adds the "raise on quiet NaN" rule,
         // and `fccmp` is the conditional-compare that joins two float tests).
@@ -679,34 +677,30 @@ fn classify_arm64(mnemonic: &str) -> InsnClass {
         // them was reported as uncovered semantics — 64 `fccmp` in the arm64
         // reference sample — even though the lifter folds them into the
         // consumer's `Compare` exactly like `fcmp`.
-        "fmov" | "fcmp" | "fcmpe" | "fccmp" | "fccmpe" | "fcsel" | "fcvt" | "fcvtzs" | "fcvtzu" | "fcvtas" | "fcvtau"
-        | "fcvtps" | "fcvtpu" | "fcvtms" | "fcvtmu" | "fcvtns" | "fcvtnu" | "scvtf"
-        | "ucvtf" | "fadd" | "fsub" | "fmul" | "fdiv" | "fsqrt" | "fabs" | "fneg"
-        | "fmax" | "fmin" | "fmadd" | "fmsub" | "fnmadd" | "fnmsub" | "frintn"
-        | "frintp" | "frintm" | "frintz" | "frinta" | "frintx" | "frinti" => {
-            InsnClass::Float
-        }
-        "add" | "adds" | "sub" | "subs" | "mul" | "madd" | "msub" | "smull" | "umull"
-        | "sdiv" | "udiv" | "and" | "ands" | "orr" | "orn" | "eor" | "eon" | "bic"
-        | "mvn" | "lsl" | "lsr" | "asr" | "ror" | "clz" | "rbit" | "rev" | "rev16"
-        | "rev32" | "sxtb" | "sxth" | "sxtw" | "uxtb" | "uxth" | "uxtw" | "cmp"
-        | "cmn" | "tst" | "ccmp" | "ccmn" | "csel" | "csinc" | "csinv" | "csneg"
-        | "cset" | "csetm" | "cinc" | "cinv" | "cneg" | "mov" | "movz" | "movk"
-        | "movn" | "sbfm" | "ubfm" | "sbfiz" | "ubfiz" | "extr" | "bfi" | "bfm"
-        | "bfxil" => InsnClass::Arith,
+        "fmov" | "fcmp" | "fcmpe" | "fccmp" | "fccmpe" | "fcsel" | "fcvt" | "fcvtzs" | "fcvtzu"
+        | "fcvtas" | "fcvtau" | "fcvtps" | "fcvtpu" | "fcvtms" | "fcvtmu" | "fcvtns" | "fcvtnu"
+        | "scvtf" | "ucvtf" | "fadd" | "fsub" | "fmul" | "fdiv" | "fsqrt" | "fabs" | "fneg"
+        | "fmax" | "fmin" | "fmadd" | "fmsub" | "fnmadd" | "fnmsub" | "frintn" | "frintp"
+        | "frintm" | "frintz" | "frinta" | "frintx" | "frinti" => InsnClass::Float,
+        "add" | "adds" | "sub" | "subs" | "mul" | "madd" | "msub" | "smull" | "umull" | "sdiv"
+        | "udiv" | "and" | "ands" | "orr" | "orn" | "eor" | "eon" | "bic" | "mvn" | "lsl"
+        | "lsr" | "asr" | "ror" | "clz" | "rbit" | "rev" | "rev16" | "rev32" | "sxtb" | "sxth"
+        | "sxtw" | "uxtb" | "uxth" | "uxtw" | "cmp" | "cmn" | "tst" | "ccmp" | "ccmn" | "csel"
+        | "csinc" | "csinv" | "csneg" | "cset" | "csetm" | "cinc" | "cinv" | "cneg" | "mov"
+        | "movz" | "movk" | "movn" | "sbfm" | "ubfm" | "sbfiz" | "ubfiz" | "extr" | "bfi"
+        | "bfm" | "bfxil" => InsnClass::Arith,
         // NEON vector ops: no managed-logic semantic today (the lifter
         // ignores them); classifying as Pseudo keeps the oracle honest
         // instead of mass-flagging SIMD-heavy methods.
-        "movi" | "mvni" | "dup" | "sshll" | "ushll" | "shl" | "sshr" | "ushr"
-        | "srshr" | "urshr" | "sqadd" | "uqadd" | "sqsub" | "uqsub" | "sqdmulh"
-        | "sqrdmulh" | "smax" | "umax" | "smin" | "umin" | "smaxp" | "umaxp"
-        | "addp" | "addv" | "saddlv" | "uaddlv" | "saddp" | "uaddp" | "xtl"
-        | "xtl2" | "shrn" | "rshrn" | "sqrshrn" | "uqrshrn" | "sqshrn" | "uqshrn"
-        | "sri" | "sli" | "tbl" | "tbx" | "uzp1" | "uzp2" | "zip1" | "zip2"
-        | "trn1" | "trn2" | "ins" | "umov" | "smov" | "sqxtn" | "sqxtun"
-        | "uqxtn" | "sqshrun" | "uqshrun" | "fcvtn" | "fcvtl" | "fcvtn2"
-        | "fcvtl2" | "rev64" | "ext" | "pmul" | "pmull" | "ld1r" | "st1"
-        | "ld1" | "ld2" | "ld3" | "ld4" | "st2" | "st3" | "st4" => InsnClass::Pseudo,
+        "movi" | "mvni" | "dup" | "sshll" | "ushll" | "shl" | "sshr" | "ushr" | "srshr"
+        | "urshr" | "sqadd" | "uqadd" | "sqsub" | "uqsub" | "sqdmulh" | "sqrdmulh" | "smax"
+        | "umax" | "smin" | "umin" | "smaxp" | "umaxp" | "addp" | "addv" | "saddlv" | "uaddlv"
+        | "saddp" | "uaddp" | "xtl" | "xtl2" | "shrn" | "rshrn" | "sqrshrn" | "uqrshrn"
+        | "sqshrn" | "uqshrn" | "sri" | "sli" | "tbl" | "tbx" | "uzp1" | "uzp2" | "zip1"
+        | "zip2" | "trn1" | "trn2" | "ins" | "umov" | "smov" | "sqxtn" | "sqxtun" | "uqxtn"
+        | "sqshrun" | "uqshrun" | "fcvtn" | "fcvtl" | "fcvtn2" | "fcvtl2" | "rev64" | "ext"
+        | "pmul" | "pmull" | "ld1r" | "st1" | "ld1" | "ld2" | "ld3" | "ld4" | "st2" | "st3"
+        | "st4" => InsnClass::Pseudo,
         _ => InsnClass::Other,
     }
 }
@@ -740,11 +734,7 @@ fn base_mnemonic32(mnemonic: &str) -> &str {
 /// `Compare` at the branch they feed) were reported as uncovered semantics — a
 /// measurement artifact sitting at the top of the cluster table.
 fn base_mnemonic(m: &str, is_arm32: bool) -> &str {
-    if is_arm32 {
-        base_mnemonic32(m)
-    } else {
-        m
-    }
+    if is_arm32 { base_mnemonic32(m) } else { m }
 }
 
 /// Does this decoded instruction READ the flags to produce a VALUE instead of
@@ -768,8 +758,7 @@ fn base_mnemonic(m: &str, is_arm32: bool) -> &str {
 /// flags (`movne`), while a plain `mov` writes them not at all.
 fn consumes_flags(raw_mnemonic: &str, base_mnemonic: &str, is_arm32: bool) -> bool {
     const SELECT_CONSUMERS: &[&str] = &[
-        "csel", "csinc", "csinv", "csneg", "fcsel", "cset", "csetm", "cinc", "cinv",
-        "cneg",
+        "csel", "csinc", "csinv", "csneg", "fcsel", "cset", "csetm", "cinc", "cinv", "cneg",
     ];
     if SELECT_CONSUMERS.contains(&base_mnemonic) {
         return true;
@@ -868,13 +857,12 @@ fn classify_arm32(mnemonic: &str) -> InsnClass {
 fn classify_x86(mnemonic: &str) -> InsnClass {
     match mnemonic {
         "call" => InsnClass::Call,
-        "jmp" | "je" | "jne" | "jg" | "jl" | "jge" | "jle" | "ja" | "jb" | "jae"
-        | "jbe" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp" | "jrcxz" | "jecxz" | "ret"
-        | "leave" => InsnClass::Branch,
-        "mov" | "movzx" | "movsx" | "movsxd" | "lea" | "xchg" | "sete" | "setne"
-        | "setg" | "setl" => {
-            InsnClass::Arith
+        "jmp" | "je" | "jne" | "jg" | "jl" | "jge" | "jle" | "ja" | "jb" | "jae" | "jbe" | "js"
+        | "jns" | "jo" | "jno" | "jp" | "jnp" | "jrcxz" | "jecxz" | "ret" | "leave" => {
+            InsnClass::Branch
         }
+        "mov" | "movzx" | "movsx" | "movsxd" | "lea" | "xchg" | "sete" | "setne" | "setg"
+        | "setl" => InsnClass::Arith,
         // Non-semantic filler / markers. `0xCC` (`int3`) is the inter-function
         // ALIGNMENT pad, and the body extent runs to the NEXT method's start,
         // so a measured body swallows every padding byte up to it. Classed as
@@ -958,10 +946,10 @@ fn facts_arm64(inst: &yaxpeax_arm::armv8::a64::Instruction, iaddr: u64) -> Nativ
                 O64::PCOffset(off) => Some((iaddr as i64 + off) as u64),
                 _ => None,
             });
-            f.tbz_bit = ops.iter().find_map(|o| match o {
-                O64::Immediate(v) => Some(*v),
-                _ => None,
-            });
+            // yaxpeax encodes the tbz/tbnz bit index as Imm16, not
+            // Immediate; reading only Immediate left tbz_bit at None, so the
+            // bit-number oracle never ran on any site.
+            f.tbz_bit = ops.iter().find_map(|o| imm_of(o).map(|v| v as u32));
             if let Some(t) = target {
                 f.cond_branch = Some((code, t));
             }
@@ -980,14 +968,26 @@ fn facts_arm64(inst: &yaxpeax_arm::armv8::a64::Instruction, iaddr: u64) -> Nativ
             f.call = Some((target.unwrap_or(0), false));
         }
         Op64::BLR => {
-            f.call = ops
-                .first()
-                .and_then(gpr)
-                .map(|r| (r as u64, true));
+            f.call = ops.first().and_then(gpr).map(|r| (r as u64, true));
         }
-        Op64::LDR | Op64::LDRB | Op64::LDRSB | Op64::LDRSW | Op64::LDRSH | Op64::LDRH
-        | Op64::LDUR | Op64::LDURB | Op64::LDURSB | Op64::LDURSW | Op64::LDURSH | Op64::LDURH
-        | Op64::STR | Op64::STRB | Op64::STRH | Op64::STRW | Op64::STUR | Op64::STURB
+        Op64::LDR
+        | Op64::LDRB
+        | Op64::LDRSB
+        | Op64::LDRSW
+        | Op64::LDRSH
+        | Op64::LDRH
+        | Op64::LDUR
+        | Op64::LDURB
+        | Op64::LDURSB
+        | Op64::LDURSW
+        | Op64::LDURSH
+        | Op64::LDURH
+        | Op64::STR
+        | Op64::STRB
+        | Op64::STRH
+        | Op64::STRW
+        | Op64::STUR
+        | Op64::STURB
         | Op64::STURH => {
             // operand 1 is the address operand in every yaxpeax arm64 ldr/str form
             if let Some(addr_op) = ops.get(1) {
@@ -1005,8 +1005,19 @@ fn facts_arm64(inst: &yaxpeax_arm::armv8::a64::Instruction, iaddr: u64) -> Nativ
                 }
             }
         }
-        Op64::ADD | Op64::ADDS | Op64::SUB | Op64::SUBS | Op64::AND | Op64::ANDS | Op64::ORR
-        | Op64::EOR | Op64::MUL | Op64::SDIV | Op64::UDIV | Op64::MADD | Op64::MSUB => {
+        Op64::ADD
+        | Op64::ADDS
+        | Op64::SUB
+        | Op64::SUBS
+        | Op64::AND
+        | Op64::ANDS
+        | Op64::ORR
+        | Op64::EOR
+        | Op64::MUL
+        | Op64::SDIV
+        | Op64::UDIV
+        | Op64::MADD
+        | Op64::MSUB => {
             let kind = match inst.opcode {
                 Op64::ADD | Op64::ADDS => ArithKind::Add,
                 Op64::SUB | Op64::SUBS => ArithKind::Sub,
@@ -1163,14 +1174,28 @@ fn facts_arm32(inst: &yaxpeax_arm::armv7::Instruction, iaddr: u64) -> NativeFact
                 f.call = Some((t, false));
             }
         }
-        Op32::LDR | Op32::STR | Op32::LDRB | Op32::STRB | Op32::LDRH | Op32::STRH
-        | Op32::LDRSH | Op32::LDRSB | Op32::LDRD | Op32::STRD => {
+        Op32::LDR
+        | Op32::STR
+        | Op32::LDRB
+        | Op32::STRB
+        | Op32::LDRH
+        | Op32::STRH
+        | Op32::LDRSH
+        | Op32::LDRSB
+        | Op32::LDRD
+        | Op32::STRD => {
             // operand 0 is the data register; the address is operand 1
             if let Some(a) = ops.get(1) {
                 mem_of(a);
             }
         }
-        Op32::ADD | Op32::SUB | Op32::AND | Op32::ORR | Op32::EOR | Op32::MUL | Op32::SDIV
+        Op32::ADD
+        | Op32::SUB
+        | Op32::AND
+        | Op32::ORR
+        | Op32::EOR
+        | Op32::MUL
+        | Op32::SDIV
         | Op32::UDIV => {
             let kind = match inst.opcode {
                 Op32::ADD => ArithKind::Add,
@@ -1795,8 +1820,12 @@ fn inline_table_data(body: &[u8], base_rva: u64) -> HashSet<u64> {
                 let start = o;
                 let mut end = o + 8;
                 while end + 4 <= body.len() {
-                    let v =
-                        u32::from_le_bytes([body[end], body[end + 1], body[end + 2], body[end + 3]]);
+                    let v = u32::from_le_bytes([
+                        body[end],
+                        body[end + 1],
+                        body[end + 2],
+                        body[end + 3],
+                    ]);
                     if in_body(v) {
                         end += 4;
                     } else {
@@ -1864,7 +1893,9 @@ pub fn record_out_of_range_lane_selections(rva: u64, violations: &[(u64, String)
     if violations.is_empty() {
         return;
     }
-    STATS.out_of_range_lane_methods.fetch_add(1, Ordering::Relaxed);
+    STATS
+        .out_of_range_lane_methods
+        .fetch_add(1, Ordering::Relaxed);
     let total = STATS
         .out_of_range_lane_sites
         .fetch_add(violations.len() as u64, Ordering::Relaxed)
@@ -2007,9 +2038,7 @@ impl Coverage {
                     || self.fallthrough.contains(&addr)
                     || self.call.contains(&addr)
             }
-            InsnClass::LoadStore => {
-                self.loadstore.contains(&addr) || self.moved.contains(&addr)
-            }
+            InsnClass::LoadStore => self.loadstore.contains(&addr) || self.moved.contains(&addr),
             InsnClass::Arith => self.arith.contains(&addr),
             InsnClass::Pseudo => true,
             InsnClass::Float => {
@@ -2193,9 +2222,10 @@ impl SemanticFingerprint {
                 let is_dest = dest_pos == Some(idx);
                 let mut mems = Vec::new();
                 collect_memory_accesses(op, &mut mems);
-                if mems.iter().any(|m| {
-                    is_dest || defines(*m) || !move_sources.iter().any(|s| *s == *m)
-                }) {
+                if mems
+                    .iter()
+                    .any(|m| is_dest || defines(*m) || !move_sources.iter().any(|s| *s == *m))
+                {
                     has_mem = true;
                 }
                 if matches!(op, Operand::StringLiteral { .. })
@@ -2279,7 +2309,9 @@ impl SemanticFingerprint {
         let mut out = Vec::new();
         let mut cmp = |name: &str, pre: usize, post: usize, allow: usize| {
             if post > pre + allow {
-                out.push(format!("A/A: {name} GREW {pre}→{post} (unexpected synthesis)"));
+                out.push(format!(
+                    "A/A: {name} GREW {pre}→{post} (unexpected synthesis)"
+                ));
             }
         };
         cmp(
@@ -2477,7 +2509,9 @@ impl VerifyReport {
             // method with only conform findings still reports "clean" — but the
             // per-method detail belongs here, not in a silenced field.
             for (class, site, what) in self.conform_findings.iter().take(4) {
-                s.push_str(&format!("\n[verify]   conform {class:?} @{site:#x}: {what}"));
+                s.push_str(&format!(
+                    "\n[verify]   conform {class:?} @{site:#x}: {what}"
+                ));
             }
             return s;
         }
@@ -2523,7 +2557,9 @@ impl VerifyReport {
             ));
         }
         for a in self.missing_conditions.iter().take(4) {
-            s.push_str(&format!("\n[verify]   conditional branch @{a:#x} has no real compare (wrong-logic class)"));
+            s.push_str(&format!(
+                "\n[verify]   conditional branch @{a:#x} has no real compare (wrong-logic class)"
+            ));
         }
         for u in self.uncovered.iter().take(8) {
             s.push_str(&format!(
@@ -2543,7 +2579,9 @@ impl VerifyReport {
         // it is still per-method data: surfacing it here makes the field read
         // (and the detail visible) without blurring the clean/flagged aggregate.
         for (class, site, what) in self.conform_findings.iter().take(4) {
-            s.push_str(&format!("\n[verify]   conform {class:?} @{site:#x}: {what}"));
+            s.push_str(&format!(
+                "\n[verify]   conform {class:?} @{site:#x}: {what}"
+            ));
         }
         s
     }
@@ -2571,9 +2609,21 @@ fn swapped_kind(k: CompareKind) -> CompareKind {
 /// Human name for an arm64 condition code (yaxpeax's own spelling).
 fn cond_name(code: u8) -> &'static str {
     match code & 0xF {
-        0 => "eq", 1 => "ne", 2 => "hs", 3 => "lo", 4 => "mi", 5 => "pl",
-        6 => "vs", 7 => "vc", 8 => "hi", 9 => "ls", 10 => "ge", 11 => "lt",
-        12 => "gt", 13 => "le", _ => "al",
+        0 => "eq",
+        1 => "ne",
+        2 => "hs",
+        3 => "lo",
+        4 => "mi",
+        5 => "pl",
+        6 => "vs",
+        7 => "vc",
+        8 => "hi",
+        9 => "ls",
+        10 => "ge",
+        11 => "lt",
+        12 => "gt",
+        13 => "le",
+        _ => "al",
     }
 }
 
@@ -2754,6 +2804,32 @@ fn semantic_diff(
             Some(v) if !v.is_empty() => v,
             _ => continue, // absence is the coverage oracle's finding
         };
+        // 0. TBZ/TBNZ bit number. Must run BEFORE the cond_branch gate below:
+        // tbz/tbnz also set cond_branch, so the gate's `continue` skipped
+        // this check on every site it was meant to guard.
+        if let Some(bit) = d.facts.tbz_bit {
+            let want = 1i64 << bit;
+            let masks: Vec<i64> = insns_at
+                .iter()
+                .filter(|i| matches!(i.op, Op::Arith(ArithKind::And)))
+                .filter_map(|i| {
+                    i.operands.iter().find_map(|o| match o {
+                        Operand::Immediate(m) => Some(*m),
+                        _ => None,
+                    })
+                })
+                .collect();
+            // ABSENCE is legitimate and must never be reported: sign-test
+            // sugar rewrites (x & 0x80000000) != 0 into x < 0, and DCE can
+            // drop the mask entirely. Only a PRESENT-but-wrong mask proves
+            // the bit index was misread.
+            if !masks.is_empty() && !masks.contains(&want) {
+                out.push((
+                    d.addr,
+                    format!("tbz bit {bit}: And mask {masks:?}, want {want}"),
+                ));
+            }
+        }
         // 1+2. conditional branch: polarity + taken target
         if let Some((code, native_target)) = d.facts.cond_branch {
             let Some(cj) = insns_at.iter().find(|i| matches!(i.op, Op::CondJump(_))) else {
@@ -2767,9 +2843,9 @@ fn semantic_diff(
                 .collect();
             // A lost pending-compare (Compare(kind, Unknown, 0)) is already
             // reported by missing_conditions — don't double-flag its kind.
-            let has_unknown_cmp = cmps.iter().any(|i| {
-                matches!(i.operands.get(1), Some(Operand::Unknown))
-            });
+            let has_unknown_cmp = cmps
+                .iter()
+                .any(|i| matches!(i.operands.get(1), Some(Operand::Unknown)));
             if !cmps.is_empty() && !has_unknown_cmp {
                 let ok = cmps.iter().any(|i| match i.op {
                     Op::Compare(k) => k == expected || k == swapped_kind(expected),
@@ -2843,7 +2919,9 @@ fn semantic_diff(
                         break;
                     }
                     let Some(ti) = cur else { break };
-                    let Some(ins) = final_insns.get(ti) else { break };
+                    let Some(ins) = final_insns.get(ti) else {
+                        break;
+                    };
                     // Check the CURRENT landing FIRST, before following any
                     // jump. The native taken target is very often an
                     // unconditional `jmp` to a shared exit (tail-merge), so
@@ -2871,9 +2949,9 @@ fn semantic_diff(
                     // layout — only an edge set that is NOT exactly the two
                     // native successors is real corruption.
                     let branch_block = cfg.blocks.iter().position(|b| {
-                        final_insns.get(b.end - 1).is_some_and(|t| {
-                            t.address == d.addr && matches!(t.op, Op::CondJump(_))
-                        })
+                        final_insns
+                            .get(b.end - 1)
+                            .is_some_and(|t| t.address == d.addr && matches!(t.op, Op::CondJump(_)))
                     });
                     if let Some(tb) = branch_block {
                         let succs = cfg.successors.get(tb);
@@ -2900,12 +2978,7 @@ fn semantic_diff(
                         let fall_ok = match fall_addr {
                             Some(f) => {
                                 f == native_target
-                                    || absorbed_landing(
-                                        decoded,
-                                        final_insns,
-                                        native_target,
-                                        f,
-                                    )
+                                    || absorbed_landing(decoded, final_insns, native_target, f)
                             }
                             None => false,
                         };
@@ -2989,24 +3062,13 @@ fn semantic_diff(
                         let show: Vec<String> = mems.iter().map(|(_, a)| format!("{a}")).collect();
                         out.push((
                             d.addr,
-                            format!("memory offset mismatch: native base{base} +{off}, IR [{}]", show.join(",")),
+                            format!(
+                                "memory offset mismatch: native base{base} +{off}, IR [{}]",
+                                show.join(",")
+                            ),
                         ));
                     }
                 }
-            }
-            continue;
-        }
-        // 6. TBZ bit number
-        if let Some(bit) = d.facts.tbz_bit {
-            let want = 1i64 << bit;
-            let mask_ok = insns_at.iter().any(|i| {
-                matches!(i.op, Op::Arith(ArithKind::And))
-                    && i.operands
-                        .iter()
-                        .any(|o| matches!(o, Operand::Immediate(m) if *m == want))
-            });
-            if !mask_ok {
-                out.push((d.addr, format!("tbz bit {bit}: no And with mask {want}")));
             }
             continue;
         }
@@ -3027,7 +3089,10 @@ fn semantic_diff(
                 let show: Vec<String> = kinds.iter().map(|k| format!("{k:?}")).collect();
                 out.push((
                     d.addr,
-                    format!("arithmetic mismatch: native {kind:?}, IR {}", show.join("/")),
+                    format!(
+                        "arithmetic mismatch: native {kind:?}, IR {}",
+                        show.join("/")
+                    ),
                 ));
             }
         }
@@ -3135,8 +3200,8 @@ pub fn verify_method(
     // `lift::preserves_nzcv` (which keys on the opcode); keeping it in sync is
     // what lets the walk below cross `cmp; mov; b.eq` at all.
     const FLAG_WRITERS: &[&str] = &[
-        "cmp", "cmn", "tst", "ccmp", "ccmn", "fcmp", "fcmpe", "fccmp", "fccmpe",
-        "subs", "adds", "ands", "bics", "adcs", "sbcs", "negs", "ngcs", "msr",
+        "cmp", "cmn", "tst", "ccmp", "ccmn", "fcmp", "fcmpe", "fccmp", "fccmpe", "subs", "adds",
+        "ands", "bics", "adcs", "sbcs", "negs", "ngcs", "msr",
         // x86 bit tests all write CF (the selected bit). Without these in the
         // list a `cmp` before a `bt` walked THROUGH the bit test to the branch
         // and claimed the compare was covered — but the `bt` had already
@@ -3267,7 +3332,10 @@ pub fn verify_method(
             if let Some(Operand::Local(v)) = i.operands.first() {
                 let real = !matches!(i.operands.get(1), Some(Operand::Unknown))
                     && !matches!(i.operands.get(1), Some(Operand::MissingAbiArg));
-                real_cmp.entry(*v).and_modify(|e| *e |= real).or_insert(real);
+                real_cmp
+                    .entry(*v)
+                    .and_modify(|e| *e |= real)
+                    .or_insert(real);
             }
         }
     }
@@ -3293,10 +3361,14 @@ pub fn verify_method(
             if i.op != Op::Phi {
                 continue;
             }
-            let Some(Operand::Local(dst)) = i.operands.first() else { continue };
-            let any = i.operands.iter().skip(1).any(
-                |o| matches!(o, Operand::Local(v) if *real_cmp.get(v).unwrap_or(&false)),
-            );
+            let Some(Operand::Local(dst)) = i.operands.first() else {
+                continue;
+            };
+            let any = i
+                .operands
+                .iter()
+                .skip(1)
+                .any(|o| matches!(o, Operand::Local(v) if *real_cmp.get(v).unwrap_or(&false)));
             if any && !real_cmp.get(dst).copied().unwrap_or(false) {
                 real_cmp.insert(*dst, true);
                 grew = true;
@@ -3348,8 +3420,7 @@ pub fn verify_method(
                     }
                     if matches!(i.op, Op::CondJump(_)) {
                         if let Some(Operand::Local(v)) = i.operands.first() {
-                            return *real_cmp.get(v).unwrap_or(&false)
-                                || const_cond.contains(v);
+                            return *real_cmp.get(v).unwrap_or(&false) || const_cond.contains(v);
                         }
                         return false;
                     }
@@ -3461,7 +3532,7 @@ pub fn verify_method(
             // value (a folded native body reached through a member that
             // declares fewer parameters), not a lost definition. See
             // `LocalInfo::is_incoming_arg`.
-            if info.is_incoming_arg {
+            if info.is_incoming_arg || info.is_call_clobber {
                 defined.insert(*v);
             }
         }
@@ -3674,12 +3745,29 @@ pub fn verify_method(
                     raw_regs_in(i, out);
                 }
             }
+            // An instance-field access carries its receiver in a NESTED
+            // operand. Without this arm a raw register surviving inside
+            // `InstanceField { base }` was invisible to the corruption
+            // oracle - the exact blind spot that let the in_xN family reach
+            // the dump unreported (passes::collect_locals had the same hole).
+            Operand::InstanceField { base, .. } => raw_regs_in(base, out),
             Operand::AddressOf(inner) | Operand::ArrayLength(inner) => raw_regs_in(inner, out),
             Operand::ArrayAccess { array, index } => {
                 raw_regs_in(array, out);
                 raw_regs_in(index, out);
             }
-            _ => {}
+            // Leaves, listed explicitly so a new Operand variant is a compile
+            // error here rather than a silent oracle blind spot.
+            Operand::Local(_)
+            | Operand::Immediate(_)
+            | Operand::FloatLiteral(_)
+            | Operand::DoubleLiteral(_)
+            | Operand::StringLiteral { .. }
+            | Operand::Method(_)
+            | Operand::Field(_)
+            | Operand::Type(_)
+            | Operand::MissingAbiArg
+            | Operand::Unknown => {}
         }
     }
     for insn in final_insns {
@@ -3881,15 +3969,28 @@ fn tv_source() -> &'static str {
     TV_SRC.with(|c| c.get())
 }
 
-fn tv_dump_record(path: &str, base_rva: u64, body_bytes: &[u8], final_insns: &[Insn], decoded: &[DecodedInsn]) {
+fn tv_dump_record(
+    path: &str,
+    base_rva: u64,
+    body_bytes: &[u8],
+    final_insns: &[Insn],
+    decoded: &[DecodedInsn],
+) {
     use std::io::Write;
     static TV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = TV_LOCK.lock();
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
         return;
     };
     let mut line = String::with_capacity(body_bytes.len() * 2 + final_insns.len() * 48 + 64);
-    line.push_str(&format!("{{\"rva\":{base_rva},\"base\":{base_rva},\"src\":\"{}\",\"bytes\":\"", tv_source()));
+    line.push_str(&format!(
+        "{{\"rva\":{base_rva},\"base\":{base_rva},\"src\":\"{}\",\"bytes\":\"",
+        tv_source()
+    ));
     for b in body_bytes {
         line.push_str(&format!("{b:02x}"));
     }
@@ -3991,7 +4092,10 @@ mod tests {
         let insns = vec![Insn::new(Op::Return, vec![], 0x1000)];
         let r = reachable_native_addresses(&decoded, &insns, 0x1000, false, None);
         assert!(r.contains(&0x1000), "the entry is code: {r:?}");
-        assert!(!r.contains(&0x1001), "padding after `ret` is not code: {r:?}");
+        assert!(
+            !r.contains(&0x1001),
+            "padding after `ret` is not code: {r:?}"
+        );
         assert!(!r.contains(&0x1003));
     }
 
@@ -4238,8 +4342,14 @@ mod tests {
             Insn::new(Op::Arith(ArithKind::Add), vec![], 0x1010),
         ];
         let r = reachable_native_addresses(&decoded, &insns, 0x1000, false, None);
-        assert!(r.contains(&0x1010), "a recovered switch body is code: {r:?}");
-        assert!(r.contains(&0x1012), "…and the walk continues through it: {r:?}");
+        assert!(
+            r.contains(&0x1010),
+            "a recovered switch body is code: {r:?}"
+        );
+        assert!(
+            r.contains(&0x1012),
+            "…and the walk continues through it: {r:?}"
+        );
     }
 
     #[test]
@@ -4252,13 +4362,21 @@ mod tests {
         let (decoded, fails) = decode_all_x86(&[0x66, 0x90, 0x90, 0x48, 0x87, 0xD8], 0x1000);
         assert_eq!(fails, 0);
         assert_eq!(decoded[0].mnemonic, "nop", "`66 90` must classify as Nop");
-        assert_eq!(decoded[0].class, InsnClass::Pseudo, "`66 90` is a no-op pad");
+        assert_eq!(
+            decoded[0].class,
+            InsnClass::Pseudo,
+            "`66 90` is a no-op pad"
+        );
         assert_eq!(decoded[1].class, InsnClass::Pseudo, "plain `90` is a no-op");
         // …and a REAL exchange must keep reporting, or the fix would hide
         // losses. `48 87 D8` = `xchg rax, rbx`, whose formatter text and
         // mnemonic agree, so it stays Arith.
         assert_eq!(decoded[2].mnemonic, "xchg");
-        assert_eq!(decoded[2].class, InsnClass::Arith, "xchg rax, rbx exchanges");
+        assert_eq!(
+            decoded[2].class,
+            InsnClass::Arith,
+            "xchg rax, rbx exchanges"
+        );
     }
 
     /// `bt eax, ecx` (0F A3 C8) then `jae` (73 00): the lifter hands CF to the
@@ -4275,7 +4393,16 @@ mod tests {
             Insn::new(Op::CondJump(2), vec![], 0x1003),
         ];
         let r = verify_method(
-            &bytes, 0x1000, &[], &final_insns, None, None, false, true, false, false,
+            &bytes,
+            0x1000,
+            &[],
+            &final_insns,
+            None,
+            None,
+            false,
+            true,
+            false,
+            false,
         );
         assert!(
             !r.uncovered.iter().any(|d| d.addr == 0x1000),
@@ -4302,7 +4429,16 @@ mod tests {
             Insn::new(Op::CondJump(2), vec![], 0x1005),
         ];
         let r = verify_method(
-            &bytes, 0x1000, &[], &final_insns, None, None, false, true, false, false,
+            &bytes,
+            0x1000,
+            &[],
+            &final_insns,
+            None,
+            None,
+            false,
+            true,
+            false,
+            false,
         );
         assert!(
             r.uncovered.iter().any(|d| d.addr == 0x1000),
@@ -4344,7 +4480,16 @@ mod tests {
             Insn::new(Op::CondJump(1), vec![Operand::Immediate(1)], 0x1003),
         ];
         let r = verify_method(
-            &bytes, 0x1000, &[], &final_insns, None, None, false, true, false, false,
+            &bytes,
+            0x1000,
+            &[],
+            &final_insns,
+            None,
+            None,
+            false,
+            true,
+            false,
+            false,
         );
         assert!(
             !r.uncovered.iter().any(|d| d.addr == 0x1000),
@@ -4362,7 +4507,10 @@ mod tests {
             0x47, 0x39, 0x3b, 0x00, 0x51, 0x39, 0x3b, 0x00, 0x63, 0x39, 0x3b, 0x00,
         ]);
         let d = inline_table_data(&body, base);
-        assert!(d.contains(&(base + 0x148)), "the table's first byte is data");
+        assert!(
+            d.contains(&(base + 0x148)),
+            "the table's first byte is data"
+        );
         assert!(d.contains(&(base + 0x149)), "…and its interior");
         // The leading zero padding is NOT an in-body pointer, so it must not be
         // marked: this only recognises the table, never ordinary bytes.
@@ -4429,7 +4577,11 @@ mod tests {
             0x2000,
         );
         let bads = out_of_range_lane_selections(std::slice::from_ref(&bad));
-        assert_eq!(bads.len(), 1, "an impossible lane must be reported: {bads:?}");
+        assert_eq!(
+            bads.len(),
+            1,
+            "an impossible lane must be reported: {bads:?}"
+        );
         assert_eq!(bads[0].0, 0x2000);
         assert!(
             bads[0].1.contains("arrange32"),
@@ -4572,8 +4724,7 @@ mod tests {
     #[test]
     fn only_folded_mnemonics_are_steppable() {
         for m in [
-            "cmp", "test", "cmn", "tst", "nop", "endbr64", "ucomiss", "ucomisd", "comiss",
-            "comisd",
+            "cmp", "test", "cmn", "tst", "nop", "endbr64", "ucomiss", "ucomisd", "comiss", "comisd",
         ] {
             assert!(is_folded_into_successor(m), "{m} is folded");
         }
@@ -4603,7 +4754,15 @@ mod tests {
             0x1000,
         )];
         let report = verify_method(
-            &bytes, 0x1000, &final_insns, &final_insns, None, Some(&table), true, false, false,
+            &bytes,
+            0x1000,
+            &final_insns,
+            &final_insns,
+            None,
+            Some(&table),
+            true,
+            false,
+            false,
             false,
         );
         assert!(
@@ -4647,11 +4806,7 @@ mod tests {
             false,
             false,
         );
-        assert!(
-            report.undefined_locals.is_empty(),
-            "{}",
-            report.summarize()
-        );
+        assert!(report.undefined_locals.is_empty(), "{}", report.summarize());
     }
 
     #[test]
@@ -4665,13 +4820,22 @@ mod tests {
             is_param: None,
             param_comp: None,
             is_incoming_arg: false,
+            is_call_clobber: false,
             is_return_buffer: false,
         });
         // Version id 25 maps to the seeded entry local (index_of, NOT position).
         table.index_of.insert(25, 0);
         let final_insns = vec![Insn::new(Op::Return, vec![Operand::Local(25)], 0x1000)];
         let report = verify_method(
-            &bytes, 0x1000, &final_insns, &final_insns, None, Some(&table), true, false, false,
+            &bytes,
+            0x1000,
+            &final_insns,
+            &final_insns,
+            None,
+            Some(&table),
+            true,
+            false,
+            false,
             false,
         );
         assert!(report.undefined_locals.is_empty());
@@ -4695,12 +4859,21 @@ mod tests {
                 is_param: None,
                 param_comp: None,
                 is_incoming_arg: false,
+                is_call_clobber: false,
                 is_return_buffer: false,
             });
             table.index_of.insert(25, 0);
             let final_insns = vec![Insn::new(Op::Return, vec![Operand::Local(25)], 0x1000)];
             let report = verify_method(
-                &bytes, 0x1000, &final_insns, &final_insns, None, Some(&table), true, false, false,
+                &bytes,
+                0x1000,
+                &final_insns,
+                &final_insns,
+                None,
+                Some(&table),
+                true,
+                false,
+                false,
                 false,
             );
             assert!(
@@ -4719,7 +4892,16 @@ mod tests {
             Insn::new(Op::Return, vec![], 0x1004),
         ];
         let report = verify_method(
-            &bytes, 0x1000, &final_insns, &final_insns, None, None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &final_insns,
+            &final_insns,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert!(
             !report.unresolved_calls.is_empty(),
@@ -4734,13 +4916,26 @@ mod tests {
         let final_insns = vec![
             Insn::new(
                 Op::CallVoid,
-                vec![Operand::Method(_mref()), Operand::Unknown, Operand::MissingAbiArg],
+                vec![
+                    Operand::Method(_mref()),
+                    Operand::Unknown,
+                    Operand::MissingAbiArg,
+                ],
                 0x1000,
             ),
             Insn::new(Op::Return, vec![], 0x1004),
         ];
         let report = verify_method(
-            &bytes, 0x1000, &final_insns, &final_insns, None, None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &final_insns,
+            &final_insns,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert_eq!(report.unresolved_calls.len(), 1);
         assert!(report.unresolved_calls[0].1.contains("operand(s) [1]"));
@@ -4782,7 +4977,16 @@ mod tests {
             Insn::new(Op::Return, vec![Operand::Local(1)], 0x1004),
         ];
         let report = verify_method(
-            &bytes, 0x1000, &final_insns, &final_insns, None, None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &final_insns,
+            &final_insns,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert!(report.is_clean(), "{}", report.summarize());
     }
@@ -4799,7 +5003,16 @@ mod tests {
         bytes.extend_from_slice(&ret.to_le_bytes());
         let final_insns = vec![Insn::new(Op::Return, vec![Operand::reg("x0")], 0x1008)];
         let report = verify_method(
-            &bytes, 0x1000, &final_insns, &final_insns, None, None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &final_insns,
+            &final_insns,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert!(!report.is_clean());
         assert_eq!(report.uncovered.len(), 2); // cmp + b.eq both uncovered
@@ -4815,7 +5028,16 @@ mod tests {
         ledger_note(0x1000, LedgerKind::GuardExcision);
         let final_insns = vec![Insn::new(Op::Return, vec![Operand::Local(1)], 0x1004)];
         let report = verify_method(
-            &bytes, 0x1000, &final_insns, &final_insns, None, None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &final_insns,
+            &final_insns,
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         ledger_clear();
         assert!(report.is_clean(), "{}", report.summarize());
@@ -4872,10 +5094,22 @@ mod tests {
         ];
         let (finals, cfg) = cfg_of(&final_insns);
         let report = verify_method(
-            &bytes, 0x1000, &finals, &finals, Some(&cfg), None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &finals,
+            &finals,
+            Some(&cfg),
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert!(
-            report.semantic_diffs.iter().any(|(_, w)| w.contains("condition mismatch")),
+            report
+                .semantic_diffs
+                .iter()
+                .any(|(_, w)| w.contains("condition mismatch")),
             "{}",
             report.summarize()
         );
@@ -4905,7 +5139,16 @@ mod tests {
         ];
         let (finals, cfg) = cfg_of(&final_insns);
         let report = verify_method(
-            &bytes, 0x1000, &finals, &finals, Some(&cfg), None, false, true, false, false,
+            &bytes,
+            0x1000,
+            &finals,
+            &finals,
+            Some(&cfg),
+            None,
+            false,
+            true,
+            false,
+            false,
         );
         assert!(
             report.semantic_diffs.is_empty(),
@@ -4933,7 +5176,16 @@ mod tests {
         ];
         let (finals, cfg) = cfg_of(&final_insns);
         let report = verify_method(
-            &bytes, 0x1000, &finals, &finals, Some(&cfg), None, false, true, false, false,
+            &bytes,
+            0x1000,
+            &finals,
+            &finals,
+            Some(&cfg),
+            None,
+            false,
+            true,
+            false,
+            false,
         );
         assert!(
             report.semantic_diffs.is_empty(),
@@ -4960,7 +5212,16 @@ mod tests {
         ];
         let (finals, cfg) = cfg_of(&final_insns);
         let report = verify_method(
-            &bytes, 0x1000, &finals, &finals, Some(&cfg), None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &finals,
+            &finals,
+            Some(&cfg),
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert!(report.semantic_diffs.is_empty(), "{}", report.summarize());
     }
@@ -4980,10 +5241,22 @@ mod tests {
         ];
         let (finals, cfg) = cfg_of(&final_insns);
         let report = verify_method(
-            &bytes, 0x1000, &finals, &finals, Some(&cfg), None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &finals,
+            &finals,
+            Some(&cfg),
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert!(
-            report.semantic_diffs.iter().any(|(_, w)| w.contains("arithmetic mismatch")),
+            report
+                .semantic_diffs
+                .iter()
+                .any(|(_, w)| w.contains("arithmetic mismatch")),
             "{}",
             report.summarize()
         );
@@ -4996,7 +5269,8 @@ mod tests {
         let final_insns = vec![
             Insn::move_(
                 Operand::reg("w1"),
-                Operand::Memory { width: 0,
+                Operand::Memory {
+                    width: 0,
                     base: Box::new(Operand::reg("x0")),
                     index: None,
                     scale: 1,
@@ -5008,10 +5282,22 @@ mod tests {
         ];
         let (finals, cfg) = cfg_of(&final_insns);
         let report = verify_method(
-            &bytes, 0x1000, &finals, &finals, Some(&cfg), None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &finals,
+            &finals,
+            Some(&cfg),
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert!(
-            report.semantic_diffs.iter().any(|(_, w)| w.contains("memory offset mismatch")),
+            report
+                .semantic_diffs
+                .iter()
+                .any(|(_, w)| w.contains("memory offset mismatch")),
             "{}",
             report.summarize()
         );
@@ -5029,10 +5315,22 @@ mod tests {
         ];
         let (finals, cfg) = cfg_of(&final_insns);
         let report = verify_method(
-            &bytes, 0x1000, &finals, &finals, Some(&cfg), None, true, false, false, false,
+            &bytes,
+            0x1000,
+            &finals,
+            &finals,
+            Some(&cfg),
+            None,
+            true,
+            false,
+            false,
+            false,
         );
         assert!(
-            report.semantic_diffs.iter().any(|(_, w)| w.contains("call target mismatch")),
+            report
+                .semantic_diffs
+                .iter()
+                .any(|(_, w)| w.contains("call target mismatch")),
             "{}",
             report.summarize()
         );
@@ -5264,7 +5562,11 @@ mod tests {
                 base + 4,
             ),
             // Raw RVA, as the lifter emits before `Cfg::build` rewrites it.
-            Insn::new(Op::CondJump((base + 4) as usize), vec![Operand::Local(1)], base + 4),
+            Insn::new(
+                Op::CondJump((base + 4) as usize),
+                vec![Operand::Local(1)],
+                base + 4,
+            ),
             Insn::new(Op::Return, vec![], base + 8),
         ];
         let (finals, cfg) = cfg_of(&final_insns);
@@ -5359,7 +5661,10 @@ mod tests {
     /// load surfaced as three `"N"` arguments after propagation).
     #[test]
     fn a_string_literal_fanned_out_to_several_call_sites_counts_once() {
-        let lit = Operand::StringLiteral { index: 2466, value: "N".into() };
+        let lit = Operand::StringLiteral {
+            index: 2466,
+            value: "N".into(),
+        };
         let call = |target: i64, addr: u64| {
             Insn::new(
                 Op::Call,
@@ -5383,8 +5688,14 @@ mod tests {
     /// blanket one-literal-per-method cap.
     #[test]
     fn distinct_string_literals_are_counted_separately() {
-        let a = Operand::StringLiteral { index: 1, value: "A".into() };
-        let b = Operand::StringLiteral { index: 2, value: "B".into() };
+        let a = Operand::StringLiteral {
+            index: 1,
+            value: "A".into(),
+        };
+        let b = Operand::StringLiteral {
+            index: 2,
+            value: "B".into(),
+        };
         let call = |lit: Operand, addr: u64| {
             Insn::new(
                 Op::Call,
@@ -5411,7 +5722,13 @@ mod tests {
             Insn::move_(Operand::Register("x0".into()), abs_mem(1), 0x1000),
             Insn::move_(Operand::Register("x1".into()), abs_mem(2), 0x1004),
         ]);
-        assert_eq!(pre.drift(&post, 0).len(), 1, "{}→{}", pre.loads_stores, post.loads_stores);
+        assert_eq!(
+            pre.drift(&post, 0).len(),
+            1,
+            "{}→{}",
+            pre.loads_stores,
+            post.loads_stores
+        );
         assert!(
             pre.drift(&post, 1).is_empty(),
             "one tail transfer excuses exactly one access"
@@ -5455,17 +5772,14 @@ mod tests {
             ),
             Insn::new(
                 Op::Compare(CompareKind::Equal),
-                vec![
-                    Operand::Local(1),
-                    Operand::Local(2),
-                    Operand::Immediate(0),
-                ],
+                vec![Operand::Local(1), Operand::Local(2), Operand::Immediate(0)],
                 0x2008,
             ),
         ]);
         let pre = SemanticFingerprint::of(&body);
         assert!(
-            !pre.drift(&SemanticFingerprint::of(&final_insns), 0).is_empty(),
+            !pre.drift(&SemanticFingerprint::of(&final_insns), 0)
+                .is_empty(),
             "without the body filter the spliced epilogue reads as synthesis"
         );
         let filtered = SemanticFingerprint::of_inside(&final_insns, 0x1000, 0x1020);
@@ -5592,7 +5906,11 @@ mod verdict_tests {
         let flagged = 0xDEAD_0000_0000_0002u64;
         assert_eq!(annotation_for(clean), None);
         annotate_method(flagged, Verdict::WrongLogic, "1 semantic diff".into());
-        assert_eq!(annotation_for(clean), None, "only flagged methods are recorded");
+        assert_eq!(
+            annotation_for(clean),
+            None,
+            "only flagged methods are recorded"
+        );
         let (v, why) = annotation_for(flagged).expect("recorded grade must round-trip");
         assert_eq!(v, Verdict::WrongLogic);
         assert_eq!(why, "1 semantic diff");

@@ -179,8 +179,8 @@ fn emit_predication_guard(
 /// form. Order matters: `hs`/`lo` precede `cs`/`cc` only because the longer
 /// spellings are tried first; both map to the same flag.
 pub(crate) const A32_CONDITION_CODES: [&str; 17] = [
-    "eq", "ne", "gt", "lt", "ge", "le", "hi", "ls", "hs", "lo", "cs", "cc", "mi", "pl",
-    "vs", "vc", "al",
+    "eq", "ne", "gt", "lt", "ge", "le", "hi", "ls", "hs", "lo", "cs", "cc", "mi", "pl", "vs", "vc",
+    "al",
 ];
 
 /// The CARRY (or borrow) produced by a flag-setting instruction.
@@ -623,7 +623,11 @@ fn materialize_pending(
         pin_deferred_read(insns, addresses, at, &mut rhs, &mut scratch.next);
     }
     let s = scratch.fresh();
-    insns.push(Insn::new(Op::Compare(kind), vec![s.clone(), lhs, rhs], addr));
+    insns.push(Insn::new(
+        Op::Compare(kind),
+        vec![s.clone(), lhs, rhs],
+        addr,
+    ));
     s
 }
 
@@ -910,10 +914,21 @@ fn mem_operand(
         None => None,
         Some(i) => Some(match acc.shift {
             0 | 2 => i.clone(),
-            n => push_shifted(insns, temp, i.clone(), ArithKind::Shl, Operand::imm(n), addr),
+            n => push_shifted(
+                insns,
+                temp,
+                i.clone(),
+                ArithKind::Shl,
+                Operand::imm(n),
+                addr,
+            ),
         }),
     };
-    let scale = if acc.index.is_some() && acc.shift == 2 { 4 } else { 1 };
+    let scale = if acc.index.is_some() && acc.shift == 2 {
+        4
+    } else {
+        1
+    };
     // `[pc, #off]` / `[pc, rm]`: `pc` is an ADDRESS — its pipeline value is
     // `addr + 8` — not a register. Left as the g15 pseudo-register it had no
     // definition anywhere, so every literal-pool load and every
@@ -926,7 +941,8 @@ fn mem_operand(
     } else {
         acc.base.clone()
     };
-    let mem = Operand::Memory { width: 0,
+    let mem = Operand::Memory {
+        width: 0,
         base: Box::new(base),
         index: index.clone().map(Box::new),
         scale,
@@ -938,7 +954,14 @@ fn mem_operand(
             Some(i) => Some(if acc.shift == 0 {
                 i.clone()
             } else {
-                push_shifted(insns, temp, i.clone(), ArithKind::Shl, Operand::imm(acc.shift), addr)
+                push_shifted(
+                    insns,
+                    temp,
+                    i.clone(),
+                    ArithKind::Shl,
+                    Operand::imm(acc.shift),
+                    addr,
+                )
             }),
         }
     } else {
@@ -948,12 +971,7 @@ fn mem_operand(
 }
 
 /// Emit the base-register rewrite an auto-indexing access performs.
-fn push_writeback(
-    insns: &mut Vec<Insn>,
-    acc: &MemAccess,
-    delta: Operand,
-    addr: u64,
-) {
+fn push_writeback(insns: &mut Vec<Insn>, acc: &MemAccess, delta: Operand, addr: u64) {
     let kind = if acc.subtract {
         ArithKind::Sub
     } else {
@@ -1148,8 +1166,7 @@ pub(crate) struct ExtOp {
 /// The mnemonics of [`ExtOp::op`], in index order. These are the spellings the
 /// oracle classifies against and the names the coverage census reports, so they
 /// must be the real A32 mnemonics.
-pub(crate) const EXT_MNEMONICS: [&str; 6] =
-    ["sxtb16", "sxtb", "sxth", "uxtb16", "uxtb", "uxth"];
+pub(crate) const EXT_MNEMONICS: [&str; 6] = ["sxtb16", "sxtb", "sxth", "uxtb16", "uxtb", "uxth"];
 
 /// Would the LIFTER produce IR for this word even though yaxpeax cannot decode
 /// it?
@@ -1187,10 +1204,7 @@ pub(crate) fn liftable_word(word: u32) -> bool {
     if is_vfp(word) {
         let mut insns = Vec::new();
         let mut fp = BTreeSet::new();
-        return !matches!(
-            lift_vfp(word, 0, &mut insns, &mut fp),
-            VfpOutcome::NotVfp
-        );
+        return !matches!(lift_vfp(word, 0, &mut insns, &mut fp), VfpOutcome::NotVfp);
     }
     false
 }
@@ -1215,7 +1229,10 @@ pub(crate) fn vfp_absorbed_word(word: u32) -> bool {
     }
     let mut insns = Vec::new();
     let mut fp = BTreeSet::new();
-    matches!(lift_vfp(word, 0, &mut insns, &mut fp), VfpOutcome::Handled(_)) && insns.is_empty()
+    matches!(
+        lift_vfp(word, 0, &mut insns, &mut fp),
+        VfpOutcome::Handled(_)
+    ) && insns.is_empty()
 }
 
 pub(crate) fn ext_op(word: u32) -> Option<ExtOp> {
@@ -1273,19 +1290,39 @@ pub(crate) fn ext_op(word: u32) -> Option<ExtOp> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DroppedOp {
     /// `ubfx rd, rn, #lsb, #width` — zero-extend bits `[lsb, lsb+width)`.
-    Ubfx { rd: u8, rn: u8, lsb: u32, width: u32 },
+    Ubfx {
+        rd: u8,
+        rn: u8,
+        lsb: u32,
+        width: u32,
+    },
     /// `sbfx rd, rn, #lsb, #width` — sign-extend bits `[lsb, lsb+width)`.
-    Sbfx { rd: u8, rn: u8, lsb: u32, width: u32 },
+    Sbfx {
+        rd: u8,
+        rn: u8,
+        lsb: u32,
+        width: u32,
+    },
     /// `bfi rd, rn, #lsb, #width`; `rn == 15` is the `bfc rd, #lsb, #width`
     /// (insert a zero constant) form.
-    Bfi { rd: u8, rn: u8, lsb: u32, width: u32 },
+    Bfi {
+        rd: u8,
+        rn: u8,
+        lsb: u32,
+        width: u32,
+    },
     /// `smmul`/`smmulr rd, rn, rm` — the signed TOP word of `rn * rm`. Its low
     /// 32 bits are not the result, so it cannot be a plain 32-bit `Mul`; it is
     /// left explicitly unmodelled like the generic fallback.
     Smmul { rd: u8, rn: u8, rm: u8, round: bool },
     /// `uxtah`/`uxtab rd, rn, rm` — `rd = rn + ZeroExtend16(rm)`. The `ab`
     /// form additionally writes the result back to `rn`.
-    Uxtah { rd: u8, rn: u8, rm: u8, writeback: bool },
+    Uxtah {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        writeback: bool,
+    },
     /// `pkhbt rd, rn, rm, #shift` — pack the low half of `rn` with the shifted
     /// high half of `rm` (`pkhbt`, bit6 = 0; `pkhtb` also exists and is left).
     Pkhbt { rd: u8, rn: u8, rm: u8, shift: u32 },
@@ -1296,7 +1333,13 @@ pub(crate) enum DroppedOp {
     /// yaxpeax rejects (`Nonconforming`). `offset` is the effective-address
     /// displacement (0 for the post-indexed form) and `writeback`, when set, is
     /// the amount the base is advanced AFTER the access.
-    Ldrs { rt: u8, rn: u8, offset: i64, writeback: Option<i64>, width: u8 },
+    Ldrs {
+        rt: u8,
+        rn: u8,
+        offset: i64,
+        writeback: Option<i64>,
+        width: u8,
+    },
 }
 
 /// A PREDICATED VFP word (`cond != 0xE`). `is_vfp` deliberately excludes these
@@ -1504,7 +1547,11 @@ fn emit_dropped_op(
         DroppedOp::Bfi { rd, rn, lsb, width } => {
             let dst = core_reg(rd as u32);
             clear_const(&dst, consts);
-            let field_mask: i64 = if width >= 32 { -1 } else { ((1i64 << width) - 1) << lsb };
+            let field_mask: i64 = if width >= 32 {
+                -1
+            } else {
+                ((1i64 << width) - 1) << lsb
+            };
             if rn == 15 {
                 // `bfc`: clear the field, keep everything else.
                 insns.push(Insn::new(
@@ -1534,7 +1581,11 @@ fn emit_dropped_op(
                     vec![keep.clone(), dst.clone(), Operand::imm(!field_mask)],
                     addr,
                 ));
-                insns.push(Insn::new(Op::Arith(ArithKind::Or), vec![dst, keep, t], addr));
+                insns.push(Insn::new(
+                    Op::Arith(ArithKind::Or),
+                    vec![dst, keep, t],
+                    addr,
+                ));
             }
         }
         DroppedOp::Smmul { rd, rn, rm, round } => {
@@ -1647,13 +1698,29 @@ fn emit_dropped_op(
             let src = core_reg(rm as u32);
             let sh = core_reg(rs as u32);
             match kind {
-                0 => insns.push(Insn::new(Op::Arith(ArithKind::Shl), vec![dst, src, sh], addr)),
-                1 => insns.push(Insn::new(Op::Arith(ArithKind::Shr), vec![dst, src, sh], addr)),
-                3 => insns.push(Insn::new(Op::Arith(ArithKind::Ror), vec![dst, src, sh], addr)),
+                0 => insns.push(Insn::new(
+                    Op::Arith(ArithKind::Shl),
+                    vec![dst, src, sh],
+                    addr,
+                )),
+                1 => insns.push(Insn::new(
+                    Op::Arith(ArithKind::Shr),
+                    vec![dst, src, sh],
+                    addr,
+                )),
+                3 => insns.push(Insn::new(
+                    Op::Arith(ArithKind::Ror),
+                    vec![dst, src, sh],
+                    addr,
+                )),
                 // ASR has no `ArithKind`; an unmodelled intrinsic keeps the
                 // value chain (and the destination defined) without pretending
                 // a logical shift is an arithmetic one.
-                _ => insns.push(Insn::new(Op::Simd("__asr".into()), vec![dst, src, sh], addr)),
+                _ => insns.push(Insn::new(
+                    Op::Simd("__asr".into()),
+                    vec![dst, src, sh],
+                    addr,
+                )),
             }
         }
     }
@@ -1662,8 +1729,7 @@ fn emit_dropped_op(
 /// The A32 condition-code spellings, indexed by the 4-bit field. The numbering
 /// is the one A64 shares for 0..=13; 14 is `al` and 15 the never-taken `nv`.
 pub(crate) const A32_COND_NAMES: [&str; 16] = [
-    "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al",
-    "nv",
+    "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
 ];
 
 /// Result of the manual VFP decoder.
@@ -1744,10 +1810,18 @@ fn lift_vfp(
             // source. `__vmov` is the documented unmodelled catch-all — the same
             // shape the generic fallback emits — which keeps the value chain
             // connected and gives the word IR AT ITS OWN ADDRESS.
-            insns.push(Insn::new(Op::Simd("__vmov".into()), vec![rt, dm.clone()], addr));
+            insns.push(Insn::new(
+                Op::Simd("__vmov".into()),
+                vec![rt, dm.clone()],
+                addr,
+            ));
             insns.push(Insn::new(Op::Simd("__vmov".into()), vec![rt2, dm], addr));
         } else {
-            insns.push(Insn::new(Op::Simd("__vmov".into()), vec![dm.clone(), rt, rt2], addr));
+            insns.push(Insn::new(
+                Op::Simd("__vmov".into()),
+                vec![dm.clone(), rt, rt2],
+                addr,
+            ));
             fp_written.insert(reg_name(&dm));
         }
         return VfpOutcome::Handled(None);
@@ -1755,9 +1829,21 @@ fn lift_vfp(
 
     // ---- VFP data processing (VMLA/VMUL/VADD/VSUB: group 11100)
     if b27_23 == 0b11100 {
-        let dst = if double { vfp_double(vd, d) } else { vfp_single(vd, d) };
-        let vn_op = if double { vfp_double_src(vn, n) } else { vfp_single_src(vn, n) };
-        let vm_op = if double { vfp_double_src(vm, m) } else { vfp_single_src(vm, m) };
+        let dst = if double {
+            vfp_double(vd, d)
+        } else {
+            vfp_single(vd, d)
+        };
+        let vn_op = if double {
+            vfp_double_src(vn, n)
+        } else {
+            vfp_single_src(vn, n)
+        };
+        let vm_op = if double {
+            vfp_double_src(vm, m)
+        } else {
+            vfp_single_src(vm, m)
+        };
 
         // core <-> VFP register move: `vmov sN, rM` / `vmov rM, sN`
         // (bit4=1 is the transfer-class marker; opc2=0 reg→vfp, 1 vfp→reg).
@@ -1794,7 +1880,10 @@ fn lift_vfp(
             (0, 0) => {
                 // VMLA: dst = dst + a*b
                 insns.push(Insn::new(
-                    Op::MulAcc { negate_addend: false, is_float: true },
+                    Op::MulAcc {
+                        negate_addend: false,
+                        is_float: true,
+                    },
                     vec![dst.clone(), vn_op, vm_op, dst.clone()],
                     addr,
                 ));
@@ -1802,7 +1891,10 @@ fn lift_vfp(
             (0, 1) => {
                 // VMLS: dst = dst - a*b
                 insns.push(Insn::new(
-                    Op::MulAcc { negate_addend: true, is_float: true },
+                    Op::MulAcc {
+                        negate_addend: true,
+                        is_float: true,
+                    },
                     vec![dst.clone(), vn_op, vm_op, dst.clone()],
                     addr,
                 ));
@@ -1837,9 +1929,21 @@ fn lift_vfp(
 
     // ---- VDIV (group 11101, opc2 = 0) -------------------------------------
     if b27_23 == 0b11101 && opc2 == 0 {
-        let dst = if double { vfp_double(vd, d) } else { vfp_single(vd, d) };
-        let vn_op = if double { vfp_double_src(vn, n) } else { vfp_single_src(vn, n) };
-        let vm_op = if double { vfp_double_src(vm, m) } else { vfp_single_src(vm, m) };
+        let dst = if double {
+            vfp_double(vd, d)
+        } else {
+            vfp_single(vd, d)
+        };
+        let vn_op = if double {
+            vfp_double_src(vn, n)
+        } else {
+            vfp_single_src(vn, n)
+        };
+        let vm_op = if double {
+            vfp_double_src(vm, m)
+        } else {
+            vfp_single_src(vm, m)
+        };
         insns.push(Insn::new(
             Op::FloatArith(FloatArithKind::Div),
             vec![dst.clone(), vn_op, vm_op],
@@ -2115,7 +2219,11 @@ fn lift_vfp(
                         addend,
                     }
                 };
-                let reg_op = if double { vfp_double(vd, d) } else { vfp_single(vd, d) };
+                let reg_op = if double {
+                    vfp_double(vd, d)
+                } else {
+                    vfp_single(vd, d)
+                };
                 if l == 1 {
                     insns.push(Insn::move_(reg_op.clone(), mem, addr));
                     fp_written.insert(reg_name(&reg_op));
@@ -2165,7 +2273,11 @@ fn lift_vfp(
                 // Single counts registers directly; double counts word-slots,
                 // and the deprecated odd-imm8 LR forms (`fstmiax`) name one
                 // register — `(imm8 / 2).max(1)` reproduces both.
-                let nregs = if double { (imm8 / 2).max(1) } else { imm8.max(1) };
+                let nregs = if double {
+                    (imm8 / 2).max(1)
+                } else {
+                    imm8.max(1)
+                };
                 let stride = if double { 8 } else { 4 };
                 let first = if double { (d << 4) | vd } else { (vd << 1) | d };
                 let base_op = Operand::reg(base_reg);
@@ -2618,7 +2730,10 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                         // still see it; it terminates either way.
                         insns.push(Insn::new(
                             Op::IndirectCall,
-                            vec![reg(parts.get(1).copied().unwrap_or("").trim()), Operand::Immediate(-1)],
+                            vec![
+                                reg(parts.get(1).copied().unwrap_or("").trim()),
+                                Operand::Immediate(-1),
+                            ],
                             addr,
                         ));
                     }
@@ -2642,8 +2757,9 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 // plain register, and immediate.
                 let src_op: Option<Operand> = if parts.len() >= 4 {
                     let src = reg(parts[2]);
-                    parse_shifted_src(&format!("x, {}", parts[3]))
-                        .map(|(_, kind, amt)| push_shifted(&mut insns, &mut temp_counter, src, kind, amt, addr))
+                    parse_shifted_src(&format!("x, {}", parts[3])).map(|(_, kind, amt)| {
+                        push_shifted(&mut insns, &mut temp_counter, src, kind, amt, addr)
+                    })
                 } else if parts.len() == 3 {
                     Some(reg(parts[2]))
                 } else {
@@ -2732,7 +2848,11 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 // r0 is a yaxpeax artifact on the immediate form)
                 let parts: Vec<&str> = rest.split(", ").collect();
                 let dst = reg(parts.first().copied().unwrap_or(""));
-                let src_text = if parts.len() >= 3 { parts[2] } else { parts.get(1).copied().unwrap_or("0") };
+                let src_text = if parts.len() >= 3 {
+                    parts[2]
+                } else {
+                    parts.get(1).copied().unwrap_or("0")
+                };
                 let src_op = match parse_int(src_text) {
                     Some(v) => Operand::imm(v),
                     None => reg(src_text),
@@ -2826,7 +2946,11 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 if matches!(mne, "add" | "sub") && matches!(a_raw.trim(), "pc" | "r15") {
                     let base = addr as i64 + 8;
                     let is_sub = mne == "sub";
-                    let arith = if is_sub { ArithKind::Sub } else { ArithKind::Add };
+                    let arith = if is_sub {
+                        ArithKind::Sub
+                    } else {
+                        ArithKind::Add
+                    };
                     if b_raw.trim().is_empty() {
                         // `add rd, pc, #0` printed with the offset elided.
                         insns.push(Insn::move_(reg(dst_s), Operand::imm(base), addr));
@@ -2936,9 +3060,7 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                     &d,
                     Operand::Register(n) if n == "sp" || n == "g15"
                 );
-                let predicated = !cond.is_empty()
-                    && !d_is_stack_or_pc
-                    && has_prior_def(&insns, &d);
+                let predicated = !cond.is_empty() && !d_is_stack_or_pc && has_prior_def(&insns, &d);
                 // NOTE: a predicated ALU op (`orrne r3, lr, ip`, `addne r0, r0,
                 // #1`) is semantically `d = cond ? op(a, b) : d`, but lowering
                 // it to that SELECT is a NET LOSS on arm32 (measured: clean
@@ -2952,8 +3074,11 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 let (a_op, b_op);
                 if mne == "rsb" {
                     // rsb rd, rn, op2  ==  rd = op2 - rn  (swap)
-                    if let Some((base_reg, skind, amt)) = parse_shifted_src(&format!("{b_raw}, {a_raw}")) {
-                        let t = push_shifted(&mut insns, &mut temp_counter, base_reg, skind, amt, addr);
+                    if let Some((base_reg, skind, amt)) =
+                        parse_shifted_src(&format!("{b_raw}, {a_raw}"))
+                    {
+                        let t =
+                            push_shifted(&mut insns, &mut temp_counter, base_reg, skind, amt, addr);
                         a_op = t;
                         b_op = reg(a_raw.trim());
                     } else {
@@ -3083,9 +3208,9 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 };
                 // The carry is usable only when a LIVE condition came from the
                 // very instruction that produced it (see `pending_carry`).
-                let src = pending_carry.clone().filter(|c| {
-                    pending_cmp.as_ref().map(|p| p.at) == Some(c.at)
-                });
+                let src = pending_carry
+                    .clone()
+                    .filter(|c| pending_cmp.as_ref().map(|p| p.at) == Some(c.at));
                 match src {
                     Some(src) => {
                         let subtract = matches!(mne, "sbc" | "rsc");
@@ -3099,21 +3224,17 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                             addr,
                         );
                         let (lhs, rhs) = if mne == "rsc" { (rm, rn) } else { (rn, rm) };
-                        let kind = if subtract { ArithKind::Sub } else { ArithKind::Add };
+                        let kind = if subtract {
+                            ArithKind::Sub
+                        } else {
+                            ArithKind::Add
+                        };
                         let t = temp_local(&mut temp_counter);
-                        insns.push(Insn::new(
-                            Op::Arith(kind),
-                            vec![t.clone(), lhs, rhs],
-                            addr,
-                        ));
+                        insns.push(Insn::new(Op::Arith(kind), vec![t.clone(), lhs, rhs], addr));
                         // `- borrow` / `+ carry` : a SUB of the borrow, an ADD
                         // of the carry — one extra step either way, and typed
                         // as an integer because `materialize_carry` yields 0/1.
-                        insns.push(Insn::new(
-                            Op::Arith(kind),
-                            vec![dst.clone(), t, cf],
-                            addr,
-                        ));
+                        insns.push(Insn::new(Op::Arith(kind), vec![dst.clone(), t, cf], addr));
                     }
                     None => {
                         // No live carry to consume: keep every operand as a
@@ -3165,9 +3286,8 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 // resolves to the CFG exit sentinel and collapses the loop.
                 insns.push(Insn::new(Op::Nop, vec![], addr));
             }
-            "ldr" | "ldrb" | "ldrh" | "ldrsh" | "ldrsb" | "str" | "strb" | "strh"
-            | "ldrbt" | "ldrht" | "ldrsbt" | "ldrsht" | "ldrt" | "strbt" | "strht"
-            | "strt" => {
+            "ldr" | "ldrb" | "ldrh" | "ldrsh" | "ldrsb" | "str" | "strb" | "strh" | "ldrbt"
+            | "ldrht" | "ldrsbt" | "ldrsht" | "ldrt" | "strbt" | "strht" | "strt" => {
                 // The unprivileged `t` forms load and store exactly like their
                 // ordinary counterparts (see `canonical_mem_mnemonic`), so the
                 // arm below is shared rather than duplicated.
@@ -3197,8 +3317,7 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                     writeback: false,
                     subtract: false,
                 });
-                let (mem, writeback_delta) =
-                    mem_operand(&acc, &mut insns, &mut temp_counter, addr);
+                let (mem, writeback_delta) = mem_operand(&acc, &mut insns, &mut temp_counter, addr);
                 let mem = mem.with_width(width);
                 if is_load {
                     insns.push(Insn::move_(src_reg.clone(), mem, addr));
@@ -3250,7 +3369,10 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 // "mla r0, r1, r2, r0" = rd = rn*rm + ra (fused)
                 let parts: Vec<&str> = rest.split(", ").collect();
                 insns.push(Insn::new(
-                    Op::MulAcc { negate_addend: false, is_float: false },
+                    Op::MulAcc {
+                        negate_addend: false,
+                        is_float: false,
+                    },
                     vec![
                         reg(parts.first().copied().unwrap_or("")),
                         reg(parts.get(1).copied().unwrap_or("")),
@@ -3335,7 +3457,11 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
             "b" if cond.is_empty() => {
                 let target = parse_target(rest.trim_start_matches('#'), addr);
                 // usize::MAX = unresolvable → CFG maps it to an exit edge
-                insns.push(Insn::new(Op::Jump(target.unwrap_or(usize::MAX)), vec![], addr));
+                insns.push(Insn::new(
+                    Op::Jump(target.unwrap_or(usize::MAX)),
+                    vec![],
+                    addr,
+                ));
                 // An unconditional `b` does NOT write APSR, so the pending
                 // compare is still live at its target: `cmp; bls L1; b L2;
                 // L1: bhi L3` re-tests the SAME flags in the second branch.
@@ -3485,7 +3611,11 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                         }
                     }
                 };
-                pending_cmp = Some(PendingCompare { lhs, rhs, at: insns.len() });
+                pending_cmp = Some(PendingCompare {
+                    lhs,
+                    rhs,
+                    at: insns.len(),
+                });
                 insns.push(Insn::new(Op::Nop, vec![], addr));
             }
             // ---- negation ---------------------------------------------------
@@ -3533,7 +3663,11 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 let mask: i64 = if mne == "uxtb" { 0xFF } else { 0xFFFF };
                 insns.push(Insn::new(
                     Op::Arith(ArithKind::And),
-                    vec![dst.clone(), reg(parts.get(1).copied().unwrap_or("")), Operand::imm(mask)],
+                    vec![
+                        dst.clone(),
+                        reg(parts.get(1).copied().unwrap_or("")),
+                        Operand::imm(mask),
+                    ],
                     addr,
                 ));
             }
@@ -3611,11 +3745,9 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                     .trim_end_matches('!');
                 let mut segs = inner.split(',');
                 let base = reg(segs.next().unwrap_or("sp").trim());
-                let off = segs
-                    .next()
-                    .and_then(|s| parse_int(s.trim()))
-                    .unwrap_or(0);
-                let mk = |delta: i64| Operand::Memory { width: 0,
+                let off = segs.next().and_then(|s| parse_int(s.trim())).unwrap_or(0);
+                let mk = |delta: i64| Operand::Memory {
+                    width: 0,
                     base: Box::new(base.clone()),
                     index: None,
                     scale: 4,
@@ -3629,17 +3761,12 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                     insns.push(Insn::move_(mk(4), r1, addr));
                 }
             }
-            "ldm" | "ldmia" | "ldmib" | "ldmda" | "ldmdb" | "stm" | "stmia" | "stmib"
-            | "stmda" | "stmdb" | "push.w" | "pop.w" => {
+            "ldm" | "ldmia" | "ldmib" | "ldmda" | "ldmdb" | "stm" | "stmia" | "stmib" | "stmda"
+            | "stmdb" | "push.w" | "pop.w" => {
                 let is_load = mne.starts_with("ldm") || mne == "pop.w";
                 let mut parts = rest.splitn(2, ", ");
                 let base_text = parts.next().unwrap_or("sp");
-                let base = reg(
-                    base_text
-                        .trim()
-                        .trim_end_matches('!')
-                        .trim(),
-                );
+                let base = reg(base_text.trim().trim_end_matches('!').trim());
                 let list_raw = parts.next().unwrap_or("{}");
                 let list: Vec<Operand> = list_raw
                     .trim()
@@ -3649,7 +3776,8 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                     .map(|s| reg(s.trim()))
                     .collect();
                 for (i, r) in list.iter().enumerate() {
-                    let m = Operand::Memory { width: 0,
+                    let m = Operand::Memory {
+                        width: 0,
                         base: Box::new(base.clone()),
                         index: None,
                         scale: 4,
@@ -3689,8 +3817,8 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
             // These emit no value and touch no register, but they are NOT
             // unknown instructions: reporting them as "uncovered" inflated the
             // census and, worse, left the address bookkeeping to the catch-all.
-            "nop" | "nop.w" | "dmb" | "dsb" | "isb" | "clrex" | "yield" | "sev" | "wfe"
-            | "wfi" | "csdb" | "pld" | "pldw" | "pli" | "vmrs" | "vmsr" => {}
+            "nop" | "nop.w" | "dmb" | "dsb" | "isb" | "clrex" | "yield" | "sev" | "wfe" | "wfi"
+            | "csdb" | "pld" | "pldw" | "pli" | "vmrs" | "vmsr" => {}
             // ---- Thumb-2 compare-and-branch --------------------------------
             // `cbz`/`cbnz` are the null/zero tests Thumb-2 uses for every
             // reference check, and `tbz`/`tbnz` test a single bit — the shape
@@ -3782,7 +3910,10 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
                 } else {
                     (None, 1usize)
                 };
-                let lsb = parts.get(field_base).and_then(|s| parse_field(s)).unwrap_or(0);
+                let lsb = parts
+                    .get(field_base)
+                    .and_then(|s| parse_field(s))
+                    .unwrap_or(0);
                 let width = parts
                     .get(field_base + 1)
                     .and_then(|s| parse_field(s))
@@ -3838,7 +3969,11 @@ pub fn lift_arm32(bytes: &[u8], base_rva: u64, max_insns: usize) -> Option<LiftR
             "ssat" | "usat" => {
                 let parts: Vec<&str> = rest.split(", ").collect();
                 let dst = reg(parts.first().copied().unwrap_or(""));
-                let bits = parts.get(1).and_then(|s| parse_field(s)).unwrap_or(32).clamp(1, 32);
+                let bits = parts
+                    .get(1)
+                    .and_then(|s| parse_field(s))
+                    .unwrap_or(32)
+                    .clamp(1, 32);
                 let src_text = parts.get(2).copied().unwrap_or("");
                 let shift = parts
                     .get(3)
@@ -4214,5 +4349,8 @@ fn parse_target(raw: &str, addr: u64) -> Option<usize> {
         let off = if neg { -v } else { v };
         return (addr as i64 + off).try_into().ok();
     }
-    raw.parse::<i64>().ok().map(|off| (addr as i64 + off) as usize).or_else(|| raw.parse::<usize>().ok())
-}
+    raw.parse::<i64>()
+        .ok()
+        .map(|off| (addr as i64 + off) as usize)
+        .or_else(|| raw.parse::<usize>().ok())
+}

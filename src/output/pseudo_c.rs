@@ -5,17 +5,16 @@
 //! Ghidra-backed pipeline was removed when the native engine became the
 //! default for ARM64 and x64.
 
-use std::collections::{HashMap, HashSet};
 use crate::executor::Il2CppExecutor;
 use crate::il2cpp::base::Il2Cpp;
 use crate::il2cpp::enums::method_attributes;
+use std::collections::{HashMap, HashSet};
 
 /// Methods smaller than this are not worth decompiling (alignment / stub
 /// thunks with no useful body).
 const MIN_BODY_SIZE: usize = 4;
 
 use crate::il2cpp::metadata::Metadata;
-
 
 /// One type with its concrete (decompilable) method count.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -250,10 +249,7 @@ pub fn assembly_matches(image_name: &str, include_assemblies: &[String]) -> bool
         .trim_end_matches(".DLL");
     let base_l = base.to_ascii_lowercase();
     include_assemblies.iter().any(|f| {
-        let f = f
-            .trim()
-            .trim_end_matches(".dll")
-            .trim_end_matches(".DLL");
+        let f = f.trim().trim_end_matches(".dll").trim_end_matches(".DLL");
         let f_l = f.to_ascii_lowercase();
         base_l == f_l || base_l.starts_with(&f_l)
     })
@@ -334,11 +330,7 @@ pub fn type_matches(full_type: &str, include_types: &[String]) -> bool {
 }
 
 /// True if either the picker-style name or the dump.cs-style name matches.
-pub fn type_matches_either(
-    picker_name: &str,
-    dump_name: &str,
-    include_types: &[String],
-) -> bool {
+pub fn type_matches_either(picker_name: &str, dump_name: &str, include_types: &[String]) -> bool {
     if include_types.is_empty() {
         return true;
     }
@@ -379,10 +371,10 @@ pub fn method_body_filter_allows_names(
     if include_assemblies.is_empty() && include_types.is_empty() {
         return true;
     }
-    let hit_asm = !include_assemblies.is_empty()
-        && assembly_matches(image_name, include_assemblies);
-    let hit_type = !include_types.is_empty()
-        && type_matches_either(picker_name, dump_name, include_types);
+    let hit_asm =
+        !include_assemblies.is_empty() && assembly_matches(image_name, include_assemblies);
+    let hit_type =
+        !include_types.is_empty() && type_matches_either(picker_name, dump_name, include_types);
     hit_asm || hit_type
 }
 
@@ -397,7 +389,10 @@ mod filter_tests {
         assert!(type_matches("Game.Player`1", &include));
         assert!(type_matches("Game.Player", &include));
         assert!(!type_matches("Game.Enemy", &include));
-        assert!(type_matches("Game.Player.Nested", &["Game.Player".to_string()]));
+        assert!(type_matches(
+            "Game.Player.Nested",
+            &["Game.Player".to_string()]
+        ));
         assert!(type_matches_either(
             "Game.Player`1",
             "Game.Player",

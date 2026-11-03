@@ -146,7 +146,10 @@ impl ManagedType {
     }
 
     pub fn is_float(&self) -> bool {
-        matches!(self, Self::Primitive(PrimKind::R4) | Self::Primitive(PrimKind::R8))
+        matches!(
+            self,
+            Self::Primitive(PrimKind::R4) | Self::Primitive(PrimKind::R8)
+        )
     }
 
     /// Metadata-free value-type-ness: `Some(true)` for primitives (value types
@@ -224,7 +227,10 @@ impl MethodRef {
         if self.declaring_namespace.is_empty() {
             format!("{}::{}", self.declaring_type_name, self.name)
         } else {
-            format!("{}.{}::{}", self.declaring_namespace, self.declaring_type_name, self.name)
+            format!(
+                "{}.{}::{}",
+                self.declaring_namespace, self.declaring_type_name, self.name
+            )
         }
     }
 }

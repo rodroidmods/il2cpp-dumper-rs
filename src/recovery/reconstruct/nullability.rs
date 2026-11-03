@@ -49,7 +49,7 @@
 //! `MethodCtx`.
 
 use super::super::csharp::CmpKind;
-use super::{children, walk_mut, Expr, Stmt};
+use super::{Expr, Stmt, children, walk_mut};
 use std::collections::HashSet;
 
 /// The evidence collected over a whole method body.
@@ -104,6 +104,18 @@ impl ReferenceProof {
             Expr::Not(x) | Expr::Neg(x) | Expr::Cast(_, x) | Expr::Await(x) => self.scan_expr(x),
             Expr::RawCall(_, args, _) | Expr::NewObj(_, args) | Expr::NewArr(_, args) => {
                 for a in args {
+                    self.scan_expr(a);
+                }
+            }
+            Expr::ArrayInit { items, .. } => {
+                for a in items {
+                    self.scan_expr(a);
+                }
+            }
+            Expr::CollectionInit {
+                ctor_args, items, ..
+            } => {
+                for a in ctor_args.iter().chain(items) {
                     self.scan_expr(a);
                 }
             }
@@ -165,10 +177,7 @@ impl ReferenceProof {
         loop {
             let mut changed = false;
             for (a, b) in self.copies.clone() {
-                if self.refs.contains(&b)
-                    && !self.addressed.contains(&a)
-                    && self.refs.insert(a)
-                {
+                if self.refs.contains(&b) && !self.addressed.contains(&a) && self.refs.insert(a) {
                     changed = true;
                 }
             }
@@ -231,7 +240,9 @@ fn declared_type_is_reference(ty: &str) -> bool {
 /// proof classified.
 fn is_proven_reference(e: &Expr, refs: &HashSet<String>) -> bool {
     match e {
-        Expr::NewObj(..) | Expr::NewArr(..) => true,
+        Expr::NewObj(..) | Expr::NewArr(..) | Expr::ArrayInit { .. } | Expr::CollectionInit { .. } => {
+            true
+        }
         Expr::Var(n) => refs.contains(n),
         _ => false,
     }
@@ -283,6 +294,18 @@ fn rewrite_expr(e: &mut Expr, refs: &HashSet<String>) -> usize {
         }
         Expr::RawCall(_, args, _) | Expr::NewObj(_, args) | Expr::NewArr(_, args) => {
             for a in args.iter_mut() {
+                n += rewrite_expr(a, refs);
+            }
+        }
+        Expr::ArrayInit { items, .. } => {
+            for a in items.iter_mut() {
+                n += rewrite_expr(a, refs);
+            }
+        }
+        Expr::CollectionInit {
+            ctor_args, items, ..
+        } => {
+            for a in ctor_args.iter_mut().chain(items) {
                 n += rewrite_expr(a, refs);
             }
         }

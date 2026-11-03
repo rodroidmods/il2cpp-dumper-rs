@@ -1,17 +1,17 @@
+use crate::config::Config;
+use crate::disassembler::{self, Disassembler, DisassemblyContext};
+use crate::error::Result;
+use crate::executor::Il2CppExecutor;
+use crate::executor::custom_attribute_reader;
+use crate::il2cpp::base::*;
+use crate::il2cpp::enums::*;
+use crate::il2cpp::metadata::Metadata;
+use crate::il2cpp::structures::*;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
-use rayon::prelude::*;
-use crate::error::Result;
-use crate::il2cpp::base::*;
-use crate::il2cpp::metadata::Metadata;
-use crate::il2cpp::enums::*;
-use crate::il2cpp::structures::*;
-use crate::executor::Il2CppExecutor;
-use crate::executor::custom_attribute_reader;
-use crate::config::Config;
-use crate::disassembler::{self, Disassembler, DisassemblyContext};
 
 pub struct Il2CppDecompiler;
 
@@ -40,7 +40,10 @@ impl Il2CppDecompiler {
             let arch = il2cpp.detect_architecture();
             logger(&format!("Disassembly enabled — architecture: {arch}"));
             let sorted_addrs = il2cpp.build_sorted_method_addresses();
-            logger(&format!("Building method address map ({} methods)...", sorted_addrs.len()));
+            logger(&format!(
+                "Building method address map ({} methods)...",
+                sorted_addrs.len()
+            ));
 
             let image_defs_clone = metadata.image_defs.clone();
 
@@ -63,7 +66,8 @@ impl Il2CppDecompiler {
                             (td.method_start as usize..method_end)
                                 .filter_map(move |mi| {
                                     let method_def = &metadata.method_defs[mi];
-                                    let method_ptr = il2cpp.get_method_pointer(&image_name, method_def);
+                                    let method_ptr =
+                                        il2cpp.get_method_pointer(&image_name, method_def);
                                     if method_ptr == 0 {
                                         return None;
                                     }
@@ -105,7 +109,10 @@ impl Il2CppDecompiler {
                 generic_spec_count += 1;
             }
             if generic_spec_count > 0 {
-                logger(&format!("Indexed {} generic method specializations", generic_spec_count));
+                logger(&format!(
+                    "Indexed {} generic method specializations",
+                    generic_spec_count
+                ));
             }
 
             let mut disassembler = Disassembler::new(arch);
@@ -115,7 +122,10 @@ impl Il2CppDecompiler {
             let string_table: HashMap<u32, String> = (0..total_string_lits)
                 .into_par_iter()
                 .filter_map(|i| {
-                    metadata.get_string_literal_from_index(i).ok().map(|s| (i as u32, s))
+                    metadata
+                        .get_string_literal_from_index(i)
+                        .ok()
+                        .map(|s| (i as u32, s))
                 })
                 .collect();
             if !string_table.is_empty() {
@@ -124,13 +134,26 @@ impl Il2CppDecompiler {
 
             logger("Building metadata annotations...");
             if il2cpp.version >= 27.0 {
-                Self::build_v27_annotations(&mut disassembler, executor, metadata, il2cpp, &image_defs_clone);
+                Self::build_v27_annotations(
+                    &mut disassembler,
+                    executor,
+                    metadata,
+                    il2cpp,
+                    &image_defs_clone,
+                );
             } else if il2cpp.version > 16.0 {
-                Self::build_legacy_annotations(&mut disassembler, executor, metadata, il2cpp, &image_defs_clone);
+                Self::build_legacy_annotations(
+                    &mut disassembler,
+                    executor,
+                    metadata,
+                    il2cpp,
+                    &image_defs_clone,
+                );
             }
 
             logger("Detecting runtime helpers (parallel sample)...");
-            let samples = Self::sample_methods_for_helpers(&disassembler, il2cpp, &sorted_addrs, config);
+            let samples =
+                Self::sample_methods_for_helpers(&disassembler, il2cpp, &sorted_addrs, config);
 
             let detected = Self::detect_string_new_wrapper_from_samples(
                 &disassembler,
@@ -141,7 +164,11 @@ impl Il2CppDecompiler {
                 disassembler.add_string_new_wrapper_rva(*rva);
             }
             if !detected.is_empty() {
-                let preview: Vec<String> = detected.iter().take(3).map(|r| format!("0x{:X}", r)).collect();
+                let preview: Vec<String> = detected
+                    .iter()
+                    .take(3)
+                    .map(|r| format!("0x{:X}", r))
+                    .collect();
                 logger(&format!(
                     "Detected {} il2cpp_string_new_wrapper candidate(s): {}",
                     detected.len(),
@@ -154,7 +181,11 @@ impl Il2CppDecompiler {
                 disassembler.add_box_helper_rva(*rva);
             }
             if !box_helpers.is_empty() {
-                let preview: Vec<String> = box_helpers.iter().take(3).map(|r| format!("0x{:X}", r)).collect();
+                let preview: Vec<String> = box_helpers
+                    .iter()
+                    .take(3)
+                    .map(|r| format!("0x{:X}", r))
+                    .collect();
                 logger(&format!(
                     "Detected {} box/object_new helper candidate(s): {}",
                     box_helpers.len(),
@@ -169,7 +200,11 @@ impl Il2CppDecompiler {
                 disassembler.add_unbox_helper_rva(*rva);
             }
             if !unbox_helpers.is_empty() {
-                let preview: Vec<String> = unbox_helpers.iter().take(3).map(|r| format!("0x{:X}", r)).collect();
+                let preview: Vec<String> = unbox_helpers
+                    .iter()
+                    .take(3)
+                    .map(|r| format!("0x{:X}", r))
+                    .collect();
                 logger(&format!(
                     "Detected {} unbox helper candidate(s): {}",
                     unbox_helpers.len(),
@@ -234,7 +269,10 @@ impl Il2CppDecompiler {
             None
         };
 
-        let image_info: Vec<(usize, i32, i32)> = metadata.image_defs.iter().enumerate()
+        let image_info: Vec<(usize, i32, i32)> = metadata
+            .image_defs
+            .iter()
+            .enumerate()
             .map(|(idx, img)| (idx, img.name_index, img.type_start))
             .collect();
         for (idx, name_index, type_start) in &image_info {
@@ -283,8 +321,20 @@ impl Il2CppDecompiler {
         let image_defs = metadata.image_defs.clone();
         let include_assemblies = &config.dump_pseudo_c_include_assemblies;
         let include_types = &config.dump_pseudo_c_include_types;
-        let class_filter_active =
-            !include_assemblies.is_empty() || !include_types.is_empty();
+        // The include list selects which assemblies get METHOD BODIES; it must
+        // not drop type/method headers when no body mode is enabled. Applying
+        // it unconditionally produced a smaller dump with whole assemblies
+        // missing (Free Fire MAX: 38,198 of 43,760 types; CODM: 77 MB instead
+        // of 81.9 MB) even though `methodBodyMode: "off"` asks for the full
+        // signature dump.
+        let bodies_enabled =
+            config.dump_pseudo_c || config.dump_disassembly || config.il_recovery;
+        let class_filter_active = bodies_enabled
+            && (!include_assemblies.is_empty() || !include_types.is_empty());
+        // `csharpFullDump`: the filter keeps selecting which TYPES get method
+        // bodies, but the dump itself stays complete — every type/method
+        // header is emitted and unselected bodies render `{ }`.
+        let header_filter_active = class_filter_active && !config.dump_pseudo_c_full_dump;
         let type_jobs: Vec<(usize, usize, String)> = image_defs
             .iter()
             .enumerate()
@@ -293,7 +343,7 @@ impl Il2CppDecompiler {
                     .get_string_from_index(image_def.name_index)
                     .unwrap_or_else(|_| format!("Assembly-{img_idx}.dll"));
                 // Fast reject: no types selected and this DLL is not allow-listed.
-                if class_filter_active
+                if header_filter_active
                     && include_types.is_empty()
                     && !crate::output::pseudo_c::assembly_matches(&image_name, include_assemblies)
                 {
@@ -302,7 +352,7 @@ impl Il2CppDecompiler {
                 let type_end = image_def.type_start as usize + image_def.type_count as usize;
                 (image_def.type_start as usize..type_end)
                     .filter(|&type_def_index| {
-                        if !class_filter_active {
+                        if !header_filter_active {
                             return true;
                         }
                         let Some(td) = metadata.type_defs.get(type_def_index) else {
@@ -310,7 +360,12 @@ impl Il2CppDecompiler {
                         };
                         let picker = crate::output::pseudo_c::picker_type_name(metadata, td);
                         let dump_name = executor.get_type_def_name(
-                            td, type_def_index, metadata, il2cpp, true, false,
+                            td,
+                            type_def_index,
+                            metadata,
+                            il2cpp,
+                            true,
+                            false,
                         );
                         crate::output::pseudo_c::method_body_filter_allows_names(
                             &image_name,
@@ -325,12 +380,13 @@ impl Il2CppDecompiler {
             })
             .collect();
         if class_filter_active {
-            if type_jobs.is_empty() {
-                let preview: Vec<&str> = include_types
-                    .iter()
-                    .take(8)
-                    .map(|s| s.as_str())
-                    .collect();
+            if class_filter_active && !header_filter_active {
+                logger(&format!(
+                    "Class filter (full dump): emitting ALL types, method bodies limited to the selection{}",
+                    if type_jobs.is_empty() { " (no metadata name matched — no bodies)" } else { "" }
+                ));
+            } else if type_jobs.is_empty() {
+                let preview: Vec<&str> = include_types.iter().take(8).map(|s| s.as_str()).collect();
                 logger(&format!(
                     "Class filter: dumping 0 types — assemblies={:?} types_preview={:?} (no metadata name matched)",
                     include_assemblies, preview
@@ -343,10 +399,13 @@ impl Il2CppDecompiler {
             }
         }
 
-        let want_flat_disasm = config.dump_disassembly_target == 0 || config.dump_disassembly_target == 1;
-        let want_split_disasm = config.dump_disassembly_target == 0 || config.dump_disassembly_target == 2;
+        let want_flat_disasm =
+            config.dump_disassembly_target == 0 || config.dump_disassembly_target == 1;
+        let want_split_disasm =
+            config.dump_disassembly_target == 0 || config.dump_disassembly_target == 2;
         let want_flat_pseudo = config.dump_pseudo_c_target == 0 || config.dump_pseudo_c_target == 1;
-        let want_split_pseudo = config.dump_pseudo_c_target == 0 || config.dump_pseudo_c_target == 2;
+        let want_split_pseudo =
+            config.dump_pseudo_c_target == 0 || config.dump_pseudo_c_target == 2;
 
         let type_results: Vec<(String, Option<(std::path::PathBuf, String)>)> = type_jobs
             .par_iter()
@@ -372,7 +431,11 @@ impl Il2CppDecompiler {
                     false,
                     flat_disasm,
                     flat_pseudo,
-                    if share_asm { Some(&mut method_asm_cache) } else { None },
+                    if share_asm {
+                        Some(&mut method_asm_cache)
+                    } else {
+                        None
+                    },
                 ) {
                     writeln!(type_buf, "/*\n{e}\n*/\n}}").ok();
                 }
@@ -424,7 +487,11 @@ impl Il2CppDecompiler {
                             true,
                             split_disasm,
                             split_pseudo,
-                            if share_asm { Some(&mut method_asm_cache) } else { None },
+                            if share_asm {
+                                Some(&mut method_asm_cache)
+                            } else {
+                                None
+                            },
                         ) {
                             writeln!(split_buf, "/*\n{e}\n*/\n}}").ok();
                         }
@@ -456,11 +523,13 @@ impl Il2CppDecompiler {
             }
         }
 
-        split_file_outputs.par_iter().for_each(|(file_path, content)| {
-            if let Err(e) = fs::write(file_path, content) {
-                eprintln!("WARNING: Failed to write diffable cs: {e}");
-            }
-        });
+        split_file_outputs
+            .par_iter()
+            .for_each(|(file_path, content)| {
+                if let Err(e) = fs::write(file_path, content) {
+                    eprintln!("WARNING: Failed to write diffable cs: {e}");
+                }
+            });
 
         fs::write(output_path, buf)?;
         Ok(())
@@ -521,8 +590,14 @@ impl Il2CppDecompiler {
 
         if config.dump_attribute {
             Self::write_custom_attributes(
-                buf, executor, metadata, il2cpp,
-                image_index, type_def.custom_attribute_index, type_def.token, indent,
+                buf,
+                executor,
+                metadata,
+                il2cpp,
+                image_index,
+                type_def.custom_attribute_index,
+                type_def.token,
+                indent,
             );
 
             if (type_def.flags & type_attributes::SERIALIZABLE) != 0 {
@@ -542,7 +617,8 @@ impl Il2CppDecompiler {
             && (type_def.flags & type_attributes::ABSTRACT) != 0
         {
             buf.push_str("abstract ");
-        } else if !type_def.is_value_type() && !type_def.is_enum()
+        } else if !type_def.is_value_type()
+            && !type_def.is_enum()
             && (type_def.flags & type_attributes::SEALED) != 0
         {
             buf.push_str("sealed ");
@@ -558,8 +634,9 @@ impl Il2CppDecompiler {
             buf.push_str("class ");
         }
 
-        let type_name_raw = executor.get_type_def_name(&type_def, type_def_index, metadata, il2cpp, false, true);
-        
+        let type_name_raw =
+            executor.get_type_def_name(&type_def, type_def_index, metadata, il2cpp, false, true);
+
         // Strip parent namespace prefixes from nested classes for clean inner definitions
         let display_name = if type_def.declaring_type_index >= 0 {
             let parts: Vec<&str> = type_name_raw.split('.').collect();
@@ -567,7 +644,7 @@ impl Il2CppDecompiler {
         } else {
             type_name_raw
         };
-        
+
         buf.push_str(&display_name);
 
         if !extends.is_empty() {
@@ -581,11 +658,30 @@ impl Il2CppDecompiler {
         }
 
         if config.dump_field && type_def.field_count > 0 {
-            Self::dump_fields(buf, executor, metadata, il2cpp, config, &type_def, type_def_index, image_index, indent)?;
+            Self::dump_fields(
+                buf,
+                executor,
+                metadata,
+                il2cpp,
+                config,
+                &type_def,
+                type_def_index,
+                image_index,
+                indent,
+            )?;
         }
 
         if config.dump_property && type_def.property_count > 0 {
-            Self::dump_properties(buf, executor, metadata, il2cpp, config, &type_def, image_index, indent)?;
+            Self::dump_properties(
+                buf,
+                executor,
+                metadata,
+                il2cpp,
+                config,
+                &type_def,
+                image_index,
+                indent,
+            )?;
         }
 
         if config.dump_method && type_def.method_count > 0 {
@@ -610,7 +706,8 @@ impl Il2CppDecompiler {
 
         if dump_nested && type_def.nested_type_count > 0 {
             for i in 0..type_def.nested_type_count as usize {
-                let nested_idx = metadata.nested_type_indices[type_def.nested_types_start as usize + i];
+                let nested_idx =
+                    metadata.nested_type_indices[type_def.nested_types_start as usize + i];
                 if let Err(e) = Self::dump_type(
                     buf,
                     executor,
@@ -657,15 +754,30 @@ impl Il2CppDecompiler {
             if config.dump_attribute {
                 let attr_indent = format!("{indent}\t");
                 Self::write_custom_attributes(
-                    buf, executor, metadata, il2cpp,
-                    image_index, field_def.custom_attribute_index, field_def.token, &attr_indent,
+                    buf,
+                    executor,
+                    metadata,
+                    il2cpp,
+                    image_index,
+                    field_def.custom_attribute_index,
+                    field_def.token,
+                    &attr_indent,
                 );
             }
 
             crate::output::static_field_exporter::write_dump_cs_field_annotations(
-                buf, executor, metadata, il2cpp, config,
-                type_def, type_def_index, i, i - type_def.field_start as usize,
-                &field_def, &field_type, indent,
+                buf,
+                executor,
+                metadata,
+                il2cpp,
+                config,
+                type_def,
+                type_def_index,
+                i,
+                i - type_def.field_start as usize,
+                &field_def,
+                &field_type,
+                indent,
             )?;
 
             buf.push_str(indent);
@@ -687,14 +799,20 @@ impl Il2CppDecompiler {
                 }
             }
 
-            let field_type_name = executor.get_type_name(&field_type, metadata, il2cpp, false, false);
+            let field_type_name =
+                executor.get_type_name(&field_type, metadata, il2cpp, false, false);
             let field_name = metadata.get_string_from_index(field_def.name_index)?;
             write!(buf, "{field_type_name} {field_name}").ok();
 
             if let Some(dv) = metadata.get_field_default_value(i as i32) {
                 let dv = dv.clone();
                 if dv.data_index != -1 {
-                    match executor.try_get_default_value(dv.type_index, dv.data_index, metadata, il2cpp) {
+                    match executor.try_get_default_value(
+                        dv.type_index,
+                        dv.data_index,
+                        metadata,
+                        il2cpp,
+                    ) {
                         Ok(val) => write!(buf, " = {val}").ok(),
                         Err(offset) => write!(buf, " /*Metadata offset 0x{offset:X}*/").ok(),
                     };
@@ -736,8 +854,14 @@ impl Il2CppDecompiler {
             if config.dump_attribute {
                 let attr_indent = format!("{indent}\t");
                 Self::write_custom_attributes(
-                    buf, executor, metadata, il2cpp,
-                    image_index, property_def.custom_attribute_index, property_def.token, &attr_indent,
+                    buf,
+                    executor,
+                    metadata,
+                    il2cpp,
+                    image_index,
+                    property_def.custom_attribute_index,
+                    property_def.token,
+                    &attr_indent,
                 );
             }
 
@@ -746,18 +870,25 @@ impl Il2CppDecompiler {
 
             let property_type_name;
             if property_def.get >= 0 {
-                let method_def = metadata.method_defs[type_def.method_start as usize + property_def.get as usize].clone();
+                let method_def = metadata.method_defs
+                    [type_def.method_start as usize + property_def.get as usize]
+                    .clone();
                 let mods = executor.get_modifiers(method_def.flags as u32).to_string();
                 buf.push_str(&mods);
                 let ret_type = il2cpp.types[method_def.return_type as usize].clone();
-                property_type_name = executor.get_type_name(&ret_type, metadata, il2cpp, false, false);
+                property_type_name =
+                    executor.get_type_name(&ret_type, metadata, il2cpp, false, false);
             } else if property_def.set >= 0 {
-                let method_def = metadata.method_defs[type_def.method_start as usize + property_def.set as usize].clone();
+                let method_def = metadata.method_defs
+                    [type_def.method_start as usize + property_def.set as usize]
+                    .clone();
                 let mods = executor.get_modifiers(method_def.flags as u32).to_string();
                 buf.push_str(&mods);
-                let param_def = metadata.parameter_defs[method_def.parameter_start as usize].clone();
+                let param_def =
+                    metadata.parameter_defs[method_def.parameter_start as usize].clone();
                 let param_type = il2cpp.types[param_def.type_index as usize].clone();
-                property_type_name = executor.get_type_name(&param_type, metadata, il2cpp, false, false);
+                property_type_name =
+                    executor.get_type_name(&param_type, metadata, il2cpp, false, false);
             } else {
                 property_type_name = "object".to_string();
             }
@@ -765,12 +896,42 @@ impl Il2CppDecompiler {
             let property_name = metadata.get_string_from_index(property_def.name_index)?;
             write!(buf, "{property_type_name} {property_name} {{ ").ok();
 
-            if property_def.get >= 0 { buf.push_str("get; "); }
-            if property_def.set >= 0 { buf.push_str("set; "); }
+            if property_def.get >= 0 {
+                buf.push_str("get; ");
+            }
+            if property_def.set >= 0 {
+                buf.push_str("set; ");
+            }
 
             writeln!(buf, "}}").ok();
         }
         Ok(())
+    }
+
+    /// A Unity engine method implemented natively: its IL2CPP stub lazily
+    /// resolves an icall pointer into a static slot and jumps through it:
+    ///
+    /// ```text
+    /// if (*(nint*)(0x457d000 +3640) == 0)
+    ///     *(nint*)(0x457d000 +3640) = fn_1c023e8(11772415);
+    /// return fnptr_0x3cb8418(this.m_CachedPtr, &stack_48);
+    /// ```
+    ///
+    /// The body IS the resolver machinery, not managed code. Unity's own
+    /// reference assembly declares these `extern` with
+    /// `[MethodImpl(MethodImplOptions.InternalCall)]`, which is what the dump
+    /// prints instead. The caller gates this to `UnityEngine*` assemblies;
+    /// managed helpers there (Vector3.Cross, Mathf.Sin) do not match the
+    /// fingerprint and keep their decompiled bodies.
+    fn is_icall_stub_body(code: &str) -> bool {
+        // Two spellings occur:
+        //   slot = fn_resolve(…);                  (direct)
+        //   v = fn_resolve(…); slot = v; return fnptr_0x…(v);   (via a temp)
+        // Both are the native icall resolver; either ends in a call through
+        // the resolved pointer (`fnptr_0x…`) or an unresolved tail jump.
+        code.contains("*(nint*)(0x")
+            && code.contains("= fn_")
+            && (code.contains("fnptr_0x") || code.contains("indirect jump"))
     }
 
     fn dump_methods(
@@ -790,10 +951,25 @@ impl Il2CppDecompiler {
     ) -> Result<()> {
         writeln!(buf, "\n{indent}\t// Methods").ok();
         let method_end = type_def.method_start as usize + type_def.method_count as usize;
+        // Delegate types declare their runtime methods (`Invoke`/`BeginInvoke`/
+        // `EndInvoke`) in the base class; the compiler emits only a `br`
+        // dispatch for them, which used to render as an "indirect jump" body.
+        // They are declarations, not managed code.
+        let is_delegate = type_def.parent_index >= 0
+            && il2cpp
+                .types
+                .get(type_def.parent_index as usize)
+                .map(|p| {
+                    let name = executor.get_type_name(p, metadata, il2cpp, false, false);
+                    name.ends_with("MulticastDelegate") || name.ends_with(".Delegate")
+                })
+                .unwrap_or(false);
 
         // Same picker filters as C# pseudo: when assemblies/types are set, only
-        // those types get native disassembly bodies (signatures still dump).
-        let disasm_allowed = {
+        // those types get method bodies (signatures still dump). With
+        // `csharpFullDump` the headers of every type are emitted, and this
+        // gate keeps the bodies empty outside the selection.
+        let body_allowed = {
             let assemblies = &config.dump_pseudo_c_include_assemblies;
             let types = &config.dump_pseudo_c_include_types;
             if assemblies.is_empty() && types.is_empty() {
@@ -801,19 +977,20 @@ impl Il2CppDecompiler {
             } else {
                 let picker = crate::output::pseudo_c::picker_type_name(metadata, type_def);
                 let dump_name = executor.get_type_def_name(
-                    type_def, type_def_index, metadata, il2cpp, true, false,
+                    type_def,
+                    type_def_index,
+                    metadata,
+                    il2cpp,
+                    true,
+                    false,
                 );
                 crate::output::pseudo_c::method_body_filter_allows_names(
-                    image_name,
-                    &picker,
-                    &dump_name,
-                    assemblies,
-                    types,
+                    image_name, &picker, &dump_name, assemblies, types,
                 )
             }
         };
 
-        let field_ctx = if disasm.is_some() && disasm_allowed {
+        let field_ctx = if disasm.is_some() && body_allowed {
             let mut field_offsets = HashMap::new();
             let mut vtable_methods = HashMap::new();
 
@@ -822,7 +999,10 @@ impl Il2CppDecompiler {
                 for fi in type_def.field_start as usize..field_end {
                     let fd = metadata.field_defs[fi].clone();
                     let ft = il2cpp.types.get(fd.type_index as usize).cloned();
-                    let is_static = ft.as_ref().map(|t| (t.attrs & crate::il2cpp::enums::field_attributes::STATIC) != 0).unwrap_or(false);
+                    let is_static = ft
+                        .as_ref()
+                        .map(|t| (t.attrs & crate::il2cpp::enums::field_attributes::STATIC) != 0)
+                        .unwrap_or(false);
                     if is_static {
                         continue;
                     }
@@ -845,7 +1025,9 @@ impl Il2CppDecompiler {
                 let ptr_size = if il2cpp.is_32bit { 4i32 } else { 8i32 };
                 for vi in 0..type_def.vtable_count as usize {
                     let vtable_index = type_def.vtable_start as usize + vi;
-                    if vtable_index >= metadata.vtable_methods.len() { break; }
+                    if vtable_index >= metadata.vtable_methods.len() {
+                        break;
+                    }
 
                     let encoded = metadata.vtable_methods[vtable_index];
                     let usage = (encoded & 0xE0000000) >> 29;
@@ -857,20 +1039,39 @@ impl Il2CppDecompiler {
 
                     let method_name = if usage == 6 {
                         if (index as usize) < il2cpp.method_specs.len() {
-                            let (tn, mn) = executor.get_method_spec_name(index as usize, metadata, il2cpp, false);
+                            let (tn, mn) = executor.get_method_spec_name(
+                                index as usize,
+                                metadata,
+                                il2cpp,
+                                false,
+                            );
                             Some(format!("{}.{}", tn, mn))
-                        } else { None }
+                        } else {
+                            None
+                        }
                     } else {
                         if let Some(md) = metadata.method_defs.get(index as usize).cloned() {
                             if md.slot != 0xFFFF {
                                 let declaring_idx = md.declaring_type as usize;
-                                let tn = if let Some(td) = metadata.type_defs.get(declaring_idx).cloned() {
-                                    metadata.get_string_from_index(td.name_index).unwrap_or_default()
-                                } else { "?".to_string() };
-                                let mn = metadata.get_string_from_index(md.name_index as i32).unwrap_or_default();
+                                let tn = if let Some(td) =
+                                    metadata.type_defs.get(declaring_idx).cloned()
+                                {
+                                    metadata
+                                        .get_string_from_index(td.name_index)
+                                        .unwrap_or_default()
+                                } else {
+                                    "?".to_string()
+                                };
+                                let mn = metadata
+                                    .get_string_from_index(md.name_index as i32)
+                                    .unwrap_or_default();
                                 Some(format!("{}.{}", tn, mn))
-                            } else { None }
-                        } else { None }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     };
 
                     if let Some(name) = method_name {
@@ -890,27 +1091,26 @@ impl Il2CppDecompiler {
 
         // Parallel precompute of method bodies (safe function-boundary DP).
         // Types are already parallel; large types with many methods were sequential stragglers.
-        let precomputed_asm: HashMap<u64, String> =
-            if disasm_allowed {
-                if let Some((disassembler, sorted_addrs)) = disasm {
-                    Self::precompute_method_disassembly(
-                        disassembler,
-                        sorted_addrs,
-                        metadata,
-                        il2cpp,
-                        config,
-                        type_def,
-                        image_name,
-                        indent,
-                        field_ctx.as_ref(),
-                        method_asm_cache.as_deref(),
-                    )
-                } else {
-                    HashMap::new()
-                }
+        let precomputed_asm: HashMap<u64, String> = if body_allowed {
+            if let Some((disassembler, sorted_addrs)) = disasm {
+                Self::precompute_method_disassembly(
+                    disassembler,
+                    sorted_addrs,
+                    metadata,
+                    il2cpp,
+                    config,
+                    type_def,
+                    image_name,
+                    indent,
+                    field_ctx.as_ref(),
+                    method_asm_cache.as_deref(),
+                )
             } else {
                 HashMap::new()
-            };
+            }
+        } else {
+            HashMap::new()
+        };
 
         // Merge newly computed bodies into the shared flat/split cache.
         if let Some(cache) = method_asm_cache.as_mut() {
@@ -923,23 +1123,52 @@ impl Il2CppDecompiler {
             writeln!(buf).ok();
             let method_def = metadata.method_defs[i].clone();
             let is_abstract = (method_def.flags as u32 & method_attributes::ABSTRACT) != 0;
+            let method_pointer = il2cpp.get_method_pointer(image_name, &method_def);
+            let method_name_for_kind =
+                metadata.get_string_from_index(method_def.name_index as i32).unwrap_or_default();
+            let delegate_runtime = is_delegate
+                && matches!(
+                    method_name_for_kind.as_str(),
+                    "Invoke" | "BeginInvoke" | "EndInvoke"
+                );
+            let rva = if method_pointer > 0 {
+                il2cpp.get_rva(method_pointer)
+            } else {
+                0
+            };
+            // `UnityEngine*.dll` icall stubs are native engine code; see
+            // `is_icall_stub_body`. They render as `extern` declarations.
+            let icall_stub = !is_abstract
+                && body_allowed
+                && image_name.starts_with("UnityEngine")
+                && pseudo_c
+                    .as_ref()
+                    .and_then(|m| m.get(&rva))
+                    .is_some_and(|code| Self::is_icall_stub_body(code));
 
             if config.dump_attribute {
                 let attr_indent = format!("{indent}\t");
                 Self::write_custom_attributes(
-                    buf, executor, metadata, il2cpp,
-                    image_index, method_def.custom_attribute_index, method_def.token, &attr_indent,
+                    buf,
+                    executor,
+                    metadata,
+                    il2cpp,
+                    image_index,
+                    method_def.custom_attribute_index,
+                    method_def.token,
+                    &attr_indent,
                 );
             }
-
             if config.dump_method_offset {
-                let method_pointer = il2cpp.get_method_pointer(image_name, &method_def);
                 if is_abstract {
                     write!(buf, "{indent}\t// ").ok();
                 } else if method_pointer > 0 {
-                    let rva = il2cpp.get_rva(method_pointer);
                     let offset = il2cpp.map_vatr(method_pointer).unwrap_or(rva);
-                    write!(buf, "{indent}\t// RVA: 0x{rva:X} Offset: 0x{offset:X} VA: 0x{method_pointer:X}").ok();
+                    write!(
+                        buf,
+                        "{indent}\t// RVA: 0x{rva:X} Offset: 0x{offset:X} VA: 0x{method_pointer:X}"
+                    )
+                    .ok();
                 } else {
                     write!(buf, "{indent}\t// RVA: -1 Offset: -1").ok();
                 }
@@ -949,6 +1178,9 @@ impl Il2CppDecompiler {
                 writeln!(buf).ok();
             }
 
+            if icall_stub {
+                writeln!(buf, "{indent}\t[MethodImpl(MethodImplOptions.InternalCall)]").ok();
+            }
             buf.push_str(indent);
             buf.push('\t');
             let mods = executor.get_modifiers(method_def.flags as u32).to_string();
@@ -959,7 +1191,10 @@ impl Il2CppDecompiler {
             let mut method_name = method_name_raw;
 
             if method_def.generic_container_index >= 0 {
-                if let Some(gc) = metadata.generic_containers.get(method_def.generic_container_index as usize) {
+                if let Some(gc) = metadata
+                    .generic_containers
+                    .get(method_def.generic_container_index as usize)
+                {
                     let gc = gc.clone();
                     let params = executor.get_generic_container_params(&gc, metadata);
                     method_name.push_str(&params);
@@ -970,15 +1205,18 @@ impl Il2CppDecompiler {
                 buf.push_str("ref ");
             }
 
-            let return_type_name = executor.get_type_name(&return_type, metadata, il2cpp, false, false);
+            let return_type_name =
+                executor.get_type_name(&return_type, metadata, il2cpp, false, false);
             write!(buf, "{return_type_name} {method_name}(").ok();
 
             let mut params = Vec::new();
             for j in 0..method_def.parameter_count as usize {
-                let param_def = metadata.parameter_defs[method_def.parameter_start as usize + j].clone();
+                let param_def =
+                    metadata.parameter_defs[method_def.parameter_start as usize + j].clone();
                 let param_name = metadata.get_string_from_index(param_def.name_index)?;
                 let param_type = il2cpp.types[param_def.type_index as usize].clone();
-                let param_type_name = executor.get_type_name(&param_type, metadata, il2cpp, false, false);
+                let param_type_name =
+                    executor.get_type_name(&param_type, metadata, il2cpp, false, false);
 
                 let mut param_str = String::new();
 
@@ -1005,12 +1243,21 @@ impl Il2CppDecompiler {
 
                 write!(param_str, "{param_type_name} {param_name}").ok();
 
-                if let Some(dv) = metadata.get_parameter_default_value(method_def.parameter_start + j as i32) {
+                if let Some(dv) =
+                    metadata.get_parameter_default_value(method_def.parameter_start + j as i32)
+                {
                     let dv = dv.clone();
                     if dv.data_index != -1 {
-                        match executor.try_get_default_value(dv.type_index, dv.data_index, metadata, il2cpp) {
+                        match executor.try_get_default_value(
+                            dv.type_index,
+                            dv.data_index,
+                            metadata,
+                            il2cpp,
+                        ) {
                             Ok(val) => write!(param_str, " = {val}").ok(),
-                            Err(offset) => write!(param_str, " /*Metadata offset 0x{offset:X}*/").ok(),
+                            Err(offset) => {
+                                write!(param_str, " /*Metadata offset 0x{offset:X}*/").ok()
+                            }
                         };
                     }
                 }
@@ -1020,24 +1267,21 @@ impl Il2CppDecompiler {
 
             buf.push_str(&params.join(", "));
 
-            if is_abstract {
+            if is_abstract || icall_stub || delegate_runtime {
                 writeln!(buf, ");").ok();
             } else {
-                let method_pointer = il2cpp.get_method_pointer(image_name, &method_def);
-                let rva = if method_pointer > 0 {
-                    il2cpp.get_rva(method_pointer)
-                } else {
-                    0
-                };
-
                 let asm_block = disasm
                     .as_ref()
                     .and_then(|_| precomputed_asm.get(&rva))
                     .filter(|s| !s.is_empty());
-                let pseudo_block = pseudo_c
-                    .as_ref()
-                    .and_then(|m| m.get(&rva))
-                    .filter(|s| !s.trim().is_empty());
+                let pseudo_block = if body_allowed {
+                    pseudo_c
+                        .as_ref()
+                        .and_then(|m| m.get(&rva))
+                        .filter(|s| !s.trim().is_empty())
+                } else {
+                    None
+                };
 
                 if asm_block.is_some() || pseudo_block.is_some() {
                     writeln!(buf, ") {{").ok();
@@ -1058,7 +1302,11 @@ impl Il2CppDecompiler {
 
                 let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
                 for spec_idx in &method_specs {
-                    let ptr = il2cpp.method_spec_generic_method_pointers.get(spec_idx).copied().unwrap_or(0);
+                    let ptr = il2cpp
+                        .method_spec_generic_method_pointers
+                        .get(spec_idx)
+                        .copied()
+                        .unwrap_or(0);
                     groups.entry(ptr).or_default().push(*spec_idx);
                 }
 
@@ -1077,13 +1325,18 @@ impl Il2CppDecompiler {
                     if ptr > 0 {
                         let rva = il2cpp.get_rva(ptr);
                         let offset = il2cpp.map_vatr(ptr).unwrap_or(rva);
-                        writeln!(buf, "{indent}\t|-RVA: 0x{rva:X} Offset: 0x{offset:X} VA: 0x{ptr:X}").ok();
+                        writeln!(
+                            buf,
+                            "{indent}\t|-RVA: 0x{rva:X} Offset: 0x{offset:X} VA: 0x{ptr:X}"
+                        )
+                        .ok();
                     } else {
                         writeln!(buf, "{indent}\t|-RVA: 0x0 Offset: 0x0").ok();
                     }
 
                     for spec_idx in spec_indices {
-                        let (type_name, method_name) = executor.get_method_spec_name(*spec_idx, metadata, il2cpp, false);
+                        let (type_name, method_name) =
+                            executor.get_method_spec_name(*spec_idx, metadata, il2cpp, false);
                         writeln!(buf, "{indent}\t|-{type_name}.{method_name}").ok();
                     }
                 }
@@ -1094,20 +1347,54 @@ impl Il2CppDecompiler {
         Ok(())
     }
 
-    /// Format a pseudo-code function definition as an indented `/* ... */`
-    /// comment block for inline emission inside a method body.
+    /// Format a pseudo-code function body for inline emission inside a method body.
+    /// Strips the comment wrappers and function signature, outputting just the body.
     fn format_pseudo_c_block(code: &str, indent: &str) -> String {
         let code = code.trim();
         let mut out = String::with_capacity(code.len() + 128);
-        out.push_str(&format!("{indent}\t\t/* C pseudo-code:\n"));
-        for line in code.lines() {
+        
+        // Skip the function signature and opening brace
+        // Pseudo-code format is:
+        //   ReturnType MethodName(params)
+        //   {
+        //       <body>
+        //   }
+        let lines: Vec<&str> = code.lines().collect();
+        let mut start_idx = 0;
+        
+        // Skip signature line(s) - find the opening brace
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim() == "{" {
+                start_idx = i + 1;
+                break;
+            }
+        }
+        
+        // Skip closing brace
+        let mut end_idx = lines.len();
+        for (i, line) in lines.iter().enumerate().rev() {
+            if line.trim() == "}" {
+                end_idx = i;
+                break;
+            }
+        }
+        
+        // Output body lines with adjusted indentation
+        for i in start_idx..end_idx {
+            let line = lines[i];
             if line.trim().is_empty() {
                 out.push('\n');
             } else {
-                out.push_str(&format!("{indent}\t\t   {line}\n"));
+                // The renderer emits ONE TAB per nesting level (first body
+                // level = 1 tab); the member prefix supplies the method's own
+                // base indent, so the body sits exactly one level in.
+                out.push_str(indent);
+                out.push('\t');
+                out.push_str(line);
+                out.push('\n');
             }
         }
-        out.push_str(&format!("{indent}\t\t*/\n"));
+        
         out
     }
 
@@ -1176,11 +1463,7 @@ impl Il2CppDecompiler {
                 .map(|(method_index, rva, bytes)| {
                     let method_def = &metadata.method_defs[*method_index];
                     let method_ctx = Self::build_method_disasm_ctx(
-                        field_ctx,
-                        method_def,
-                        metadata,
-                        is_arm,
-                        is_arm64,
+                        field_ctx, method_def, metadata, is_arm, is_arm64,
                     );
                     let asm = disassembler.format_method_body(
                         bytes,
@@ -1201,11 +1484,7 @@ impl Il2CppDecompiler {
                 .map(|(method_index, rva, bytes)| {
                     let method_def = &metadata.method_defs[*method_index];
                     let method_ctx = Self::build_method_disasm_ctx(
-                        field_ctx,
-                        method_def,
-                        metadata,
-                        is_arm,
-                        is_arm64,
+                        field_ctx, method_def, metadata, is_arm, is_arm64,
                     );
                     let asm = disassembler.format_method_body(
                         bytes,
@@ -1245,8 +1524,10 @@ impl Il2CppDecompiler {
             let mut reg_slot = if is_static {
                 0usize
             } else {
-                ctx.register_names.insert("x0".to_string(), "this".to_string());
-                ctx.register_names.insert("x19".to_string(), "this".to_string());
+                ctx.register_names
+                    .insert("x0".to_string(), "this".to_string());
+                ctx.register_names
+                    .insert("x19".to_string(), "this".to_string());
                 1
             };
 
@@ -1262,8 +1543,10 @@ impl Il2CppDecompiler {
                 reg_slot += 1;
             }
         } else if !is_static {
-            ctx.register_names.insert("ecx".to_string(), "this".to_string());
-            ctx.register_names.insert("rcx".to_string(), "this".to_string());
+            ctx.register_names
+                .insert("ecx".to_string(), "this".to_string());
+            ctx.register_names
+                .insert("rcx".to_string(), "this".to_string());
         }
 
         Some(ctx)
@@ -1283,7 +1566,8 @@ impl Il2CppDecompiler {
             return;
         }
 
-        let attr_index = metadata.get_custom_attribute_index(image_index, custom_attribute_index, token);
+        let attr_index =
+            metadata.get_custom_attribute_index(image_index, custom_attribute_index, token);
 
         if let Some(attr_idx) = attr_index {
             if il2cpp.version < 29.0 {
@@ -1300,13 +1584,16 @@ impl Il2CppDecompiler {
                     for j in 0..attr_range.count as usize {
                         let type_index = metadata.attribute_types[attr_range.start as usize + j];
                         if let Some(attr_type) = il2cpp.types.get(type_index as usize).cloned() {
-                            let type_name = executor.get_type_name(&attr_type, metadata, il2cpp, false, false);
+                            let type_name =
+                                executor.get_type_name(&attr_type, metadata, il2cpp, false, false);
                             writeln!(buf, "{padding}[{type_name}] // RVA: 0x{rva:X} Offset: 0x{offset:X} VA: 0x{method_pointer:X}").ok();
                         }
                     }
                 }
             } else {
-                custom_attribute_reader::format_custom_attribute_data(buf, metadata, attr_idx, padding);
+                custom_attribute_reader::format_custom_attribute_data(
+                    buf, metadata, attr_idx, padding,
+                );
             }
         }
     }
@@ -1316,7 +1603,11 @@ impl Il2CppDecompiler {
         il2cpp: &Il2Cpp,
         sorted_addrs: &[u64],
         config: &Config,
-    ) -> Vec<(u64, Vec<disassembler::DisassembledInstruction>, disassembler::PropagationResults)> {
+    ) -> Vec<(
+        u64,
+        Vec<disassembler::DisassembledInstruction>,
+        disassembler::PropagationResults,
+    )> {
         let arch = disassembler.arch();
         if !matches!(arch, disassembler::Architecture::Arm64) || sorted_addrs.is_empty() {
             return Vec::new();
@@ -1331,7 +1622,10 @@ impl Il2CppDecompiler {
             .copied()
             .collect();
 
-        let max_probe = config.max_disassembly_instructions.saturating_mul(4).max(256);
+        let max_probe = config
+            .max_disassembly_instructions
+            .saturating_mul(4)
+            .max(256);
         let max_insns = config.max_disassembly_instructions.min(120);
 
         sample_rvas
@@ -1352,7 +1646,11 @@ impl Il2CppDecompiler {
 
     fn detect_box_helpers_from_samples(
         disassembler: &Disassembler,
-        samples: &[(u64, Vec<disassembler::DisassembledInstruction>, disassembler::PropagationResults)],
+        samples: &[(
+            u64,
+            Vec<disassembler::DisassembledInstruction>,
+            disassembler::PropagationResults,
+        )],
     ) -> Vec<u64> {
         let mut total_calls: HashMap<u64, u32> = HashMap::new();
         let mut typeinfo_arg_calls: HashMap<u64, u32> = HashMap::new();
@@ -1383,7 +1681,9 @@ impl Il2CppDecompiler {
         let mut candidates: Vec<(u64, u32, u32)> = typeinfo_arg_calls
             .iter()
             .map(|(&rva, &hits)| (rva, hits, *total_calls.get(&rva).unwrap_or(&0)))
-            .filter(|(_, hits, total)| *hits >= 8 && *total >= 8 && (*hits as f32 / *total as f32) >= 0.8)
+            .filter(|(_, hits, total)| {
+                *hits >= 8 && *total >= 8 && (*hits as f32 / *total as f32) >= 0.8
+            })
             .collect();
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         candidates.truncate(4);
@@ -1392,7 +1692,11 @@ impl Il2CppDecompiler {
 
     fn detect_unbox_helpers_from_samples(
         disassembler: &Disassembler,
-        samples: &[(u64, Vec<disassembler::DisassembledInstruction>, disassembler::PropagationResults)],
+        samples: &[(
+            u64,
+            Vec<disassembler::DisassembledInstruction>,
+            disassembler::PropagationResults,
+        )],
         exclude: &HashSet<u64>,
     ) -> Vec<u64> {
         let mut total_calls: HashMap<u64, u32> = HashMap::new();
@@ -1433,7 +1737,9 @@ impl Il2CppDecompiler {
         let mut candidates: Vec<(u64, u32, u32)> = x1_typeinfo_calls
             .iter()
             .map(|(&rva, &hits)| (rva, hits, *total_calls.get(&rva).unwrap_or(&0)))
-            .filter(|(_, hits, total)| *hits >= 6 && *total >= 6 && (*hits as f32 / *total as f32) >= 0.75)
+            .filter(|(_, hits, total)| {
+                *hits >= 6 && *total >= 6 && (*hits as f32 / *total as f32) >= 0.75
+            })
             .collect();
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         candidates.truncate(3);
@@ -1442,7 +1748,11 @@ impl Il2CppDecompiler {
 
     fn detect_string_new_wrapper_from_samples(
         disassembler: &Disassembler,
-        samples: &[(u64, Vec<disassembler::DisassembledInstruction>, disassembler::PropagationResults)],
+        samples: &[(
+            u64,
+            Vec<disassembler::DisassembledInstruction>,
+            disassembler::PropagationResults,
+        )],
         total_string_lits: usize,
     ) -> Vec<u64> {
         if total_string_lits == 0 {
@@ -1478,7 +1788,9 @@ impl Il2CppDecompiler {
         let mut candidates: Vec<(u64, u32, u32)> = string_arg_calls
             .iter()
             .map(|(&rva, &hits)| (rva, hits, *total_calls.get(&rva).unwrap_or(&0)))
-            .filter(|(_, hits, total)| *hits >= 5 && *total >= 5 && (*hits as f32 / *total as f32) >= 0.6)
+            .filter(|(_, hits, total)| {
+                *hits >= 5 && *total >= 5 && (*hits as f32 / *total as f32) >= 0.6
+            })
             .collect();
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         candidates.truncate(2);
@@ -1500,7 +1812,9 @@ impl Il2CppDecompiler {
             .metadata_usage_dic
             .iter()
             .flat_map(|(usage_type, entries)| {
-                entries.iter().map(move |(dest, src)| (*usage_type, *dest as usize, *src as usize))
+                entries
+                    .iter()
+                    .map(move |(dest, src)| (*usage_type, *dest as usize, *src as usize))
             })
             .collect();
 
@@ -1532,8 +1846,10 @@ impl Il2CppDecompiler {
                     }
                     3 => {
                         if let Some(method_def) = metadata.method_defs.get(*src).cloned() {
-                            if let Some(type_def) =
-                                metadata.type_defs.get(method_def.declaring_type as usize).cloned()
+                            if let Some(type_def) = metadata
+                                .type_defs
+                                .get(method_def.declaring_type as usize)
+                                .cloned()
                             {
                                 let td_idx = method_def.declaring_type as usize;
                                 let type_name = local_exec.get_type_def_name(
@@ -1556,7 +1872,11 @@ impl Il2CppDecompiler {
                                 let il2cpp_type =
                                     il2cpp.types[field_ref.type_index as usize].clone();
                                 let type_name = local_exec.get_type_name(
-                                    &il2cpp_type, metadata, il2cpp, true, false,
+                                    &il2cpp_type,
+                                    metadata,
+                                    il2cpp,
+                                    true,
+                                    false,
                                 );
                                 let klass_idx = il2cpp_type.klass_index() as usize;
                                 if let Some(td) = metadata.type_defs.get(klass_idx) {
@@ -1713,14 +2033,16 @@ impl Il2CppDecompiler {
                 }
             }
             3 => {
-                if let Some(method_def) = metadata.method_defs.get(decoded_index as usize).cloned() {
-                    if let Some(type_def) =
-                        metadata.type_defs.get(method_def.declaring_type as usize).cloned()
+                if let Some(method_def) = metadata.method_defs.get(decoded_index as usize).cloned()
+                {
+                    if let Some(type_def) = metadata
+                        .type_defs
+                        .get(method_def.declaring_type as usize)
+                        .cloned()
                     {
                         let td_idx = method_def.declaring_type as usize;
-                        let type_name = executor.get_type_def_name(
-                            &type_def, td_idx, metadata, il2cpp, true, true,
-                        );
+                        let type_name = executor
+                            .get_type_def_name(&type_def, td_idx, metadata, il2cpp, true, true);
                         let method_name = metadata
                             .get_string_from_index(method_def.name_index as i32)
                             .unwrap_or_default();
@@ -1866,7 +2188,9 @@ enum DisasmAnnotation {
 fn get_type_visibility(visibility: u32) -> String {
     match visibility {
         type_attributes::PUBLIC | type_attributes::NESTED_PUBLIC => "public ".to_string(),
-        type_attributes::NOT_PUBLIC | type_attributes::NESTED_FAM_AND_ASSEM | type_attributes::NESTED_ASSEMBLY => "internal ".to_string(),
+        type_attributes::NOT_PUBLIC
+        | type_attributes::NESTED_FAM_AND_ASSEM
+        | type_attributes::NESTED_ASSEMBLY => "internal ".to_string(),
         type_attributes::NESTED_PRIVATE => "private ".to_string(),
         type_attributes::NESTED_FAMILY => "protected ".to_string(),
         type_attributes::NESTED_FAM_OR_ASSEM => "protected internal ".to_string(),

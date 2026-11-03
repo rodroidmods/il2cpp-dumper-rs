@@ -10,7 +10,12 @@ pub struct SearchSection {
 
 impl SearchSection {
     pub fn new(offset: u64, offset_end: u64, address: u64, address_end: u64) -> Self {
-        Self { offset, offset_end, address, address_end }
+        Self {
+            offset,
+            offset_end,
+            address,
+            address_end,
+        }
     }
 }
 
@@ -151,7 +156,11 @@ impl<'a> SectionHelper<'a> {
     }
 
     fn find_refs_fast(&self, addr: u64) -> Vec<(usize, u64)> {
-        let target = if self.is_32bit { (addr as u32) as u64 } else { addr };
+        let target = if self.is_32bit {
+            (addr as u32) as u64
+        } else {
+            addr
+        };
         let mut refs = Vec::new();
         self.visit_aligned_pointers(&self.data_sections, |offset, va| {
             if self.read_ptr_at(offset) == Some(target) {
@@ -192,10 +201,18 @@ impl<'a> SectionHelper<'a> {
         self.find_code_registration_2019_with_feature(use_exec, b"System.Private.CoreLib.dll\x00")
     }
 
-    fn find_code_registration_2019_with_feature(&self, use_exec: &bool, feature_bytes: &[u8]) -> Option<u64> {
+    fn find_code_registration_2019_with_feature(
+        &self,
+        use_exec: &bool,
+        feature_bytes: &[u8],
+    ) -> Option<u64> {
         let ptr_size = self.ptr_size();
 
-        let sections = if *use_exec { &self.code_sections } else { &self.data_sections };
+        let sections = if *use_exec {
+            &self.code_sections
+        } else {
+            &self.data_sections
+        };
 
         for section in sections {
             let start = section.offset as usize;
@@ -215,7 +232,8 @@ impl<'a> SectionHelper<'a> {
 
                     for (_ref_offset2, ref_va2) in &refs2 {
                         if self.version >= 27.0 {
-                            let min_target = ref_va2 - (self.image_count as u64 - 1) * ptr_size as u64;
+                            let min_target =
+                                ref_va2 - (self.image_count as u64 - 1) * ptr_size as u64;
                             let max_target = *ref_va2;
 
                             // `codeGenModulesCount` followed by a pointer into
@@ -236,14 +254,20 @@ impl<'a> SectionHelper<'a> {
                                     return false;
                                 }
                                 let i = (ref_va2 - pv) / ptr_size as u64;
-                                if i >= self.image_count as u64 || pv != ref_va2 - i * ptr_size as u64 {
+                                if i >= self.image_count as u64
+                                    || pv != ref_va2 - i * ptr_size as u64
+                                {
                                     return false;
                                 }
                                 if let Some(ref_va3) = self.offset_to_va(next_offset) {
                                     // `ref_va3` is the struct's `addrCodeGenModulePtrs`
                                     // field, which is the last one, so the struct
                                     // starts exactly its own size minus one slot back.
-                                    found = Some(ref_va3 - ptr_size as u64 * self.code_registration_module_field_index());
+                                    found = Some(
+                                        ref_va3
+                                            - ptr_size as u64
+                                                * self.code_registration_module_field_index(),
+                                    );
                                     return true;
                                 }
                                 false
@@ -259,7 +283,11 @@ impl<'a> SectionHelper<'a> {
                                     // Same walk-back as the v27+ branch above; the
                                     // hard-coded 13 here was four slots short on
                                     // v24.5, where `addrCodeGenModulePtrs` is slot 16.
-                                    return Some(ref_va3 - ptr_size as u64 * self.code_registration_module_field_index());
+                                    return Some(
+                                        ref_va3
+                                            - ptr_size as u64
+                                                * self.code_registration_module_field_index(),
+                                    );
                                 }
                             }
                         }
@@ -477,15 +505,21 @@ impl<'a> SectionHelper<'a> {
     }
 
     fn is_in_data_sections(&self, addr: u64) -> bool {
-        self.data_sections.iter().any(|s| addr >= s.address && addr <= s.address_end)
+        self.data_sections
+            .iter()
+            .any(|s| addr >= s.address && addr <= s.address_end)
     }
 
     fn is_in_code_sections(&self, addr: u64) -> bool {
-        self.code_sections.iter().any(|s| addr >= s.address && addr <= s.address_end)
+        self.code_sections
+            .iter()
+            .any(|s| addr >= s.address && addr <= s.address_end)
     }
 
     fn is_in_bss_sections(&self, addr: u64) -> bool {
-        self.bss_sections.iter().any(|s| addr >= s.address && addr <= s.address_end)
+        self.bss_sections
+            .iter()
+            .any(|s| addr >= s.address && addr <= s.address_end)
     }
 
     fn _addr_to_offset(&self, addr: u64) -> Option<u64> {
@@ -556,7 +590,11 @@ impl<'a> SectionHelper<'a> {
                 }
                 // The struct starts `tds_count_index` slots before this word, and
                 // v108's registration is four slots shorter than v107's.
-                let tds_count_index = if self.version >= 108.0 { 8usize } else { 12usize };
+                let tds_count_index = if self.version >= 108.0 {
+                    8usize
+                } else {
+                    12usize
+                };
                 if abs_pos < ptr_size * tds_count_index {
                     continue;
                 }
@@ -628,7 +666,12 @@ impl<'a> SectionHelper<'a> {
         fallback
     }
 
-    fn is_codm_metadata_usages_pointer(&self, mu_va: u64, mu_count: usize, ptr_size: usize) -> bool {
+    fn is_codm_metadata_usages_pointer(
+        &self,
+        mu_va: u64,
+        mu_count: usize,
+        ptr_size: usize,
+    ) -> bool {
         let mu_offset = match self.va_to_offset_data(mu_va) {
             Some(o) => o,
             None => return self.is_in_bss_sections(mu_va),
@@ -642,7 +685,11 @@ impl<'a> SectionHelper<'a> {
             }
             match self.read_ptr_at(entry_offset) {
                 Some(ptr) if ptr == 0 => {}
-                Some(ptr) if self.is_in_bss_sections(ptr) || self.is_in_data_sections(ptr) || self.is_in_code_sections(ptr) => {
+                Some(ptr)
+                    if self.is_in_bss_sections(ptr)
+                        || self.is_in_data_sections(ptr)
+                        || self.is_in_code_sections(ptr) =>
+                {
                     valid += 1;
                 }
                 _ => return false,
@@ -698,12 +745,20 @@ mod tests {
             let ptr = (SECTION_ADDR + 0x300 + (i * 16) as u64).to_le_bytes();
             data[0x200 + i * PTR..0x200 + i * PTR + PTR].copy_from_slice(&ptr);
         }
-        for (i, w) in metadata_registration_words(version, type_count, tds_addr).iter().enumerate() {
+        for (i, w) in metadata_registration_words(version, type_count, tds_addr)
+            .iter()
+            .enumerate()
+        {
             let at = MR_OFFSET + i * PTR;
             data[at..at + PTR].copy_from_slice(&w.to_le_bytes());
         }
 
-        let section = SearchSection::new(0, data.len() as u64, SECTION_ADDR, SECTION_ADDR + data.len() as u64);
+        let section = SearchSection::new(
+            0,
+            data.len() as u64,
+            SECTION_ADDR,
+            SECTION_ADDR + data.len() as u64,
+        );
         let helper = SectionHelper::new(
             &data,
             false,
@@ -765,7 +820,12 @@ mod tests {
         let last_field = CR_OFF + (Il2CppCodeRegistration::field_count(24.5) - 1) * PTR;
         data[last_field..last_field + PTR].copy_from_slice(&module_entry_addr.to_le_bytes());
 
-        let section = SearchSection::new(0, data.len() as u64, SECTION_ADDR, SECTION_ADDR + data.len() as u64);
+        let section = SearchSection::new(
+            0,
+            data.len() as u64,
+            SECTION_ADDR,
+            SECTION_ADDR + data.len() as u64,
+        );
         let mut helper = SectionHelper::new(
             &data,
             false,
@@ -806,15 +866,38 @@ mod tests {
             let ptr = (SECTION_ADDR + 0x1800).to_le_bytes();
             data[0x100 + i * PTR..0x100 + i * PTR + PTR].copy_from_slice(&ptr);
         }
-        let mut words = vec![1u64, field_offsets_addr, 1, field_offsets_addr, 1, field_offsets_addr, 100, field_offsets_addr, 1, field_offsets_addr];
-        words.extend_from_slice(&[TYPE_COUNT, field_offsets_addr, TYPE_COUNT, tds_addr, 1, field_offsets_addr]);
+        let mut words = vec![
+            1u64,
+            field_offsets_addr,
+            1,
+            field_offsets_addr,
+            1,
+            field_offsets_addr,
+            100,
+            field_offsets_addr,
+            1,
+            field_offsets_addr,
+        ];
+        words.extend_from_slice(&[
+            TYPE_COUNT,
+            field_offsets_addr,
+            TYPE_COUNT,
+            tds_addr,
+            1,
+            field_offsets_addr,
+        ]);
         assert_eq!(words.len(), 16); // the pre-v27 registration is 16 slots
         for (i, w) in words.iter().enumerate() {
             let at = MR_OFF + i * PTR;
             data[at..at + PTR].copy_from_slice(&w.to_le_bytes());
         }
 
-        let section = SearchSection::new(0, data.len() as u64, SECTION_ADDR, SECTION_ADDR + data.len() as u64);
+        let section = SearchSection::new(
+            0,
+            data.len() as u64,
+            SECTION_ADDR,
+            SECTION_ADDR + data.len() as u64,
+        );
         let helper = SectionHelper::new(
             &data,
             false,
@@ -829,6 +912,9 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(helper.find_metadata_registration(), Some(SECTION_ADDR + MR_OFF as u64));
+        assert_eq!(
+            helper.find_metadata_registration(),
+            Some(SECTION_ADDR + MR_OFF as u64)
+        );
     }
 }

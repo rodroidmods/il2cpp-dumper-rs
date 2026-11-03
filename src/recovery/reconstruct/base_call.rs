@@ -1,6 +1,29 @@
 //! `base.Method(...)` restoration — the NARROW, provable subset.
 //!
-//! ## MEASURED STATUS: inert on the real corpus BY CONSTRUCTION
+//! ## STATUS: Two complementary approaches
+//!
+//! ### 1. Render-time rewriting in `csharp.rs` (Phase 5B — ACTIVE)
+//!
+//! `MethodCtx::call_parts` detects base calls at expression construction time
+//! using metadata that was previously unavailable at this layer:
+//!
+//!   - The callee's `MethodRef.type_def_index` (the TDI of the type that
+//!     DECLARES the callee);
+//!   - The current method's `parent_chain` (the ancestor chain of the type
+//!     that declares the current method);
+//!   - The receiver expression (resolved from the `this` parameter local).
+//!
+//! When the callee's TDI is a STRICT ANCESTOR of the declaring type AND the
+//! receiver is `this`, the receiver is rewritten to `Expr::Var("base")`, which
+//! renders as `base.Method(args)`. This is provable, not guessed: the metadata
+//! proves the callee lives on an ancestor type, and the receiver proves the
+//! call is on the current object. The virtual flag is deliberately NOT checked
+//! because `base.NonVirtual()` is legal C#.
+//!
+//! When the parent chain is empty (no ancestry metadata), `is_strict_ancestor`
+//! returns false and the call is left untouched — conservative by construction.
+//!
+//! ### 2. Marker-based rewriting (THIS FILE — INERT BY CONSTRUCTION)
 //!
 //! This must not be read as a working recognizer. On the x64 corpus it reports
 //! **0**, and it will keep reporting 0 until something produces the marker it
@@ -13,7 +36,7 @@
 //! needs, and because the alternative — guessing the receiver — fabricates
 //! callers, which is the worst class of error this port can make.
 //!
-//! ## Why the general case cannot be decided here
+//! ## Why the marker-based approach cannot decide the general case here
 //!
 //! IL2CPP compiles `base.M(x)` to a direct call on the base implementation. In
 //! the recovered tree that surfaces as a **static-looking call whose first
@@ -33,7 +56,7 @@
 //! renders identically. Renaming the receiver on that evidence would claim the
 //! call reaches an ancestor when it does not.
 //!
-//! ## What it *can* do without inventing anything
+//! ## What the marker-based pass *can* do without inventing anything
 //!
 //! Act on an explicit MARKER: a `Stmt::Comment` immediately above the call whose
 //! text begins with the whole token `base` (`base call`, `base: SomeBase`,
@@ -48,18 +71,8 @@
 //!     receiver is already `base`.
 //!
 //! In every other case the pass is a no-op.
-//!
-//! ## What would unlock it
-//!
-//! `MethodCtx` (in `csharp.rs`) holds the ancestry (`in_declaring_chain`,
-//! `parent_chain`) and the resolver holds the callee's `MethodRef`
-//! (`declaring_type_name`), plus `locals::LocalTable` for the receiver's type.
-//! With those, the rule becomes: rewrite when the receiver's type is `this`'s
-//! class AND the callee's declaring type is a strict ancestor of the current
-//! type AND the method is virtual. That belongs in `csharp.rs` at
-//! statement-render time (where the table exists), not here.
 
-use super::{split_call, walk_mut, Expr, Stmt};
+use super::{Expr, Stmt, split_call, walk_mut};
 
 /// True when a comment is a `base`-call marker.
 ///

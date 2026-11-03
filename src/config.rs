@@ -132,11 +132,19 @@ pub struct Config {
     pub dump_pseudo_c_max_body_size: usize,
     /// Restrict method bodies (C# pseudo, IL recovery, and assembly) to these
     /// assemblies (empty = all).
-    #[serde(rename = "csharpIncludeAssemblies", alias = "dumpPseudoCIncludeAssemblies")]
+    #[serde(
+        rename = "csharpIncludeAssemblies",
+        alias = "dumpPseudoCIncludeAssemblies"
+    )]
     pub dump_pseudo_c_include_assemblies: Vec<String>,
     /// Restrict method bodies to these types / namespace prefixes (empty = all).
     #[serde(rename = "csharpIncludeTypes", alias = "dumpPseudoCIncludeTypes")]
     pub dump_pseudo_c_include_types: Vec<String>,
+    /// Keep the FULL metadata dump when a class filter is active: every type
+    /// and method header is still emitted, but only the selected
+    /// assemblies/types get method bodies — the rest render as `{ }`.
+    #[serde(rename = "csharpFullDump", alias = "dumpPseudoCFullDump")]
+    pub dump_pseudo_c_full_dump: bool,
     #[serde(rename = "assemblyHexBytes", alias = "dumpDisassemblyHexBytes")]
     pub dump_disassembly_hex_bytes: bool,
     #[serde(rename = "assemblyFieldNames", alias = "dumpDisassemblyFieldNames")]
@@ -145,7 +153,10 @@ pub struct Config {
     pub dump_disassembly_annotations: bool,
     #[serde(rename = "assemblyCfg", alias = "dumpDisassemblyCfg")]
     pub dump_disassembly_cfg: bool,
-    #[serde(rename = "maxAssemblyInstructions", alias = "maxDisassemblyInstructions")]
+    #[serde(
+        rename = "maxAssemblyInstructions",
+        alias = "maxDisassemblyInstructions"
+    )]
     pub max_disassembly_instructions: usize,
     pub generate_cpp_scaffold: bool,
     pub mangle_names: bool,
@@ -212,6 +223,7 @@ impl Default for Config {
             dump_pseudo_c_max_body_size: 0, // 0 = decompile every method body
             dump_pseudo_c_include_assemblies: Vec::new(),
             dump_pseudo_c_include_types: Vec::new(),
+            dump_pseudo_c_full_dump: false,
             dump_disassembly_hex_bytes: true,
             dump_disassembly_field_names: true,
             dump_disassembly_annotations: true,
@@ -241,8 +253,7 @@ impl Config {
     ///   derive the mode from the booleans.
     /// - New configs (`methodBodyMode` set): mode wins and rewrites the booleans.
     pub fn reconcile_method_body_mode(&mut self) {
-        let from_flags =
-            MethodBodyMode::from_flags(self.dump_disassembly, self.dump_pseudo_c);
+        let from_flags = MethodBodyMode::from_flags(self.dump_disassembly, self.dump_pseudo_c);
         if self.method_body_mode == MethodBodyMode::Off && from_flags != MethodBodyMode::Off {
             self.method_body_mode = from_flags;
         } else {
@@ -300,7 +311,8 @@ mod tests {
 
     #[test]
     fn mode_wins_over_stale_bools() {
-        let json = r#"{ "methodBodyMode": "assembly", "dumpPseudoC": true, "dumpDisassembly": false }"#;
+        let json =
+            r#"{ "methodBodyMode": "assembly", "dumpPseudoC": true, "dumpDisassembly": false }"#;
         let mut cfg: Config = serde_json::from_str(json).unwrap();
         cfg.reconcile_method_body_mode();
         assert_eq!(cfg.method_body_mode, MethodBodyMode::Assembly);
@@ -331,8 +343,14 @@ mod tests {
         assert_eq!(cfg.dump_pseudo_c_target, 2);
         assert!(cfg.dump_pseudo_c_interactive);
         assert_eq!(cfg.dump_pseudo_c_max_body_size, 100);
-        assert_eq!(cfg.dump_pseudo_c_include_assemblies, vec!["Assembly-CSharp".to_string()]);
-        assert_eq!(cfg.dump_pseudo_c_include_types, vec!["Game.Player".to_string()]);
+        assert_eq!(
+            cfg.dump_pseudo_c_include_assemblies,
+            vec!["Assembly-CSharp".to_string()]
+        );
+        assert_eq!(
+            cfg.dump_pseudo_c_include_types,
+            vec!["Game.Player".to_string()]
+        );
         assert!(!cfg.dump_disassembly_hex_bytes);
         assert_eq!(cfg.max_disassembly_instructions, 64);
         let out = serde_json::to_string_pretty(&cfg).unwrap();
@@ -342,6 +360,19 @@ mod tests {
         assert!(!out.contains("dumpPseudoCIncludeAssemblies"));
         assert!(!out.contains("\"dumpDisassembly\""));
         assert!(!out.contains("\"dumpPseudoC\""));
+    }
+
+    #[test]
+    fn full_dump_with_class_filter_round_trips() {
+        let cfg: Config =
+            serde_json::from_str(r#"{ "csharpIncludeAssemblies": ["Assembly-CSharp.dll"], "csharpFullDump": true }"#)
+                .unwrap();
+        assert!(cfg.dump_pseudo_c_full_dump);
+        let out = serde_json::to_string(&cfg).unwrap();
+        assert!(out.contains("\"csharpFullDump\":true"));
+        // The default is OFF, so an older config keeps the old behaviour.
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(!old.dump_pseudo_c_full_dump);
     }
 
     #[test]

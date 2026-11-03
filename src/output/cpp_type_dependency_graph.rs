@@ -288,11 +288,8 @@ impl CppTypeDependencyGraph {
                     }
                 }
 
-                let incoming_ref: Vec<NodeId> = self.nodes[node_id.0]
-                    .incoming_ref
-                    .iter()
-                    .copied()
-                    .collect();
+                let incoming_ref: Vec<NodeId> =
+                    self.nodes[node_id.0].incoming_ref.iter().copied().collect();
                 for ref_id in &incoming_ref {
                     self.nodes[ref_id.0].outgoing_ref.remove(&node_id);
                 }
@@ -337,9 +334,7 @@ impl CppTypeDependencyGraph {
     }
 
     pub fn kind_of(&self, name: &str) -> Option<GraphTypeKind> {
-        self.name_to_id
-            .get(name)
-            .map(|id| self.nodes[id.0].kind)
+        self.name_to_id.get(name).map(|id| self.nodes[id.0].kind)
     }
 
     pub fn all_known_names(&self) -> HashSet<String> {

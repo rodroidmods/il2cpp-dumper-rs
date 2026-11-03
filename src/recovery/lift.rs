@@ -17,8 +17,7 @@ use std::sync::{LazyLock, Mutex};
 use yaxpeax_arch::{Decoder, LengthedInstruction, U8Reader};
 use yaxpeax_arm::armv8::a64::{
     InstDecoder as A64Decoder, Instruction as A64Insn, Opcode as A64Opcode, Operand as A64Op,
-    ShiftStyle,
-    SIMDSizeCode,
+    SIMDSizeCode, ShiftStyle,
 };
 
 pub struct LiftResult {
@@ -68,8 +67,7 @@ static LIFT_CENSUS: LazyLock<Mutex<BTreeMap<String, CensusRow>>> =
 fn census_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("ILR_LIFT_CENSUS").is_ok()
-            || std::env::var("ILR_LIFT_CENSUS_FILE").is_ok()
+        std::env::var("ILR_LIFT_CENSUS").is_ok() || std::env::var("ILR_LIFT_CENSUS_FILE").is_ok()
     })
 }
 
@@ -77,7 +75,9 @@ fn census_unhandled(op: A64Opcode, addr: u64, word: u32, effectful: bool) {
     if !census_enabled() {
         return;
     }
-    let Ok(mut m) = LIFT_CENSUS.lock() else { return };
+    let Ok(mut m) = LIFT_CENSUS.lock() else {
+        return;
+    };
     let row = m.entry(format!("{op:?}")).or_default();
     row.count += 1;
     if effectful {
@@ -102,7 +102,9 @@ fn census_intrinsic(op: A64Opcode) {
     if !census_enabled() {
         return;
     }
-    let Ok(mut m) = INTRINSIC_CENSUS.lock() else { return };
+    let Ok(mut m) = INTRINSIC_CENSUS.lock() else {
+        return;
+    };
     *m.entry(format!("{op:?}")).or_default() += 1;
 }
 
@@ -178,7 +180,9 @@ pub fn lift_census_report() -> String {
     let mut out = String::with_capacity(rows.len() * 96 + 512);
     out.push_str("# Lifter coverage census — AArch64 opcodes `lift_arm64` does not implement.\n");
     out.push_str("#\n");
-    out.push_str("# Each row fell through the `_ =>` catch-all. `effectful` counts the times the\n");
+    out.push_str(
+        "# Each row fell through the `_ =>` catch-all. `effectful` counts the times the\n",
+    );
     out.push_str("# instruction had a register destination, i.e. the generated C# shows a bare\n");
     out.push_str("# `Unknown` where a real value belongs. Rows with effectful=0 (NOP/DSB/ISB/\n");
     out.push_str("# MSR/MRS/PRFM) are correctly ignorable and are listed only so the list is\n");
@@ -226,7 +230,11 @@ fn fp_reg(size: SIMDSizeCode, num: u16) -> String {
     match size {
         SIMDSizeCode::B => format!("vb{num}"),
         SIMDSizeCode::H => format!("vh{num}"),
-        SIMDSizeCode::S => format!("vs{num}"),
+        // Keep scalar S-register values in the same namespace as vector S
+        // lanes: `sN` is lane 0 of `vN`, while `vN.s[k]` is lane k. The
+        // flattened index is `4*N + k` (see `s_lane_name`). Using `vsN` here
+        // aliased unrelated registers, e.g. `s8` with `v2.s[0]`.
+        SIMDSizeCode::S => scalar_s_name(num),
         SIMDSizeCode::D => format!("vd{num}"),
         SIMDSizeCode::Q => format!("vq{num}"),
     }
@@ -403,21 +411,21 @@ pub(crate) fn eval_cond_code(code: u8, nzcv: u8) -> bool {
     let c = nzcv & 2 != 0;
     let v = nzcv & 1 != 0;
     match code & 0xF {
-        0x0 => z,                    // eq
-        0x1 => !z,                   // ne
-        0x2 => c,                    // cs / hs
-        0x3 => !c,                   // cc / lo
-        0x4 => n,                    // mi
-        0x5 => !n,                   // pl
-        0x6 => v,                    // vs
-        0x7 => !v,                   // vc
-        0x8 => c && !z,              // hi
-        0x9 => !c || z,              // ls
-        0xA => n == v,               // ge
-        0xB => n != v,               // lt
-        0xC => !z && n == v,         // gt
-        0xD => z || n != v,          // le
-        _ => true,                   // al / nv
+        0x0 => z,            // eq
+        0x1 => !z,           // ne
+        0x2 => c,            // cs / hs
+        0x3 => !c,           // cc / lo
+        0x4 => n,            // mi
+        0x5 => !n,           // pl
+        0x6 => v,            // vs
+        0x7 => !v,           // vc
+        0x8 => c && !z,      // hi
+        0x9 => !c || z,      // ls
+        0xA => n == v,       // ge
+        0xB => n != v,       // lt
+        0xC => !z && n == v, // gt
+        0xD => z || n != v,  // le
+        _ => true,           // al / nv
     }
 }
 
@@ -766,6 +774,65 @@ pub fn lift_arm64(
                 pending_cmp = None;
             }
 
+            // SIMD `mov vD.<arr>, vN.<arr>` is an alias of
+            // `orr vD.<arr>, vN.<arr>, vN.<arr>`. Keep it out of the GPR
+            // arm below: `gpr_of` intentionally has no answer for a SIMD
+            // destination, and using `?` there used to abort the *entire*
+            // method lift. This is common in IL2CPP prologues that preserve
+            // Vector3/Vector4 arguments in callee-saved v8-v15 registers.
+            // A true copy is represented as Move (so ordinary copy
+            // propagation can see it); other vector ORRs retain all inputs
+            // as an explicit SIMD operation until the renderer can lower
+            // their element semantics.
+            A64Opcode::ORR if simd_name(&insn.operands[0]).is_some() => {
+                let dst = simd_name(&insn.operands[0]).unwrap();
+                let lhs = any_operand_at(&insn, 1);
+                let rhs = any_operand_at(&insn, 2);
+                if lhs == rhs {
+                    insns.push(Insn::move_(Operand::reg(dst), lhs, addr));
+                    // A whole-register copy also defines every narrower view
+                    // used by scalar FP instructions. Keeping only `vq13 =
+                    // vq10` left a later `s13` read looking like an unrelated,
+                    // undefined register (`vs52`), even though MOV Vd,Vn had
+                    // copied those exact bits. Project the copied low S/D
+                    // lanes into their scalar SSA names as well; the full Q/D
+                    // move remains above for vector consumers.
+                    if let (Some((dst_reg, dst_bytes)), Some((src_reg, src_bytes))) = (
+                        simd_copy_container(&insn.operands[0]),
+                        simd_copy_container(&insn.operands[2]),
+                    ) {
+                        if dst_bytes == src_bytes {
+                            for lane in 0..(dst_bytes / 4) {
+                                insns.push(Insn::move_(
+                                    Operand::reg(s_lane_name(dst_reg, lane)),
+                                    Operand::reg(s_lane_name(src_reg, lane)),
+                                    addr,
+                                ));
+                            }
+                            for lane in 0..(dst_bytes / 8) {
+                                let dst = if lane == 0 {
+                                    format!("vd{dst_reg}")
+                                } else {
+                                    format!("vd{dst_reg}[{lane}]")
+                                };
+                                let src = if lane == 0 {
+                                    format!("vd{src_reg}")
+                                } else {
+                                    format!("vd{src_reg}[{lane}]")
+                                };
+                                insns.push(Insn::move_(Operand::reg(dst), Operand::reg(src), addr));
+                            }
+                        }
+                    }
+                } else {
+                    insns.push(Insn::new(
+                        Op::Simd("ORR".into()),
+                        vec![Operand::reg(dst), lhs, rhs],
+                        addr,
+                    ));
+                }
+                pending_cmp = None;
+            }
             A64Opcode::ORR => {
                 let dst = gpr_of(&insn.operands[0])?;
                 if matches!(&insn.operands[1], A64Op::Register(_, 31)) {
@@ -775,6 +842,7 @@ pub fn lift_arm64(
                     // `MOV x20, x0` receiver pin emit Unknown and broke the
                     // ABI-copy seeding downstream.
                     let src = match insn.operands.get(2) {
+                        Some(A64Op::RegShift(_, 0, _, r)) if *r == 31 => Operand::imm(0),
                         Some(A64Op::RegShift(_, 0, _, r)) => Operand::reg(gpr(*r, false)),
                         _ => operand_at(&insn, 2).unwrap_or(Operand::Unknown),
                     };
@@ -814,7 +882,12 @@ pub fn lift_arm64(
             }
 
             // ---- arithmetic ----------------------------------------------
-            A64Opcode::ADD | A64Opcode::SUB => {
+            // A SIMD destination is the vector encoding of ADD/SUB, which
+            // this scalar arm does not model. Decline it (fall through to
+            // the generic intrinsic arm) instead of `?`-aborting the entire
+            // method: one `add v0.2s` used to erase every method that
+            // contained one.
+            A64Opcode::ADD | A64Opcode::SUB if gpr_of(&insn.operands[0]).is_some() => {
                 let dst = gpr_of(&insn.operands[0])?;
                 let kind = if insn.opcode == A64Opcode::ADD { ArithKind::Add } else { ArithKind::Sub };
                 let imm = match insn.operands.get(2).cloned() {
@@ -872,8 +945,12 @@ pub fn lift_arm64(
                 }
                 pending_cmp = None;
             }
+            // Same contract as ADD/SUB above: a SIMD destination is the
+            // vector form (`and v1.8b, …`), not this GPR arm. Decline to the
+            // generic intrinsic instead of aborting the whole method.
             A64Opcode::AND | A64Opcode::EOR | A64Opcode::BIC | A64Opcode::ORN
-            | A64Opcode::EON | A64Opcode::LSLV | A64Opcode::LSRV => {
+            | A64Opcode::EON | A64Opcode::LSLV | A64Opcode::LSRV
+                if gpr_of(&insn.operands[0]).is_some() => {
                 // `BIC`/`ORN`/`EON` are the encoder's "inverted second operand"
                 // forms of `AND`/`ORR`/`EOR`: rather than materialize a `NOT`
                 // the assembler folds the complement into the opcode. They had
@@ -1099,13 +1176,20 @@ pub fn lift_arm64(
                     // `fp_of` for `S`/`D`, and adds the `Q` view.
                     let dst = simd_name(&dst_op).unwrap_or_default();
                     let dst2 = dst.clone();
+                    // The register VIEW states the access width: `ldr s0` reads
+                    // four bytes, `ldr d0` eight, `ldr q0` sixteen. Leaving it
+                    // at 0 made every FP load render as `*(nint*)` — an 8-byte
+                    // access to a float field, which is also why a `ref float`
+                    // parameter's read looked like a pointer-sized integer.
+                    let access_width = fp_reg_bytes(&dst).unwrap_or(0);
                     let loaded = try_literal_pool_load(&insn, addr, bytes, base_rva, offset, pool_reader);
                     match loaded {
                         Some(val) => {
                             insns.push(Insn::move_(Operand::reg(dst), val, addr));
                         }
                         None => {
-                            let mem = memory_operand(insn.operands.get(1));
+                            let mem = memory_operand(insn.operands.get(1))
+                                .map(|m| m.with_width(access_width));
                             insns.push(Insn::move_(
                                 Operand::reg(dst),
                                 mem.unwrap_or(Operand::Unknown),
@@ -1238,7 +1322,19 @@ pub fn lift_arm64(
                     | A64Opcode::STTRH
                     | A64Opcode::STURH
                     | A64Opcode::STLRH => 2,
-                    _ => 0,
+                    _ => {
+                        if let Some(name) = simd_name(&insn.operands[0]) {
+                            // `str s0, [x]` writes FOUR bytes, not eight — see
+                            // the FP load note. The structurer renders a
+                            // width-4 store whose value is a float register as
+                            // `*(float*)`, so the store keeps its real type.
+                            fp_reg_bytes(&name).unwrap_or(0)
+                        } else if insn.operands.first().and_then(gpr_of).is_some() {
+                            (gpr_bits(&insn.operands[0]) / 8) as u8
+                        } else {
+                            0
+                        }
+                    }
                 };
                 let mem = memory_operand(insn.operands.get(1)).map(|m| m.with_width(width));
                 if let (true, Some(m)) = (!matches!(val, Operand::Unknown), mem) {
@@ -1407,14 +1503,16 @@ pub fn lift_arm64(
                 };
                 match (gpr_of(&insn.operands[0]), gpr_of(&insn.operands[1]), base.clone()) {
                     (Some(a), Some(b), Some(bs)) => {
+                        let elem_width = register_width(&insn.operands[0]);
+                        let elem_width = if elem_width == 0 { 8 } else { elem_width };
                         insns.push(Insn::move_(
                             Operand::reg(a),
-                            Operand::Memory { width: 0, base: Box::new(Operand::reg(bs.clone())), index: None, scale: 8, addend: off },
+                            Operand::Memory { width: elem_width, base: Box::new(Operand::reg(bs.clone())), index: None, scale: elem_width, addend: off },
                             addr,
                         ));
                         insns.push(Insn::move_(
                             Operand::reg(b),
-                            Operand::Memory { width: 0, base: Box::new(Operand::reg(bs)), index: None, scale: 8, addend: off + 8 },
+                            Operand::Memory { width: elem_width, base: Box::new(Operand::reg(bs)), index: None, scale: elem_width, addend: off + elem_width as i64 },
                             addr,
                         ));
                     }
@@ -1424,8 +1522,8 @@ pub fn lift_arm64(
                     // def→use chain for every argument of that call.
                     _ => {
                         if let (Some((a, b, esz)), Some(bs)) = (fp_pair_of(&insn), base) {
-                            let mem1 = Operand::Memory { width: 0, base: Box::new(Operand::reg(bs.clone())), index: None, scale: esz, addend: off };
-                            let mem2 = Operand::Memory { width: 0, base: Box::new(Operand::reg(bs)), index: None, scale: esz, addend: off + esz as i64 };
+                            let mem1 = Operand::Memory { width: esz, base: Box::new(Operand::reg(bs.clone())), index: None, scale: esz, addend: off };
+                            let mem2 = Operand::Memory { width: esz, base: Box::new(Operand::reg(bs)), index: None, scale: esz, addend: off + esz as i64 };
                             let ra = a.clone();
                             let rb = b.clone();
                             insns.push(Insn::move_(Operand::reg(ra.clone()), mem1, addr));
@@ -1467,17 +1565,14 @@ pub fn lift_arm64(
                         // — including `vd` (64-bit), which it then advanced by
                         // 4 instead of 8, aliasing the second double onto the
                         // low half of the first. Ask the name for its width.
-                        let st_scale = match &v1 {
-                            Operand::Register(n) => fp_reg_bytes(n).unwrap_or(8),
-                            _ => 8,
-                        };
+                        let st_scale = register_width(&insn.operands[0]).max(1);
                         insns.push(Insn::move_(
-                            Operand::Memory { width: 0, base: Box::new(Operand::reg(bs.clone())), index: None, scale: st_scale, addend: off },
+                            Operand::Memory { width: st_scale, base: Box::new(Operand::reg(bs.clone())), index: None, scale: st_scale, addend: off },
                             v1,
                             addr,
                         ));
                         insns.push(Insn::move_(
-                            Operand::Memory { width: 0, base: Box::new(Operand::reg(bs)), index: None, scale: st_scale, addend: off + st_scale as i64 },
+                            Operand::Memory { width: st_scale, base: Box::new(Operand::reg(bs)), index: None, scale: st_scale, addend: off + st_scale as i64 },
                             v2,
                             addr,
                         ));
@@ -1485,8 +1580,8 @@ pub fn lift_arm64(
                     // SIMD pair spill (`STP s0, s1, [sp]`).
                     _ => {
                         if let (Some((v1, v2, esz)), Some(bs)) = (fp_pair_of(&insn), base) {
-                            let mem1 = Operand::Memory { width: 0, base: Box::new(Operand::reg(bs.clone())), index: None, scale: esz, addend: off };
-                            let mem2 = Operand::Memory { width: 0, base: Box::new(Operand::reg(bs)), index: None, scale: esz, addend: off + esz as i64 };
+                            let mem1 = Operand::Memory { width: esz, base: Box::new(Operand::reg(bs.clone())), index: None, scale: esz, addend: off };
+                            let mem2 = Operand::Memory { width: esz, base: Box::new(Operand::reg(bs)), index: None, scale: esz, addend: off + esz as i64 };
                             insns.push(Insn::move_(mem1, Operand::reg(v1), addr));
                             insns.push(Insn::move_(mem2, Operand::reg(v2), addr));
                         }
@@ -1858,7 +1953,21 @@ pub fn lift_arm64(
             A64Opcode::TBZ | A64Opcode::TBNZ => {
                 let target = branch_target_rva(&insn, addr);
                 let reg = operand_at(&insn, 0).unwrap_or(Operand::Unknown);
+                // yaxpeax encodes the TBZ/TBNZ bit index as `Imm16`, not
+                // `Immediate`/`ImmShift` (armv8/a64.rs: `Operand::Imm16(b)` for
+                // the 32-bit form, `Imm16(b | 0x20)` for the 64-bit form). It
+                // was missing from this match, so `bit` was ALWAYS 0 and every
+                // test-branch was lifted as a bit-0 test:
+                //
+                //   0x0189dc64  tbnz w24, #0x1f, $+0xbc
+                //     ir Arith(And) [v, x24, #1]        <- must be #0x80000000
+                //
+                // That is why `Initialize` @0x189D9D4 emitted guards such as
+                // `if (!index) { if (index >= 1) ... }`: the sign test on the
+                // token count became a test of bit 0. Mask off the 0x20 flag
+                // that distinguishes the 64-bit form.
                 let bit: i64 = match insn.operands.get(1) {
+                    Some(A64Op::Imm16(v)) => (*v as i64) & 0x1f,
                     Some(A64Op::Immediate(v)) => *v as i64,
                     Some(A64Op::ImmShift(v, _)) => *v as i64,
                     _ => 0,
@@ -1916,7 +2025,17 @@ pub fn lift_arm64(
                 // Vector3 math). Record only FP regs written since the last
                 // call — those are the ones this call actually consumes;
                 // unconditional s0–s7 entries would phantom-arg every call.
-                for r in fp_written.iter() {
+                // ABI ORDER, not lexicographic order. The set is
+                // `BTreeSet<String>`, so `vs40` (s10) sorted BEFORE `vs8`
+                // (s2) and the second float argument was bound to the wrong
+                // register (or to none). Sort by the flattened index instead.
+                let mut fps: Vec<&String> = fp_written.iter().collect();
+                fps.sort_by_key(|n| {
+                    n.strip_prefix("vs")
+                        .and_then(|d| d.parse::<u32>().ok())
+                        .unwrap_or(u32::MAX)
+                });
+                for r in fps {
                     ops.push(Operand::reg(r.clone()));
                 }
                 fp_written.clear();
@@ -1961,7 +2080,17 @@ pub fn lift_arm64(
                 // Same AAPCS64 FP-argument rule as `BL`: only the FP registers
                 // written since the previous call are arguments of THIS call;
                 // unconditional s0–s7 entries would phantom-arg every call.
-                for r in fp_written.iter() {
+                // ABI ORDER, not lexicographic order. The set is
+                // `BTreeSet<String>`, so `vs40` (s10) sorted BEFORE `vs8`
+                // (s2) and the second float argument was bound to the wrong
+                // register (or to none). Sort by the flattened index instead.
+                let mut fps: Vec<&String> = fp_written.iter().collect();
+                fps.sort_by_key(|n| {
+                    n.strip_prefix("vs")
+                        .and_then(|d| d.parse::<u32>().ok())
+                        .unwrap_or(u32::MAX)
+                });
+                for r in fps {
                     ops.push(Operand::reg(r.clone()));
                 }
                 fp_written.clear();
@@ -1981,7 +2110,17 @@ pub fn lift_arm64(
                 for r in ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"] {
                     ops.push(Operand::reg(r));
                 }
-                for r in fp_written.iter() {
+                // ABI ORDER, not lexicographic order. The set is
+                // `BTreeSet<String>`, so `vs40` (s10) sorted BEFORE `vs8`
+                // (s2) and the second float argument was bound to the wrong
+                // register (or to none). Sort by the flattened index instead.
+                let mut fps: Vec<&String> = fp_written.iter().collect();
+                fps.sort_by_key(|n| {
+                    n.strip_prefix("vs")
+                        .and_then(|d| d.parse::<u32>().ok())
+                        .unwrap_or(u32::MAX)
+                });
+                for r in fps {
                     ops.push(Operand::reg(r.clone()));
                 }
                 fp_written.clear();
@@ -2182,7 +2321,12 @@ pub fn lift_arm64(
             }
             A64Opcode::SCVTF | A64Opcode::UCVTF => {
                 let dst = fp_of(&insn.operands[0]).unwrap_or_default();
-                let src = operand_at(&insn, 1).unwrap_or(Operand::Unknown);
+                // The source is an INTEGER value that may live in EITHER
+                // register file. `operand_at` names GPRs only, so
+                // `scvtf s0, s0` (reinterpreting a 4-byte load as an int and
+                // converting it to float — `(float)token.Count`) produced
+                // Convert[.., Unknown] and the whole numerator vanished.
+                let src = value_operand_at(&insn, 1);
                 let conv = if dst.starts_with("vd") {
                     super::ir::Conversion::IntToFloat64
                 } else {
@@ -2424,6 +2568,22 @@ pub fn lift_arm64(
                 census_intrinsic(insn.opcode);
                 let dst = generic_intrinsic_dst(&insn).unwrap();
                 let mut ops = vec![Operand::reg(dst)];
+                // For MOVI, preserve the element size as a third operand so the
+                // renderer can expand the immediate to the full 64-bit value.
+                if insn.opcode == A64Opcode::MOVI {
+                    if let Some(A64Op::SIMDRegisterElements(_, _, esz)) = insn.operands.first() {
+                        let lane_bytes: i64 = match esz {
+                            SIMDSizeCode::B => 1,
+                            SIMDSizeCode::H => 2,
+                            SIMDSizeCode::S => 4,
+                            SIMDSizeCode::D => 8,
+                            _ => 0,
+                        };
+                        if lane_bytes > 0 {
+                            ops.push(Operand::imm(lane_bytes));
+                        }
+                    }
+                }
                 for k in 1..insn.operands.len() {
                     if matches!(insn.operands[k], A64Op::Nothing) {
                         break;
@@ -2496,9 +2656,11 @@ pub fn is_scratch(v: u32) -> bool {
 }
 
 fn is_fp_operand(op: &A64Op) -> bool {
-    matches!(op, A64Op::SIMDRegister(SIMDSizeCode::S | SIMDSizeCode::D, _))
+    matches!(
+        op,
+        A64Op::SIMDRegister(SIMDSizeCode::S | SIMDSizeCode::D, _)
+    )
 }
-
 
 fn fp_of(op: &A64Op) -> Option<String> {
     match op {
@@ -2517,9 +2679,22 @@ fn vec_fp2s(op: &A64Op) -> Option<(u16, u8)> {
     }
 }
 
-/// Scalar s-register name of a SIMD lane: Vn lane k (32-bit element) aliases
-/// S(4n+k) — the SAME name scalar ops use, so lane math joins the scalar
-/// FloatArith world seamlessly.
+/// Name of a scalar S-register: direct mapping `sN → vsN`.
+fn scalar_s_name(num: u16) -> String {
+    // The scalar `sN` view IS lane 0 of `vN`, and vector lanes are named with
+    // the flattened identity `vs{4*reg + lane}` (`s_lane_name`, and
+    // `highvar`'s ABI-supplied check). Returning `vs{num}` here gave the SAME
+    // architectural register two names: `fsub s8` defined/used `vs8`, while
+    // `mov v8.16b, v0.16b` defined `vs32` (lane 0 of v8). The copy was then
+    // dead, the loop's roll lost its definition, and the emitted code read an
+    // ABI entry slot (`in_vs8`) instead of the Range() result (0x18A53C4).
+    // It also aliased `s8` with `v2.s[0]` (`vs8`), two unrelated values.
+    format!("vs{}", num as u32 * 4)
+}
+
+/// Name of a 32-bit SIMD lane. Scalar `sN` is represented as lane 0 of `vN`,
+/// so scalar and vector operations share a name only when they access the same
+/// architectural bits.
 fn s_lane_name(vreg: u16, lane: u8) -> String {
     format!("vs{}", vreg as u32 * 4 + lane as u32)
 }
@@ -2631,6 +2806,19 @@ fn simd_name(op: &A64Op) -> Option<String> {
         }
         A64Op::SIMDRegisterGroup(c, n, _, _) => Some(fp_reg(*c, *n)),
         A64Op::SIMDRegisterGroupLane(n, c, _, _) => Some(fp_reg(*c, *n)),
+        _ => None,
+    }
+}
+
+/// `(physical V register, byte width)` for a full-width SIMD value. Used when
+/// a bitwise MOV alias copies a Q/D register and scalar instructions later read
+/// one of its S/D views.
+fn simd_copy_container(op: &A64Op) -> Option<(u16, u8)> {
+    match op {
+        A64Op::SIMDRegister(SIMDSizeCode::D, n)
+        | A64Op::SIMDRegisterElements(SIMDSizeCode::D, n, _) => Some((*n, 8)),
+        A64Op::SIMDRegister(SIMDSizeCode::Q, n)
+        | A64Op::SIMDRegisterElements(SIMDSizeCode::Q, n, _) => Some((*n, 16)),
         _ => None,
     }
 }
@@ -2772,31 +2960,36 @@ fn shifted_reg_src(insn: &A64Insn, idx: usize) -> Option<(String, ArithKind, u8)
 
 fn memory_operand(op: Option<&A64Op>) -> Option<Operand> {
     match op? {
-        op @ (A64Op::Register(_, _) | A64Op::RegisterOrSP(_, _)) => gpr_of(op).map(|b| {
-            Operand::Memory { width: 0, base: Box::new(Operand::reg(b)), index: None, scale: 8, addend: 0 }
-        }),
-        A64Op::RegPreIndex(base, off, _) => {
-            Some(Operand::Memory { width: 0,
-                base: Box::new(Operand::reg(gpr(*base, true))),
-                index: None,
-                scale: 8,
-                addend: *off as i64,
-            })
-        }
-        // Post-index (`ldr x0, [x1], #8` / `[x1], x9`): the ACCESS is at the
-        // UNCHANGED base — the offset is only the increment, which
-        // `memory_writeback` deliberately does not model yet (see the note
-        // there). Reading it as an access offset made every element copy loop
-        // load eight bytes past the element it meant.
-        A64Op::RegPostIndex(base, _) | A64Op::RegPostIndexReg(base, _) => {
-            Some(Operand::Memory { width: 0,
-                base: Box::new(Operand::reg(gpr(*base, true))),
+        op @ (A64Op::Register(_, _) | A64Op::RegisterOrSP(_, _)) => {
+            gpr_of(op).map(|b| Operand::Memory {
+                width: 0,
+                base: Box::new(Operand::reg(b)),
                 index: None,
                 scale: 8,
                 addend: 0,
             })
         }
-        A64Op::RegRegOffset(base, index, _, _, shift) => Some(Operand::Memory { width: 0,
+        A64Op::RegPreIndex(base, off, _) => Some(Operand::Memory {
+            width: 0,
+            base: Box::new(Operand::reg(gpr(*base, true))),
+            index: None,
+            scale: 8,
+            addend: *off as i64,
+        }),
+        // Post-index (`ldr x0, [x1], #8` / `[x1], x9`): the ACCESS is at the
+        // UNCHANGED base — the offset is only the increment, which
+        // `memory_writeback` deliberately does not model yet (see the note
+        // there). Reading it as an access offset made every element copy loop
+        // load eight bytes past the element it meant.
+        A64Op::RegPostIndex(base, _) | A64Op::RegPostIndexReg(base, _) => Some(Operand::Memory {
+            width: 0,
+            base: Box::new(Operand::reg(gpr(*base, true))),
+            index: None,
+            scale: 8,
+            addend: 0,
+        }),
+        A64Op::RegRegOffset(base, index, _, _, shift) => Some(Operand::Memory {
+            width: 0,
             base: Box::new(Operand::reg(gpr(*base, true))),
             index: Some(Box::new(Operand::reg(gpr(*index, false)))),
             scale: 1u8 << (*shift).min(3),
@@ -2849,12 +3042,10 @@ fn memory_writeback(op: Option<&A64Op>) -> Option<(String, Option<String>, i64)>
 /// OLD register value; this move then defines the new one. The callers emit
 /// it whether or not the access produced IR (an unknown stored value drops
 /// the store but the native write-back still happens).
-fn push_writeback(
-    insns: &mut Vec<Insn>,
-    wb: Option<(String, Option<String>, i64)>,
-    addr: u64,
-) {
-    let Some((base, index, addend)) = wb else { return };
+fn push_writeback(insns: &mut Vec<Insn>, wb: Option<(String, Option<String>, i64)>, addr: u64) {
+    let Some((base, index, addend)) = wb else {
+        return;
+    };
     let (kind, rhs) = match index {
         Some(idx) => (ArithKind::Add, Operand::reg(idx)),
         None if addend > 0 => (ArithKind::Add, Operand::imm(addend)),
@@ -2875,8 +3066,21 @@ fn push_writeback(
 /// load/store: [x] → [x + 4k]). Non-memory operands degrade to Unknown.
 fn mem_plus(op: &Operand, byte_add: i64) -> Operand {
     match op {
-        Operand::Memory { width: 0, base, index, scale, addend } if byte_add == 0 => op.clone(),
-        Operand::Memory { width: 0, base, index, scale, addend } => Operand::Memory { width: 0,
+        Operand::Memory {
+            width: 0,
+            base,
+            index,
+            scale,
+            addend,
+        } if byte_add == 0 => op.clone(),
+        Operand::Memory {
+            width: 0,
+            base,
+            index,
+            scale,
+            addend,
+        } => Operand::Memory {
+            width: 0,
             base: base.clone(),
             index: index.clone(),
             scale: *scale,
@@ -2966,7 +3170,11 @@ fn materialize_cond(
             pin_deferred_read(insns, addresses, *prev_at, &mut pl, next_scratch);
             pin_deferred_read(insns, addresses, *prev_at, &mut pr, next_scratch);
             let sp = take(next_scratch);
-            insns.push(Insn::new(Op::Compare(p_kind), vec![sp.clone(), pl, pr], addr));
+            insns.push(Insn::new(
+                Op::Compare(p_kind),
+                vec![sp.clone(), pl, pr],
+                addr,
+            ));
             let mut cl = lhs.clone();
             let mut cr = rhs.clone();
             pin_deferred_read(insns, addresses, *at, &mut cl, next_scratch);
@@ -3011,7 +3219,7 @@ fn preserves_nzcv(op: A64Opcode) -> bool {
     matches!(
         op,
         // moves, constants, logic and arithmetic WITHOUT the S suffix
-        MOVN | MOVK | MOVZ | ADC | SBC | AND | ORR | ORN | EOR | EON | BIC
+        MOVN | MOVK | MOVZ | ADD | SUB | ADC | SBC | AND | ORR | ORN | EOR | EON | BIC
             | BFM | UBFM | SBFM | EXTR | ADR | ADRP | MOVI
         // multiply / divide / variable shifts: no flag write
             | MADD | MSUB | SMADDL | SMSUBL | SMULH | UMADDL | UMSUBL | UMULH
@@ -3031,8 +3239,14 @@ fn preserves_nzcv(op: A64Opcode) -> bool {
             | STTRH | STUR | STURB | STURH | STXR | STXRB | STXRH | STXP
             | LD1 | LD1R | LD2 | LD2R | LD3 | LD3R | LD4 | LD4R
             | ST1 | ST2 | ST3 | ST4
-        // branches that do not test the flags
-            | B | CBZ | CBNZ | TBZ | TBNZ
+        // Conditional branches do not write NZCV and their FALL-THROUGH is
+        // a real successor, so a compare may legitimately carry across them.
+        // An unconditional B is deliberately NOT here: it writes nothing
+        // either, but the instruction that follows it in address order is
+        // usually not the branch target, so carrying the compare there bound
+        // the wrong condition. `passes::resolve_cross_block_conditions`
+        // supplies those by dominance instead.
+            | CBZ | CBNZ | TBZ | TBNZ
         // conditional select: READS the flags, does not write them
             | CSEL | CSINC | CSINV | CSNEG
         // FP / SIMD arithmetic and conversions: no NZCV
@@ -3074,12 +3288,7 @@ pub enum TargetArch {
     X64,
 }
 
-pub fn disasm_align_report(
-    bytes: &[u8],
-    rva: u64,
-    insns: &[Insn],
-    arch: TargetArch,
-) -> String {
+pub fn disasm_align_report(bytes: &[u8], rva: u64, insns: &[Insn], arch: TargetArch) -> String {
     // THE NATIVE COLUMN MUST BE DECODED FOR THE BINARY'S OWN ARCHITECTURE.
     //
     // This function used `A64Decoder` unconditionally, so on an ARM32 or x86
@@ -3225,9 +3434,23 @@ fn push_binary(
 /// wrap inside the operand size rather than inside 64 bits.
 fn gpr_bits(op: &A64Op) -> u32 {
     match op {
-        A64Op::Register(yaxpeax_arm::armv8::a64::SizeCode::X, _) => 64,
+        A64Op::Register(yaxpeax_arm::armv8::a64::SizeCode::X, _)
+        | A64Op::RegisterOrSP(yaxpeax_arm::armv8::a64::SizeCode::X, _) => 64,
         _ => 32,
     }
+}
+
+/// Architectural byte width for a scalar register operand used by a load or
+/// store. The `STR` opcode family covers both W/X and S/D/Q registers; its
+/// mnemonic alone does not carry enough width information for the IR.
+fn register_width(op: &A64Op) -> u8 {
+    if let Some(name) = simd_name(op) {
+        return fp_reg_bytes(&name).unwrap_or(0);
+    }
+    if gpr_of(op).is_some() {
+        return (gpr_bits(op) / 8) as u8;
+    }
+    0
 }
 
 /// ARM ARM `DecodeBitMasks(N, imms, immr, FALSE)` — returns `wmask`.
@@ -3254,13 +3477,7 @@ fn decode_bit_masks(bits: u32, imms: u32, immr: u32) -> u64 {
     let r = immr & levels;
     let d = s.wrapping_sub(r) & levels;
     let esize = 1u32 << len;
-    let ones = |n: u32| -> u64 {
-        if n >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << n) - 1
-        }
-    };
+    let ones = |n: u32| -> u64 { if n >= 64 { u64::MAX } else { (1u64 << n) - 1 } };
     let welem = ones(s + 1);
     let telem = ones(d + 1);
     let _ = telem; // SBFM's sign bit; BFM/UBFM need only `wmask`
@@ -3298,7 +3515,11 @@ fn ror_const(
     let mut tmp = |op: Op| -> Operand {
         let t = Operand::reg(format!("xt{}", *virt_serial));
         *virt_serial += 1;
-        insns.push(Insn::new(op, vec![t.clone(), src.clone(), Operand::imm(a as i64)], addr));
+        insns.push(Insn::new(
+            op,
+            vec![t.clone(), src.clone(), Operand::imm(a as i64)],
+            addr,
+        ));
         t
     };
     let hi = tmp(Op::Arith(ArithKind::Shr));
@@ -3347,5 +3568,9 @@ fn test_flags(
     // name (`xt{n}`), and anchoring the pin at the index of an instruction that
     // DEFINES one of the compare's own operands would make the pin read an
     // undefined local.
-    FlagState::Cmp { lhs: acc, rhs: Operand::imm(0), at: insns.len() }
+    FlagState::Cmp {
+        lhs: acc,
+        rhs: Operand::imm(0),
+        at: insns.len(),
+    }
 }

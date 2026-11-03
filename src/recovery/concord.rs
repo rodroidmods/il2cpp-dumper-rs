@@ -50,8 +50,8 @@
 //! offending method to `concord_findings.jsonl`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::verify::{self, DecodedInsn, InsnClass};
 
@@ -198,7 +198,9 @@ fn classify_fidelity(cs_text: &str, blocks_unemitted: usize) {
 
     if unknown_refs > 0 {
         let _ = FIDELITY.with_unknown.fetch_add(1, Ordering::Relaxed);
-        let _ = FIDELITY.unknown_refs.fetch_add(unknown_refs, Ordering::Relaxed);
+        let _ = FIDELITY
+            .unknown_refs
+            .fetch_add(unknown_refs, Ordering::Relaxed);
     }
     if unknown_consumed > 0 {
         let _ = FIDELITY
@@ -210,7 +212,9 @@ fn classify_fidelity(cs_text: &str, blocks_unemitted: usize) {
         let _ = FIDELITY.goto_refs.fetch_add(goto_refs, Ordering::Relaxed);
     }
     if dispatch {
-        let _ = FIDELITY.dispatch_unrecovered.fetch_add(1, Ordering::Relaxed);
+        let _ = FIDELITY
+            .dispatch_unrecovered
+            .fetch_add(1, Ordering::Relaxed);
     }
     if unwalked {
         let _ = FIDELITY
@@ -229,8 +233,8 @@ fn classify_fidelity(cs_text: &str, blocks_unemitted: usize) {
 /// them is a C# nameable value, so a token equal to one of these in the output
 /// means the local-mapping step gave up on that register.
 const RAW_REGISTER_NAMES: &[&str] = &[
-    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20",
-    "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "g14", "g15",
+    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21",
+    "x22", "x23", "x24", "x25", "x26", "x27", "x28", "g14", "g15",
 ];
 
 pub static STATS: ConcordStats = ConcordStats {
@@ -261,6 +265,13 @@ pub static STATS: ConcordStats = ConcordStats {
 /// caller (`ILR_CONCORD_TOP`, default 40) so a full-binary run cannot grow it
 /// without limit.
 static WORST: Mutex<Vec<MethodConcord>> = Mutex::new(Vec::new());
+
+/// Methods whose structured walk never emitted at least one CFG block:
+/// `(rva, unemitted, total)`. This is the explicit "code may have vanished"
+/// ledger — the one class that must never be inferred from a percentage.
+/// Bounded so a full-binary run cannot grow it without limit.
+static BLOCK_LOSS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+const BLOCK_LOSS_CAP: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct MethodConcord {
@@ -343,10 +354,41 @@ pub struct CsFacts {
 }
 
 const KEYWORDS: &[&str] = &[
-    "if", "else", "while", "for", "do", "switch", "case", "default", "break", "continue",
-    "return", "goto", "new", "typeof", "sizeof", "nameof", "checked", "unchecked", "lock",
-    "using", "try", "catch", "finally", "throw", "catch", "in", "is", "as", "this", "true",
-    "false", "null", "and", "or", "not",
+    "if",
+    "else",
+    "while",
+    "for",
+    "do",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "return",
+    "goto",
+    "new",
+    "typeof",
+    "sizeof",
+    "nameof",
+    "checked",
+    "unchecked",
+    "lock",
+    "using",
+    "try",
+    "catch",
+    "finally",
+    "throw",
+    "catch",
+    "in",
+    "is",
+    "as",
+    "this",
+    "true",
+    "false",
+    "null",
+    "and",
+    "or",
+    "not",
 ];
 
 fn is_keyword(w: &str) -> bool {
@@ -491,11 +533,7 @@ fn signature_call_bias(text: &str) -> usize {
     match text.find('{') {
         Some(br) => {
             let head = &text[..br];
-            if head.contains('(') {
-                1
-            } else {
-                0
-            }
+            if head.contains('(') { 1 } else { 0 }
         }
         None => 0,
     }
@@ -774,6 +812,18 @@ pub fn check_and_log(cs_text: &str, bytes: &[u8], base_rva: u64, arch: Arch) {
         .fetch_add(blocks_total as u64, Ordering::Relaxed);
     if unemitted > 0 {
         let _ = STATS.methods_partial.fetch_add(1, Ordering::Relaxed);
+        if std::env::var("ILR_CONCORD").is_ok() || std::env::var("ILR_COVLOSS").is_ok() {
+            eprintln!(
+                "[covloss] {base_rva:#x}: {unemitted}/{blocks_total} CFG blocks never emitted"
+            );
+        }
+        if std::env::var("ILR_CONCORD").is_ok() {
+            if let Ok(mut v) = BLOCK_LOSS.lock() {
+                if v.len() < BLOCK_LOSS_CAP {
+                    v.push((base_rva, unemitted, blocks_total));
+                }
+            }
+        }
     }
 
     let mut c = compare(cs_text, &decoded);
@@ -797,11 +847,15 @@ pub fn check_and_log(cs_text: &str, bytes: &[u8], base_rva: u64, arch: Arch) {
     let _ = STATS
         .vacuous_conds
         .fetch_add(c.vacuous_conds as u64, Ordering::Relaxed);
-    let _ = STATS.cs_calls.fetch_add(c.cs_calls as u64, Ordering::Relaxed);
+    let _ = STATS
+        .cs_calls
+        .fetch_add(c.cs_calls as u64, Ordering::Relaxed);
     let _ = STATS
         .native_conds
         .fetch_add(c.native_conds as u64, Ordering::Relaxed);
-    let _ = STATS.cs_conds.fetch_add(c.cs_conds as u64, Ordering::Relaxed);
+    let _ = STATS
+        .cs_conds
+        .fetch_add(c.cs_conds as u64, Ordering::Relaxed);
     let _ = STATS
         .cs_logical_ops
         .fetch_add(c.cs_logical_ops as u64, Ordering::Relaxed);
@@ -915,7 +969,13 @@ fn native_cond_branches(decoded: &[DecodedInsn]) -> Vec<(u64, String, u64)> {
     decoded
         .iter()
         .filter(|d| is_conditional_branch(&d.mnemonic))
-        .map(|d| (d.addr, d.mnemonic.clone(), d.facts.cond_branch.map(|c| c.1).unwrap_or(0)))
+        .map(|d| {
+            (
+                d.addr,
+                d.mnemonic.clone(),
+                d.facts.cond_branch.map(|c| c.1).unwrap_or(0),
+            )
+        })
         .collect()
 }
 
@@ -975,7 +1035,13 @@ pub fn method_diff(cs_text: &str, decoded: &[DecodedInsn], rva: u64) -> String {
     let branches = native_cond_branches(decoded);
 
     let mut o = String::new();
-    let pct = |n: usize, d: usize| if d == 0 { 100.0 } else { 100.0 * n as f64 / d as f64 };
+    let pct = |n: usize, d: usize| {
+        if d == 0 {
+            100.0
+        } else {
+            100.0 * n as f64 / d as f64
+        }
+    };
     o.push_str(&format!(
         "[concord-diff] {rva:#x}: {} decoded native insns\n",
         decoded.len()
@@ -1067,7 +1133,11 @@ pub fn method_diff(cs_text: &str, decoded: &[DecodedInsn], rva: u64) -> String {
     ));
     let conc = target_concentration(&branches);
     if let Some((t, c)) = conc.first() {
-        let share = if branches.is_empty() { 0.0 } else { 100.0 * *c as f64 / branches.len() as f64 };
+        let share = if branches.is_empty() {
+            0.0
+        } else {
+            100.0 * *c as f64 / branches.len() as f64
+        };
         o.push_str(&format!(
             "          {} distinct taken targets; most-taken {t:#x} by {c} branches ({share:.0}%)",
             conc.len()
@@ -1094,12 +1164,18 @@ pub fn method_diff(cs_text: &str, decoded: &[DecodedInsn], rva: u64) -> String {
     // ---- the side-by-side ---------------------------------------------
     const SHOW: usize = 16;
     if native_conds > cs_conds {
-        o.push_str(&format!("  -- native branches (first {SHOW} of {}) --\n", branches.len()));
+        o.push_str(&format!(
+            "  -- native branches (first {SHOW} of {}) --\n",
+            branches.len()
+        ));
         for (a, m, t) in branches.iter().take(SHOW) {
             o.push_str(&format!("     {a:#x}  {m} -> {t:#x}\n"));
         }
         let cl = cs_cond_lines(cs_text);
-        o.push_str(&format!("  -- C# branch lines (first {SHOW} of {}) --\n", cl.len()));
+        o.push_str(&format!(
+            "  -- C# branch lines (first {SHOW} of {}) --\n",
+            cl.len()
+        ));
         for l in cl.iter().take(SHOW) {
             let mut l = l.replace('\n', " ");
             if l.len() > 120 {
@@ -1277,6 +1353,18 @@ pub fn report() -> String {
             out.push_str(&format!(
                 "[concord]   CFG regions missing entirely (blocks never walked): {uw}\n"
             ));
+            if let Ok(v) = BLOCK_LOSS.lock() {
+                let list: Vec<String> = v
+                    .iter()
+                    .map(|(r, un, tot)| format!("{r:#x}:{un}/{tot}"))
+                    .collect();
+                out.push_str(&format!(
+                    "[concord]     rvas (first {} of {}): {}\n",
+                    list.len(),
+                    uw,
+                    list.join(" ")
+                ));
+            }
         }
         let (gg, gr) = (g(&FIDELITY.with_goto), g(&FIDELITY.goto_refs));
         if gg > 0 {
@@ -1398,7 +1486,10 @@ mod tests {
         // stay out of the denominator.
         let bytes = {
             let words: [u32; 1] = [0xA9017BFD]; // stp x29, x30, [sp, #0x10]
-            words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()
+            words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<u8>>()
         };
         let decoded = verify::decode_all_arm64(&bytes, 0x1000).0;
         let (calls, conds, offsets, imms) = native_counts(&decoded);

@@ -4,22 +4,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use clap::Parser;
-use console::{style, Emoji};
+use console::{Emoji, style};
 use dialoguer::{Input, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use il2cpp_dumper::config::{Config, MethodBodyMode};
 use il2cpp_dumper::error::Result;
-use il2cpp_dumper::il2cpp::metadata::{Metadata, MetadataVariant};
-use il2cpp_dumper::il2cpp::base::{Il2Cpp, VaSegment};
 use il2cpp_dumper::executor::Il2CppExecutor;
-use il2cpp_dumper::output::decompiler::Il2CppDecompiler;
-use il2cpp_dumper::output::struct_generator::StructGenerator;
 use il2cpp_dumper::formats::elf::Elf;
-use il2cpp_dumper::formats::pe::Pe;
 use il2cpp_dumper::formats::macho::MachO;
 use il2cpp_dumper::formats::nso::Nso;
+use il2cpp_dumper::formats::pe::Pe;
 use il2cpp_dumper::formats::wasm::Wasm;
+use il2cpp_dumper::il2cpp::base::{Il2Cpp, VaSegment};
+use il2cpp_dumper::il2cpp::metadata::{Metadata, MetadataVariant};
+use il2cpp_dumper::output::decompiler::Il2CppDecompiler;
+use il2cpp_dumper::output::struct_generator::StructGenerator;
 
 /// Dump base supplied on the command line (`--dump-base`). A global rather
 /// than an environment variable on purpose: the platform initialisers take the
@@ -78,18 +78,38 @@ il2cpp_dumper dumped.bin global-metadata.dat --dump-base 0x7074053000 --cs"
 struct Cli {
     /// Path to the IL2CPP binary: an ELF .so, a PE .dll/.exe, a Mach-O image,
     /// an NSO or a WASM module. Same as the first positional.
-    #[arg(long = "binary", short = 'b', value_name = "FILE", help_heading = "Input")]
+    #[arg(
+        long = "binary",
+        short = 'b',
+        value_name = "FILE",
+        help_heading = "Input"
+    )]
     il2cpp_binary_flag: Option<String>,
     /// Path to global-metadata.dat. Same as the second positional.
-    #[arg(long = "metadata", short = 'm', value_name = "FILE", help_heading = "Input")]
+    #[arg(
+        long = "metadata",
+        short = 'm',
+        value_name = "FILE",
+        help_heading = "Input"
+    )]
     metadata_flag: Option<String>,
     /// Directory to write the Dump0/ folder into [default: .]. Same as the
     /// third positional.
-    #[arg(long = "output", short = 'o', value_name = "DIR", help_heading = "Input")]
+    #[arg(
+        long = "output",
+        short = 'o',
+        value_name = "DIR",
+        help_heading = "Input"
+    )]
     output_dir_flag: Option<String>,
     /// Load a config.json instead of the built-in defaults. Command-line flags
     /// override the keys it sets.
-    #[arg(long = "config", short = 'c', value_name = "FILE", help_heading = "Input")]
+    #[arg(
+        long = "config",
+        short = 'c',
+        value_name = "FILE",
+        help_heading = "Input"
+    )]
     config: Option<String>,
     /// Force the CODM metadata/container variant. It is normally detected from
     /// the metadata itself; set this when the image uses the variant but
@@ -114,7 +134,11 @@ struct Cli {
     dump_base: Option<String>,
     /// Method-body output mode: `off`, `assembly`, `csharp`, or `both`.
     /// Preferred over the legacy dumpDisassembly / dumpPseudoC pair in config.json.
-    #[arg(long = "method-body-mode", value_name = "MODE", help_heading = "Decompilation")]
+    #[arg(
+        long = "method-body-mode",
+        value_name = "MODE",
+        help_heading = "Decompilation"
+    )]
     method_body_mode: Option<String>,
     /// Restrict method bodies (assembly / C# / IL recovery) to this assembly
     /// (repeatable, e.g. --pseudo-include-assembly Assembly-CSharp).
@@ -136,28 +160,28 @@ struct Cli {
     no_pseudo_prompt: bool,
     /// Skip pseudo-C decompilation of methods whose body is larger than this
     /// many bytes (the giant coroutine/parser methods are the slowest).
-    #[arg(long = "pseudo-max-body-size", value_name = "BYTES", help_heading = "Decompilation")]
+    #[arg(
+        long = "pseudo-max-body-size",
+        value_name = "BYTES",
+        help_heading = "Decompilation"
+    )]
     pseudo_max_body_size: Option<usize>,
     /// Generate the DummyDll/ directory (a real .NET assembly skeleton with
-    /// metadata, field offsets and stubs). Required by --il-recovery.
-    #[arg(long = "generate-dummy-dll", help_heading = "C# recovery")]
+    /// metadata, field offsets and stubs). Controlled by config.json `generateDummyDll`.
+    #[arg(long = "generate-dummy-dll", help_heading = "C# recovery", hide = true)]
     generate_dummy_dll: bool,
     /// Skip DummyDll generation (overrides `generateDummyDll` in the config).
-    #[arg(long = "no-generate-dummy-dll", help_heading = "C# recovery")]
+    #[arg(long = "no-generate-dummy-dll", help_heading = "C# recovery", hide = true)]
     no_generate_dummy_dll: bool,
-    /// Recover real CIL method bodies into the DummyDlls, so dnSpy/ILSpy
-    /// decompile them to C# instead of showing empty stubs. Needs
-    /// --generate-dummy-dll. Works on ARM64, x64 and ARM32.
-    #[arg(long = "il-recovery", help_heading = "C# recovery")]
+    /// Recover real CIL method bodies into the DummyDlls. Controlled by config.json `methodBodyMode`.
+    #[arg(long = "il-recovery", help_heading = "C# recovery", hide = true)]
     il_recovery: bool,
     /// Do not recover CIL method bodies; leave every DummyDll method a stub
     /// (overrides `ilRecovery` in the config).
-    #[arg(long = "no-il-recovery", help_heading = "C# recovery")]
+    #[arg(long = "no-il-recovery", help_heading = "C# recovery", hide = true)]
     no_il_recovery: bool,
-    /// One-flag shortcut for the C# decompilation workflow: same as
-    /// `--il-recovery` (which implies DummyDll generation). Point dnSpy / ILSpy
-    /// at <output>/Dump0/DummyDll to read the recovered method bodies as C#.
-    #[arg(long = "cs", help_heading = "C# recovery")]
+    /// One-flag shortcut for the C# decompilation workflow. Controlled by config.json `methodBodyMode: "csharp"`.
+    #[arg(long = "cs", help_heading = "C# recovery", hide = true)]
     cs: bool,
     /// Do not grade the recovered methods. By default every method is run
     /// through the differential verifier and the ones it cannot prove clean are
@@ -179,13 +203,20 @@ struct Cli {
 
 impl Cli {
     fn resolve(&self) -> std::result::Result<(String, String, String), String> {
-        let binary = self.il2cpp_binary_flag.clone()
+        let binary = self
+            .il2cpp_binary_flag
+            .clone()
             .or_else(|| self.binary_pos.clone())
-            .ok_or_else(|| "no IL2CPP binary given — pass it as the first argument or with --binary/-b".to_string())?;
+            .ok_or_else(|| {
+                "no IL2CPP binary given — pass it as the first argument or with --binary/-b"
+                    .to_string()
+            })?;
         let metadata = self.metadata_flag.clone()
             .or_else(|| self.metadata_pos.clone())
             .ok_or_else(|| "no metadata given — pass global-metadata.dat as the second argument or with --metadata/-m".to_string())?;
-        let output = self.output_dir_flag.clone()
+        let output = self
+            .output_dir_flag
+            .clone()
             .or_else(|| self.output_pos.clone())
             .unwrap_or_else(|| ".".into());
         Ok((binary, metadata, output))
@@ -220,10 +251,7 @@ fn print_banner() {
         style("  Version").dim(),
         style(format!(" v{version}")).magenta().bold()
     );
-    println!(
-        "  {}",
-        style("─────────────────────────────────────").dim()
-    );
+    println!("  {}", style("─────────────────────────────────────").dim());
     println!();
 }
 
@@ -262,17 +290,23 @@ fn print_detection(label: &str) {
 }
 
 fn read_magic_u32(data: &[u8]) -> u32 {
-    if data.len() < 4 { return 0; }
+    if data.len() < 4 {
+        return 0;
+    }
     u32::from_le_bytes([data[0], data[1], data[2], data[3]])
 }
 
 fn read_magic_u16(data: &[u8]) -> u16 {
-    if data.len() < 2 { return 0; }
+    if data.len() < 2 {
+        return 0;
+    }
     u16::from_le_bytes([data[0], data[1]])
 }
 
 fn is_valid_metadata_version(data: &[u8]) -> bool {
-    if data.len() < 8 { return false; }
+    if data.len() < 8 {
+        return false;
+    }
     let ver = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
     ver > 0 && ver < 200
 }
@@ -287,7 +321,9 @@ fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
     let k1 = magic[0] ^ data[0];
     if k1 != 0 && (1..4).all(|i| (magic[i] ^ data[i]) == k1) {
         let mut test = data.clone();
-        for b in test.iter_mut() { *b ^= k1; }
+        for b in test.iter_mut() {
+            *b ^= k1;
+        }
         if is_valid_metadata_version(&test) {
             *data = test;
             return Some(format!("Single-byte XOR (key: 0x{k1:02X})"));
@@ -297,39 +333,66 @@ fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
     let key4: [u8; 4] = std::array::from_fn(|i| magic[i] ^ data[i]);
     if key4 != [0u8; 4] && !key4.windows(2).all(|w| w[0] == w[1]) {
         let mut test = data.clone();
-        for (i, b) in test.iter_mut().enumerate() { *b ^= key4[i % 4]; }
+        for (i, b) in test.iter_mut().enumerate() {
+            *b ^= key4[i % 4];
+        }
         if is_valid_metadata_version(&test) {
             *data = test;
-            return Some(format!("4-byte XOR (key: {:02X}{:02X}{:02X}{:02X})",
-                key4[0], key4[1], key4[2], key4[3]));
+            return Some(format!(
+                "4-byte XOR (key: {:02X}{:02X}{:02X}{:02X})",
+                key4[0], key4[1], key4[2], key4[3]
+            ));
         }
     }
 
-    let key8: [u8; 8] = std::array::from_fn(|i| {
-        if i < 4 { magic[i] ^ data[i] } else { data[i] }
-    });
+    let key8: [u8; 8] = std::array::from_fn(|i| if i < 4 { magic[i] ^ data[i] } else { data[i] });
     if key8[0..4] != [0u8; 4] {
         let expected_ver_bytes: Vec<u8> = (4..8).map(|i| data[i] ^ key8[i]).collect();
-        let test_ver = i32::from_le_bytes([expected_ver_bytes[0], expected_ver_bytes[1], expected_ver_bytes[2], expected_ver_bytes[3]]);
+        let test_ver = i32::from_le_bytes([
+            expected_ver_bytes[0],
+            expected_ver_bytes[1],
+            expected_ver_bytes[2],
+            expected_ver_bytes[3],
+        ]);
         if test_ver > 0 && test_ver < 200 {
             let mut test = data.clone();
-            for (i, b) in test.iter_mut().enumerate() { *b ^= key8[i % 8]; }
+            for (i, b) in test.iter_mut().enumerate() {
+                *b ^= key8[i % 8];
+            }
             if is_valid_metadata_version(&test) {
                 *data = test;
-                return Some(format!("8-byte XOR (key: {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X})",
-                    key8[0], key8[1], key8[2], key8[3], key8[4], key8[5], key8[6], key8[7]));
+                return Some(format!(
+                    "8-byte XOR (key: {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X})",
+                    key8[0], key8[1], key8[2], key8[3], key8[4], key8[5], key8[6], key8[7]
+                ));
             }
         }
     }
 
     for key_len in [16usize, 32, 64, 128, 256] {
-        if data.len() < key_len * 2 { continue; }
-        let key: Vec<u8> = (0..key_len).map(|i| if i < 4 { magic[i] ^ data[i] } else { data[i] ^ 0 }).collect();
-        if key[0..4] == [0u8; 4] { continue; }
+        if data.len() < key_len * 2 {
+            continue;
+        }
+        let key: Vec<u8> = (0..key_len)
+            .map(|i| {
+                if i < 4 {
+                    magic[i] ^ data[i]
+                } else {
+                    data[i] ^ 0
+                }
+            })
+            .collect();
+        if key[0..4] == [0u8; 4] {
+            continue;
+        }
         let mut test = data[..8].to_vec();
-        for (i, b) in test.iter_mut().enumerate() { *b ^= key[i % key_len]; }
+        for (i, b) in test.iter_mut().enumerate() {
+            *b ^= key[i % key_len];
+        }
         if &test[0..4] == &magic && is_valid_metadata_version(&test) {
-            for (i, b) in data.iter_mut().enumerate() { *b ^= key[i % key_len]; }
+            for (i, b) in data.iter_mut().enumerate() {
+                *b ^= key[i % key_len];
+            }
             return Some(format!("{key_len}-byte rolling XOR key"));
         }
     }
@@ -341,8 +404,10 @@ fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
         }
         if &test[0..4] == &magic && is_valid_metadata_version(&test) {
             *data = test;
-            return Some(format!("Position-dependent XOR (base key: {:02X}{:02X}{:02X}{:02X})",
-                key4[0], key4[1], key4[2], key4[3]));
+            return Some(format!(
+                "Position-dependent XOR (base key: {:02X}{:02X}{:02X}{:02X})",
+                key4[0], key4[1], key4[2], key4[3]
+            ));
         }
     }
 
@@ -353,8 +418,10 @@ fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
         }
         if &test[0..4] == &magic && is_valid_metadata_version(&test) {
             *data = test;
-            return Some(format!("Masked position XOR (base key: {:02X}{:02X}{:02X}{:02X})",
-                key4[0], key4[1], key4[2], key4[3]));
+            return Some(format!(
+                "Masked position XOR (base key: {:02X}{:02X}{:02X}{:02X})",
+                key4[0], key4[1], key4[2], key4[3]
+            ));
         }
     }
 
@@ -366,8 +433,10 @@ fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
         }
         if &test[0..4] == &magic && is_valid_metadata_version(&test) {
             *data = test;
-            return Some(format!("Header-only XOR ({header_size} bytes, key: {:02X}{:02X}{:02X}{:02X})",
-                key4[0], key4[1], key4[2], key4[3]));
+            return Some(format!(
+                "Header-only XOR ({header_size} bytes, key: {:02X}{:02X}{:02X}{:02X})",
+                key4[0], key4[1], key4[2], key4[3]
+            ));
         }
     }
 
@@ -380,23 +449,32 @@ fn detect_unity_version(data: &[u8]) -> Option<String> {
     while i + 12 < data.len() {
         // "2022.3.24f1" (pre-Unity 6) or "6000.6.0a6" (Unity 6, which the engine
         // spells with its full major version number).
-        let looks_like_version = (data[i] == b'2' && data[i + 1] == b'0'
-            && data[i + 2].is_ascii_digit() && data[i + 3].is_ascii_digit()
+        let looks_like_version = (data[i] == b'2'
+            && data[i + 1] == b'0'
+            && data[i + 2].is_ascii_digit()
+            && data[i + 3].is_ascii_digit()
             && data[i + 4] == b'.'
             && data[i + 5].is_ascii_digit())
-            || (data[i] == b'6' && data[i + 1] == b'0' && data[i + 2] == b'0' && data[i + 3] == b'0'
+            || (data[i] == b'6'
+                && data[i + 1] == b'0'
+                && data[i + 2] == b'0'
+                && data[i + 3] == b'0'
                 && data[i + 4] == b'.'
                 && data[i + 5].is_ascii_digit());
         if looks_like_version {
             let max_len = std::cmp::min(24, data.len() - i);
-            let end = data[i..i + max_len].iter().position(|&b| {
-                !b.is_ascii_alphanumeric() && b != b'.'
-            }).unwrap_or(max_len);
+            let end = data[i..i + max_len]
+                .iter()
+                .position(|&b| !b.is_ascii_alphanumeric() && b != b'.')
+                .unwrap_or(max_len);
             let candidate = &data[i..i + end];
             if candidate.len() >= 8 && candidate.len() <= 20 {
                 if let Ok(s) = std::str::from_utf8(candidate) {
                     if s.chars().filter(|c| *c == '.').count() == 2
-                        && (s.contains('f') || s.contains('b') || s.contains('a') || s.contains('p'))
+                        && (s.contains('f')
+                            || s.contains('b')
+                            || s.contains('a')
+                            || s.contains('p'))
                         && s.ends_with(|c: char| c.is_ascii_digit())
                     {
                         if best.as_ref().map_or(true, |prev| s > prev.as_str()) {
@@ -414,7 +492,10 @@ fn detect_unity_version(data: &[u8]) -> Option<String> {
 }
 
 fn validate_hex(input: &String) -> std::result::Result<(), String> {
-    let trimmed = input.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let trimmed = input
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
     if trimmed.is_empty() {
         return Err("Address cannot be empty".into());
     }
@@ -424,7 +505,10 @@ fn validate_hex(input: &String) -> std::result::Result<(), String> {
 }
 
 fn parse_hex_input(input: &str) -> u64 {
-    let trimmed = input.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let trimmed = input
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
     u64::from_str_radix(trimmed, 16).unwrap_or(0)
 }
 
@@ -447,7 +531,9 @@ fn prompt_dump_address() -> Option<u64> {
     println!(
         "  {} {}",
         WARN,
-        style("This appears to be a memory dump file.").yellow().bold()
+        style("This appears to be a memory dump file.")
+            .yellow()
+            .bold()
     );
     println!(
         "  {}",
@@ -463,11 +549,7 @@ fn prompt_dump_address() -> Option<u64> {
         .unwrap_or_else(|_| "0".into());
 
     let addr = parse_hex_input(&input);
-    if addr != 0 {
-        Some(addr)
-    } else {
-        None
-    }
+    if addr != 0 { Some(addr) } else { None }
 }
 
 fn prompt_manual_addresses() -> Result<(u64, u64)> {
@@ -486,26 +568,39 @@ fn prompt_manual_addresses() -> Result<(u64, u64)> {
     let cr_input: String = Input::new()
         .with_prompt(format!("  {} CodeRegistration (hex)", style("→").cyan()))
         .validate_with(|input: &String| {
-            let trimmed = input.trim().trim_start_matches("0x").trim_start_matches("0X");
+            let trimmed = input
+                .trim()
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
             if trimmed.is_empty() || trimmed == "0" {
                 return Err("CodeRegistration address is required".to_string());
             }
             validate_hex(input)
         })
         .interact_text()
-        .map_err(|_| il2cpp_dumper::error::Error::Other("Failed to read CodeRegistration input".into()))?;
+        .map_err(|_| {
+            il2cpp_dumper::error::Error::Other("Failed to read CodeRegistration input".into())
+        })?;
 
     let mr_input: String = Input::new()
-        .with_prompt(format!("  {} MetadataRegistration (hex)", style("→").cyan()))
+        .with_prompt(format!(
+            "  {} MetadataRegistration (hex)",
+            style("→").cyan()
+        ))
         .validate_with(|input: &String| {
-            let trimmed = input.trim().trim_start_matches("0x").trim_start_matches("0X");
+            let trimmed = input
+                .trim()
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
             if trimmed.is_empty() || trimmed == "0" {
                 return Err("MetadataRegistration address is required".to_string());
             }
             validate_hex(input)
         })
         .interact_text()
-        .map_err(|_| il2cpp_dumper::error::Error::Other("Failed to read MetadataRegistration input".into()))?;
+        .map_err(|_| {
+            il2cpp_dumper::error::Error::Other("Failed to read MetadataRegistration input".into())
+        })?;
 
     let cr = parse_hex_input(&cr_input);
     let mr = parse_hex_input(&mr_input);
@@ -578,14 +673,20 @@ fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
     // `fix_program_segments`/`fix_dynamic_section` rewrite the mapping.
 
     let sp = spinner("Searching for registrations...");
-    let method_count = metadata.method_defs.iter().filter(|m| m.method_index >= 0).count();
+    let method_count = metadata
+        .method_defs
+        .iter()
+        .filter(|m| m.method_index >= 0)
+        .count();
     let type_count = metadata.type_defs.len();
     let image_count = metadata.image_defs.len();
 
     let mut helper = elf.get_section_helper(method_count, type_count, image_count);
     let code_reg = helper.find_code_registration();
     let metadata_reg = if metadata.variant == MetadataVariant::Codm {
-        helper.find_metadata_registration_codm().or_else(|| helper.find_metadata_registration())
+        helper
+            .find_metadata_registration_codm()
+            .or_else(|| helper.find_metadata_registration())
     } else {
         helper.find_metadata_registration()
     };
@@ -693,7 +794,9 @@ fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
                 located
             ));
         } else {
-            print_warn("Could not locate code-gen modules in the dump; method addresses will be -1");
+            print_warn(
+                "Could not locate code-gen modules in the dump; method addresses will be -1",
+            );
         }
     }
     il2cpp.codm = il2cpp.codm || resolve_codm(config, metadata);
@@ -749,9 +852,11 @@ fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
     }
     il2cpp.exported_symbols = elf_exports.iter().map(|(n, _)| n.clone()).collect();
     for (name, addr) in elf_exports {
+        let rva = il2cpp.get_rva(addr);
         if name.starts_with("il2cpp_") || name.starts_with("mono_") {
-            let rva = il2cpp.get_rva(addr);
             il2cpp.api_export_rvas.insert(name, rva);
+        } else if name.starts_with("__cxa") || name.starts_with("___cxa") {
+            il2cpp.cxa_func_rvas.insert(rva, name);
         }
     }
     // PLT/GOT relocations (JUMP_SLOT/GLOB_DAT) name every imported slot —
@@ -768,7 +873,10 @@ fn init_elf(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
 
 fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp> {
     let mut pe = Pe::new(data)?;
-    print_detection(&format!("PE{} format", if pe.is_32bit { "32" } else { "64" }));
+    print_detection(&format!(
+        "PE{} format",
+        if pe.is_32bit { "32" } else { "64" }
+    ));
 
     let version = if config.force_il2cpp_version {
         config.force_version
@@ -787,7 +895,11 @@ fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp
     }
 
     let sp = spinner("Searching for registrations...");
-    let method_count = metadata.method_defs.iter().filter(|m| m.method_index >= 0).count();
+    let method_count = metadata
+        .method_defs
+        .iter()
+        .filter(|m| m.method_index >= 0)
+        .count();
     let type_count = metadata.type_defs.len();
     let image_count = metadata.image_defs.len();
     let mu_count = metadata.metadata_usages_count;
@@ -805,7 +917,8 @@ fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp
     }
 
     if cr_addr == 0 || mr_addr == 0 {
-        let mut helper = pe.get_section_helper(method_count, type_count, mu_count, image_count, version);
+        let mut helper =
+            pe.get_section_helper(method_count, type_count, mu_count, image_count, version);
         let code_reg = helper.find_code_registration();
         let metadata_reg = helper.find_metadata_registration();
         sp.finish_and_clear();
@@ -826,13 +939,15 @@ fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp
     }
 
     let pe_image_base = pe.image_base();
-    let va_segments: Vec<VaSegment> = pe.sections.iter().map(|s| {
-        VaSegment {
+    let va_segments: Vec<VaSegment> = pe
+        .sections
+        .iter()
+        .map(|s| VaSegment {
             vaddr: s.virtual_address as u64 + pe_image_base,
             memsz: s.virtual_size as u64,
             offset: s.pointer_to_raw_data as u64,
-        }
-    }).collect();
+        })
+        .collect();
 
     let mut il2cpp = Il2Cpp::new(pe.stream.clone(), version, pe.is_32bit);
     il2cpp.va_segments = va_segments;
@@ -907,7 +1022,7 @@ fn init_pe(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp
 }
 
 fn init_macho_fat(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp> {
-    use il2cpp_dumper::formats::macho::{parse_fat, extract_fat_slice, MH_MAGIC_64};
+    use il2cpp_dumper::formats::macho::{MH_MAGIC_64, extract_fat_slice, parse_fat};
 
     let arches = parse_fat(&data)?;
     print_detection(&format!("Fat Mach-O with {} architectures", arches.len()));
@@ -939,7 +1054,10 @@ fn init_macho_fat(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result
 fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cpp> {
     let magic = read_magic_u32(&data);
     let is_64 = magic == MAGIC_MACHO64;
-    print_detection(&format!("Mach-O {} format", if is_64 { "64-bit" } else { "32-bit" }));
+    print_detection(&format!(
+        "Mach-O {} format",
+        if is_64 { "64-bit" } else { "32-bit" }
+    ));
 
     let mut macho = if metadata.variant == MetadataVariant::Codm {
         MachO::new_with_codm_fixups(data, !is_64, true)?
@@ -958,7 +1076,11 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
     print_info("IL2CPP Version", &version.to_string());
 
     let sp = spinner("Searching for registrations...");
-    let method_count = metadata.method_defs.iter().filter(|m| m.method_index >= 0).count();
+    let method_count = metadata
+        .method_defs
+        .iter()
+        .filter(|m| m.method_index >= 0)
+        .count();
     let type_count = metadata.type_defs.len();
     let image_count = metadata.image_defs.len();
     let mu_count = metadata.metadata_usages_count;
@@ -987,10 +1109,13 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
     }
 
     if cr_addr == 0 || mr_addr == 0 {
-        let mut helper = macho.get_section_helper(method_count, type_count, mu_count, image_count, version);
+        let mut helper =
+            macho.get_section_helper(method_count, type_count, mu_count, image_count, version);
         let code_reg = helper.find_code_registration();
         let metadata_reg = if metadata.variant == MetadataVariant::Codm {
-            helper.find_metadata_registration_codm().or_else(|| helper.find_metadata_registration())
+            helper
+                .find_metadata_registration_codm()
+                .or_else(|| helper.find_metadata_registration())
         } else {
             helper.find_metadata_registration()
         };
@@ -1011,13 +1136,15 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
         mr_addr = mr;
     }
 
-    let va_segments: Vec<VaSegment> = macho.segments.iter().map(|s| {
-        VaSegment {
+    let va_segments: Vec<VaSegment> = macho
+        .segments
+        .iter()
+        .map(|s| VaSegment {
             vaddr: s.vmaddr,
             memsz: s.vmsize,
             offset: s.fileoff,
-        }
-    }).collect();
+        })
+        .collect();
 
     // Helper: try a (cr, mr) pair with il2cpp.init and tell the caller
     // whether it actually parsed cleanly. The auto-detection on Mach-O
@@ -1073,10 +1200,14 @@ fn init_macho(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2
 
     if macho.is_32bit {
         for ptr in il2cpp.method_pointers.iter_mut() {
-            if *ptr > 0 { *ptr -= 1; }
+            if *ptr > 0 {
+                *ptr -= 1;
+            }
         }
         for ptr in il2cpp.custom_attribute_generators.iter_mut() {
-            if *ptr > 0 { *ptr -= 1; }
+            if *ptr > 0 {
+                *ptr -= 1;
+            }
         }
     }
 
@@ -1117,12 +1248,17 @@ fn init_nso(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
     print_info("IL2CPP Version", &version.to_string());
 
     let sp = spinner("Searching for registrations...");
-    let method_count = metadata.method_defs.iter().filter(|m| m.method_index >= 0).count();
+    let method_count = metadata
+        .method_defs
+        .iter()
+        .filter(|m| m.method_index >= 0)
+        .count();
     let type_count = metadata.type_defs.len();
     let image_count = metadata.image_defs.len();
     let mu_count = metadata.metadata_usages_count;
 
-    let mut helper = nso.get_section_helper(method_count, type_count, mu_count, image_count, version);
+    let mut helper =
+        nso.get_section_helper(method_count, type_count, mu_count, image_count, version);
     let code_reg = helper.find_code_registration();
     let metadata_reg = helper.find_metadata_registration();
     sp.finish_and_clear();
@@ -1137,7 +1273,11 @@ fn init_nso(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2Cp
 
     let stream_len = nso.stream.data().len() as u64;
     let mut il2cpp = Il2Cpp::new(nso.stream.clone(), version, nso.is_32bit);
-    il2cpp.va_segments = vec![VaSegment { vaddr: 0, memsz: stream_len, offset: 0 }];
+    il2cpp.va_segments = vec![VaSegment {
+        vaddr: 0,
+        memsz: stream_len,
+        offset: 0,
+    }];
     il2cpp.codm = resolve_codm(config, metadata);
     il2cpp.init_with_auto_plus(cr_addr, mr_addr, &|addr| nso.map_vatr(addr), false)?;
     il2cpp.data_sections = nso.data_search_sections();
@@ -1171,12 +1311,17 @@ fn init_wasm(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2C
     print_info("IL2CPP Version", &version.to_string());
 
     let sp = spinner("Searching for registrations...");
-    let method_count = metadata.method_defs.iter().filter(|m| m.method_index >= 0).count();
+    let method_count = metadata
+        .method_defs
+        .iter()
+        .filter(|m| m.method_index >= 0)
+        .count();
     let type_count = metadata.type_defs.len();
     let image_count = metadata.image_defs.len();
     let mu_count = metadata.metadata_usages_count;
 
-    let mut helper = wasm.get_section_helper(method_count, type_count, mu_count, image_count, version);
+    let mut helper =
+        wasm.get_section_helper(method_count, type_count, mu_count, image_count, version);
     let code_reg = helper.find_code_registration();
     let metadata_reg = helper.find_metadata_registration();
     sp.finish_and_clear();
@@ -1191,7 +1336,11 @@ fn init_wasm(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result<Il2C
 
     let stream_len = wasm.stream.data().len() as u64;
     let mut il2cpp = Il2Cpp::new(wasm.stream.clone(), version, wasm.is_32bit);
-    il2cpp.va_segments = vec![VaSegment { vaddr: 0, memsz: stream_len, offset: 0 }];
+    il2cpp.va_segments = vec![VaSegment {
+        vaddr: 0,
+        memsz: stream_len,
+        offset: 0,
+    }];
     // WebAssembly bytecode, not machine code — see `Architecture::Wasm`.
     // Without this the 32-bit/non-PE default (`Arm32`) applies and the ARM
     // disassembler happily decodes wasm bytes as instructions.
@@ -1281,7 +1430,7 @@ fn prompt_pseudo_c_selection(
     // Clear any stale keystrokes so the first prompt actually waits for input.
     drain_pending_input();
 
-    use il2cpp_dumper::output::pseudo_c::{list_filter_tree, PseudoAssemblyEntry};
+    use il2cpp_dumper::output::pseudo_c::{PseudoAssemblyEntry, list_filter_tree};
 
     let tree = list_filter_tree(il2cpp, metadata, executor);
     if tree.is_empty() {
@@ -1507,8 +1656,10 @@ fn prompt_pseudo_c_selection(
     if chosen_cls.is_empty() || chosen_cls.len() == cls_counts.len() {
         return; // keep the namespace-level filter
     }
-    config.dump_pseudo_c_include_types =
-        chosen_cls.iter().map(|&i| cls_counts[i].0.clone()).collect();
+    config.dump_pseudo_c_include_types = chosen_cls
+        .iter()
+        .map(|&i| cls_counts[i].0.clone())
+        .collect();
     let cls_total: usize = chosen_cls.iter().map(|&i| cls_counts[i].1).sum();
     print_success(&format!(
         "Selected {} of {} classes ({} methods)",
@@ -1517,7 +1668,6 @@ fn prompt_pseudo_c_selection(
         cls_total
     ));
 }
-
 
 fn run() -> Result<()> {
     let start_time = Instant::now();
@@ -1529,14 +1679,17 @@ fn run() -> Result<()> {
         CLI_DUMP_BASE.store(parse_hex_input(base), Ordering::Relaxed);
     }
 
-    let (il2cpp_binary_path, metadata_path, output_dir_arg) = cli.resolve()
-        .map_err(il2cpp_dumper::error::Error::Other)?;
+    let (il2cpp_binary_path, metadata_path, output_dir_arg) =
+        cli.resolve().map_err(il2cpp_dumper::error::Error::Other)?;
 
     print_banner();
 
     let mut config = if let Some(config_path) = &cli.config {
         Config::load_from_file(config_path).unwrap_or_else(|e| {
-            print_warn(&format!("Failed to load config from {}: {}", config_path, e));
+            print_warn(&format!(
+                "Failed to load config from {}: {}",
+                config_path, e
+            ));
             Config::default()
         })
     } else if std::path::Path::new("config.json").exists() {
@@ -1550,10 +1703,18 @@ fn run() -> Result<()> {
     // load_from_file already reconciles; defaults / failed loads still need it.
     config.reconcile_method_body_mode();
 
-    if cli.codm { config.codm = true; }
-    if cli.dump_static_metadata { config.dump_static_field_metadata = true; }
-    if cli.no_dump_static_metadata { config.dump_static_field_metadata = false; }
-    if cli.force_dump { config.force_dump = true; }
+    if cli.codm {
+        config.codm = true;
+    }
+    if cli.dump_static_metadata {
+        config.dump_static_field_metadata = true;
+    }
+    if cli.no_dump_static_metadata {
+        config.dump_static_field_metadata = false;
+    }
+    if cli.force_dump {
+        config.force_dump = true;
+    }
     if let Some(raw) = &cli.method_body_mode {
         match MethodBodyMode::parse(raw) {
             Some(mode) => config.set_method_body_mode(mode),
@@ -1571,12 +1732,24 @@ fn run() -> Result<()> {
     if let Some(size) = cli.pseudo_max_body_size {
         config.dump_pseudo_c_max_body_size = size;
     }
-    if cli.generate_dummy_dll { config.generate_dummy_dll = true; }
-    if cli.no_generate_dummy_dll { config.generate_dummy_dll = false; }
-    if cli.il_recovery || cli.cs { config.il_recovery = true; }
-    if cli.no_il_recovery { config.il_recovery = false; }
-    if cli.no_annotate_recovery { config.annotate_recovery = false; }
-    if cli.pseudo_select { config.dump_pseudo_c_interactive = true; }
+    if cli.generate_dummy_dll {
+        config.generate_dummy_dll = true;
+    }
+    if cli.no_generate_dummy_dll {
+        config.generate_dummy_dll = false;
+    }
+    if cli.il_recovery || cli.cs {
+        config.il_recovery = true;
+    }
+    if cli.no_il_recovery {
+        config.il_recovery = false;
+    }
+    if cli.no_annotate_recovery {
+        config.annotate_recovery = false;
+    }
+    if cli.pseudo_select {
+        config.dump_pseudo_c_interactive = true;
+    }
     if config.il_recovery && !config.generate_dummy_dll {
         print_warn("--il-recovery needs DummyDll output; enabling generateDummyDll");
         config.generate_dummy_dll = true;
@@ -1589,7 +1762,10 @@ fn run() -> Result<()> {
     while base_dir.join(format!("Dump{dump_num}")).exists() {
         dump_num += 1;
     }
-    let output_dir = base_dir.join(format!("Dump{dump_num}")).to_string_lossy().to_string();
+    let output_dir = base_dir
+        .join(format!("Dump{dump_num}"))
+        .to_string_lossy()
+        .to_string();
     fs::create_dir_all(&output_dir).ok();
     println!(
         "  {}{} {}",
@@ -1657,15 +1833,15 @@ fn run() -> Result<()> {
     }
 
     let sp = spinner("Parsing metadata structures...");
-    let mut metadata = Metadata::new_with_options(
-        metadata_bytes,
-        unity_version_str.as_deref(),
-        config.codm,
-    )?;
+    let mut metadata =
+        Metadata::new_with_options(metadata_bytes, unity_version_str.as_deref(), config.codm)?;
     sp.finish_and_clear();
     print_info("Metadata Version", &metadata.version.to_string());
     print_info("Type Definitions", &format!("{}", metadata.type_defs.len()));
-    print_info("Method Definitions", &format!("{}", metadata.method_defs.len()));
+    print_info(
+        "Method Definitions",
+        &format!("{}", metadata.method_defs.len()),
+    );
 
     println!();
     println!(
@@ -1685,9 +1861,9 @@ fn run() -> Result<()> {
         "wasm" => init_wasm(il2cpp_bytes, &metadata, &config)?,
         _ => {
             let magic = read_magic_u32(&il2cpp_bytes);
-            return Err(il2cpp_dumper::error::Error::Other(
-                format!("Unsupported binary format (magic: 0x{magic:08X})")
-            ));
+            return Err(il2cpp_dumper::error::Error::Other(format!(
+                "Unsupported binary format (magic: 0x{magic:08X})"
+            )));
         }
     };
 
@@ -1710,7 +1886,8 @@ fn run() -> Result<()> {
             if byval_idx < il2cpp.types.len() {
                 let il2cpp_type = &il2cpp.types[byval_idx];
                 let type_handle = il2cpp_type.type_handle();
-                il2cpp.image_base = type_handle.wrapping_sub(metadata.header.type_definitions_offset as u64);
+                il2cpp.image_base =
+                    type_handle.wrapping_sub(metadata.header.type_definitions_offset as u64);
             }
         }
     }
@@ -1747,8 +1924,7 @@ fn run() -> Result<()> {
     // only appears when the user explicitly asks for it — `--pseudo-select` or
     // `"csharpInteractive": true` — and never when a filter is already set
     // or `--no-pseudo-prompt` was given.
-    let bodies_enabled =
-        config.dump_pseudo_c || config.dump_disassembly || config.il_recovery;
+    let bodies_enabled = config.dump_pseudo_c || config.dump_disassembly || config.il_recovery;
     let want_interactive = bodies_enabled
         && (cli.pseudo_select || config.dump_pseudo_c_interactive)
         && !cli.no_pseudo_prompt
@@ -1797,15 +1973,23 @@ fn run() -> Result<()> {
         }
     }
 
-    Il2CppDecompiler::decompile(&mut executor, &mut metadata, &mut il2cpp, &config, &il2cpp_binary_path, &output_dir, |msg| {
-        sp_dump.set_message(msg.to_string());
-        // Some terminals (especially Windows / WSL wrappers) don't render
-        // indicatif's in-place `\r` message redraws, so the spinner looks
-        // frozen on "Generating dump.cs..." even though it is working. Print
-        // every milestone as a permanent, scrolling line too — it cannot be
-        // hidden, and it tells the user exactly which phase is running.
-        sp_dump.println(format!("  {msg}"));
-    })?;
+    Il2CppDecompiler::decompile(
+        &mut executor,
+        &mut metadata,
+        &mut il2cpp,
+        &config,
+        &il2cpp_binary_path,
+        &output_dir,
+        |msg| {
+            sp_dump.set_message(msg.to_string());
+            // Some terminals (especially Windows / WSL wrappers) don't render
+            // indicatif's in-place `\r` message redraws, so the spinner looks
+            // frozen on "Generating dump.cs..." even though it is working. Print
+            // every milestone as a permanent, scrolling line too — it cannot be
+            // hidden, and it tells the user exactly which phase is running.
+            sp_dump.println(format!("  {msg}"));
+        },
+    )?;
     sp_dump.finish_and_clear();
     print_success("dump.cs generated");
 
@@ -1814,16 +1998,20 @@ fn run() -> Result<()> {
     let static_catalog = if config.dump_static_field_metadata {
         let sp = spinner("Analyzing thread-static / FieldRVA metadata...");
         let catalog = il2cpp_dumper::output::static_field_exporter::StaticFieldCatalog::collect(
-            &mut executor, &mut metadata, &mut il2cpp, &config,
+            &mut executor,
+            &mut metadata,
+            &mut il2cpp,
+            &config,
         )?;
         il2cpp_dumper::output::static_field_exporter::StaticFieldExporter::write_document(
-            &catalog, &il2cpp, &output_dir,
+            &catalog,
+            &il2cpp,
+            &output_dir,
         )?;
         sp.finish_and_clear();
         print_success(&format!(
             "static_metadata.json generated ({} thread-static, {} FieldRVA)",
-            catalog.summary.thread_static_count,
-            catalog.summary.field_rva_count,
+            catalog.summary.thread_static_count, catalog.summary.field_rva_count,
         ));
         generated_files.push("static_metadata.json".into());
         Some(catalog)
@@ -1834,19 +2022,32 @@ fn run() -> Result<()> {
     if config.generate_struct {
         let sp = spinner("Generating structs...");
         StructGenerator::write_all(
-            &mut executor, &mut metadata, &mut il2cpp, &config, &output_dir,
+            &mut executor,
+            &mut metadata,
+            &mut il2cpp,
+            &config,
+            &output_dir,
             static_catalog.as_ref(),
         )?;
         il2cpp_dumper::output::embedded_scripts::write_scripts(std::path::Path::new(&output_dir))?;
         sp.finish_and_clear();
         print_success("script.json, il2cpp.h, il2cpp-functions.h, stringliteral.json generated");
-        generated_files.extend(["script.json".into(), "il2cpp.h".into(), "il2cpp-functions.h".into(), "stringliteral.json".into()]);
+        generated_files.extend([
+            "script.json".into(),
+            "il2cpp.h".into(),
+            "il2cpp-functions.h".into(),
+            "stringliteral.json".into(),
+        ]);
     }
 
     if config.generate_dummy_dll {
         let sp = spinner("Generating dummy DLLs...");
         il2cpp_dumper::output::dummy_assembly_generator::generate_dummy_dlls(
-            &mut executor, &mut metadata, &mut il2cpp, &config, &output_dir,
+            &mut executor,
+            &mut metadata,
+            &mut il2cpp,
+            &config,
+            &output_dir,
         )?;
         sp.finish_and_clear();
         print_success("Dummy DLL files generated");
@@ -1857,7 +2058,11 @@ fn run() -> Result<()> {
         let sp = spinner("Generating generics dump...");
         let generics_path = std::path::Path::new(&output_dir).join("generics_dump.txt");
         if let Err(e) = il2cpp_dumper::output::generics::dump_generics(
-            &generics_path.to_string_lossy(), &mut metadata, &mut il2cpp, &mut executor, &config
+            &generics_path.to_string_lossy(),
+            &mut metadata,
+            &mut il2cpp,
+            &mut executor,
+            &config,
         ) {
             sp.finish_and_clear();
             print_warn(&format!("Failed to generate generics_dump.txt: {}", e));
@@ -1904,14 +2109,18 @@ fn run() -> Result<()> {
             "  {} {} {}",
             style("→").green().bold(),
             style("Decompile as C#:").dim(),
-            style(format!("open {output_dir}/DummyDll in dnSpy / ILSpy")).green().bold()
+            style(format!("open {output_dir}/DummyDll in dnSpy / ILSpy"))
+                .green()
+                .bold()
         );
     }
     println!(
         "  {}{} {}",
         ROCKET,
         style("Elapsed:").dim(),
-        style(format!("{:.2}s", elapsed.as_secs_f64())).magenta().bold()
+        style(format!("{:.2}s", elapsed.as_secs_f64()))
+            .magenta()
+            .bold()
     );
     println!(
         "  {}",
@@ -1925,11 +2134,7 @@ fn run() -> Result<()> {
 fn main() {
     if let Err(e) = run() {
         eprintln!();
-        eprintln!(
-            "  {} {}",
-            style("✗ ERROR:").red().bold(),
-            style(&e).red()
-        );
+        eprintln!("  {} {}", style("✗ ERROR:").red().bold(), style(&e).red());
         eprintln!();
         process::exit(1);
     }

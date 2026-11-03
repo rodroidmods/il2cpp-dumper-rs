@@ -55,21 +55,29 @@ impl PartialOrd for UnityVersion {
 impl Ord for UnityVersion {
     fn cmp(&self, other: &Self) -> Ordering {
         let mut cmp = self.major.cmp(&other.major);
-        if cmp != Ordering::Equal { return cmp; }
-        
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+
         cmp = self.minor.cmp(&other.minor);
-        if cmp != Ordering::Equal { return cmp; }
-        
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+
         cmp = self.update.cmp(&other.update);
-        if cmp != Ordering::Equal { return cmp; }
-        
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+
         if self.build_type == BuildType::Unspecified || other.build_type == BuildType::Unspecified {
             return Ordering::Equal;
         }
-        
+
         cmp = self.build_type.cmp(&other.build_type);
-        if cmp != Ordering::Equal { return cmp; }
-        
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+
         self.build_number.cmp(&other.build_number)
     }
 }
@@ -79,9 +87,17 @@ impl FromStr for UnityVersion {
 
     fn from_str(version_string: &str) -> Result<Self, Self::Err> {
         let mut parts = version_string.split('.');
-        let major = parts.next().unwrap_or("").parse::<i32>().map_err(|_| "Invalid major version")?;
-        let minor = parts.next().unwrap_or("").parse::<i32>().map_err(|_| "Invalid minor version")?;
-        
+        let major = parts
+            .next()
+            .unwrap_or("")
+            .parse::<i32>()
+            .map_err(|_| "Invalid major version")?;
+        let minor = parts
+            .next()
+            .unwrap_or("")
+            .parse::<i32>()
+            .map_err(|_| "Invalid minor version")?;
+
         let mut update = 0;
         let mut build_type = BuildType::Unspecified;
         let mut build_number = 0;
@@ -97,7 +113,7 @@ impl FromStr for UnityVersion {
 
             if let Some(idx) = alpha_idx {
                 update = rest[..idx].parse::<i32>().unwrap_or(0);
-                
+
                 let mut num_idx = None;
                 for (i, c) in rest[idx..].char_indices() {
                     if c.is_ascii_digit() {
@@ -105,7 +121,7 @@ impl FromStr for UnityVersion {
                         break;
                     }
                 }
-                
+
                 if let Some(n_idx) = num_idx {
                     build_type = BuildType::from_str_safe(&rest[idx..n_idx]);
                     build_number = rest[n_idx..].parse::<i32>().unwrap_or(0);
@@ -151,9 +167,19 @@ impl UnityVersionRange {
     }
 
     pub fn intersect(&self, other: &UnityVersionRange) -> Option<UnityVersionRange> {
-        let highest_low = if self.min > other.min { &self.min } else { &other.min };
+        let highest_low = if self.min > other.min {
+            &self.min
+        } else {
+            &other.min
+        };
         let lowest_high = match (&self.max, &other.max) {
-            (Some(max1), Some(max2)) => if max1 < max2 { Some(max1) } else { Some(max2) },
+            (Some(max1), Some(max2)) => {
+                if max1 < max2 {
+                    Some(max1)
+                } else {
+                    Some(max2)
+                }
+            }
             (Some(max1), None) => Some(max1),
             (None, Some(max2)) => Some(max2),
             (None, None) => None,
@@ -174,8 +200,11 @@ impl UnityVersionRange {
     pub fn from_filename(header_filename: &str) -> Self {
         let base_name = header_filename.trim_end_matches(".h");
         let parts: Vec<&str> = base_name.split('-').collect();
-        
-        let actual_parts = if parts.len() > 1 && parts[0].chars().any(|c| c.is_ascii_digit()) && parts[0].len() <= 4 {
+
+        let actual_parts = if parts.len() > 1
+            && parts[0].chars().any(|c| c.is_ascii_digit())
+            && parts[0].len() <= 4
+        {
             &parts[1..]
         } else {
             &parts[0..]

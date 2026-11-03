@@ -1,10 +1,10 @@
+use super::structures::*;
+use crate::error::{Error, Result};
+use crate::io::{BinaryStream, checked_array_len, signed_size_to_u64};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::sync::Mutex;
-use crate::io::{checked_array_len, signed_size_to_u64, BinaryStream};
-use crate::error::{Error, Result};
-use super::structures::*;
 
 pub const METADATA_MAGIC: u32 = 0xFAB11BAF;
 
@@ -203,9 +203,13 @@ impl Metadata {
         if version_raw < 16 {
             return Err(Error::UnsupportedVersion(version_raw));
         }
-        let known_versions = [16, 17, 19, 20, 21, 22, 24, 27, 29, 31, 33, 35, 38, 39, 104, 105, 106, 107, 108];
+        let known_versions = [
+            16, 17, 19, 20, 21, 22, 24, 27, 29, 31, 33, 35, 38, 39, 104, 105, 106, 107, 108,
+        ];
         if !known_versions.contains(&version_raw) {
-            eprintln!("Warning: Unknown metadata version {version_raw}. Attempting anyway, results may be incorrect.");
+            eprintln!(
+                "Warning: Unknown metadata version {version_raw}. Attempting anyway, results may be incorrect."
+            );
         }
         if version_raw >= 38 {
             crate::output::note(&format!(
@@ -316,22 +320,44 @@ impl Metadata {
     /// Catch encrypted/garbage headers early: section offset+size must fit in the file.
     fn validate_header_ranges(header: &Il2CppGlobalMetadataHeader, file_len: u64) -> Result<()> {
         let sections: [(&str, i32, i32); 10] = [
-            ("string_literal", header.string_literal_offset, header.string_literal_size),
+            (
+                "string_literal",
+                header.string_literal_offset,
+                header.string_literal_size,
+            ),
             ("string", header.string_offset, header.string_size),
-            ("type_definitions", header.type_definitions_offset, header.type_definitions_size),
+            (
+                "type_definitions",
+                header.type_definitions_offset,
+                header.type_definitions_size,
+            ),
             ("methods", header.methods_offset, header.methods_size),
             ("fields", header.fields_offset, header.fields_size),
-            ("parameters", header.parameters_offset, header.parameters_size),
+            (
+                "parameters",
+                header.parameters_offset,
+                header.parameters_size,
+            ),
             ("images", header.images_offset, header.images_size),
-            ("assemblies", header.assemblies_offset, header.assemblies_size),
-            ("properties", header.properties_offset, header.properties_size),
+            (
+                "assemblies",
+                header.assemblies_offset,
+                header.assemblies_size,
+            ),
+            (
+                "properties",
+                header.properties_offset,
+                header.properties_size,
+            ),
             ("events", header.events_offset, header.events_size),
         ];
 
         let mut bad = Vec::new();
         for (name, off, size) in sections {
             if off < 0 || size < 0 {
-                bad.push(format!("{name}: negative offset/size (off={off}, size={size})"));
+                bad.push(format!(
+                    "{name}: negative offset/size (off={off}, size={size})"
+                ));
                 continue;
             }
             if size == 0 {
@@ -402,7 +428,11 @@ impl Metadata {
             ($t:ty, $off:expr, $size:expr, $count:expr) => {{
                 let off = signed_size_to_u64($off, stringify!($off))?;
                 let size = signed_size_to_u64($size, stringify!($size))?;
-                let cnt = if v38 && $count > 0 { Some($count as usize) } else { None };
+                let cnt = if v38 && $count > 0 {
+                    Some($count as usize)
+                } else {
+                    None
+                };
                 self.read_metadata_array::<$t>(off, size, cnt)?
             }};
         }
@@ -416,25 +446,55 @@ impl Metadata {
             }
         }
 
-        self.assembly_defs = load!(Il2CppAssemblyDefinition, h.assemblies_offset, h.assemblies_size, 0);
+        self.assembly_defs = load!(
+            Il2CppAssemblyDefinition,
+            h.assemblies_offset,
+            h.assemblies_size,
+            0
+        );
 
         if v38 {
-            let (type_defs, td_offsets) = self.read_metadata_array_with_offsets::<Il2CppTypeDefinition>(
-                signed_size_to_u64(h.type_definitions_offset, "type_definitions_offset")?,
-                signed_size_to_u64(h.type_definitions_size, "type_definitions_size")?,
-                if h.type_definitions_count > 0 { Some(h.type_definitions_count as usize) } else { None },
-            )?;
+            let (type_defs, td_offsets) = self
+                .read_metadata_array_with_offsets::<Il2CppTypeDefinition>(
+                    signed_size_to_u64(h.type_definitions_offset, "type_definitions_offset")?,
+                    signed_size_to_u64(h.type_definitions_size, "type_definitions_size")?,
+                    if h.type_definitions_count > 0 {
+                        Some(h.type_definitions_count as usize)
+                    } else {
+                        None
+                    },
+                )?;
             self.type_defs = type_defs;
             self.type_def_offset_to_index = td_offsets;
         } else {
-            self.type_defs = load!(Il2CppTypeDefinition, h.type_definitions_offset, h.type_definitions_size, h.type_definitions_count);
+            self.type_defs = load!(
+                Il2CppTypeDefinition,
+                h.type_definitions_offset,
+                h.type_definitions_size,
+                h.type_definitions_count
+            );
         }
 
         self.method_defs = self.load_method_defs(&h)?;
-        self.parameter_defs = load!(Il2CppParameterDefinition, h.parameters_offset, h.parameters_size, h.parameters_count);
-        self.field_defs = load!(Il2CppFieldDefinition, h.fields_offset, h.fields_size, h.fields_count);
+        self.parameter_defs = load!(
+            Il2CppParameterDefinition,
+            h.parameters_offset,
+            h.parameters_size,
+            h.parameters_count
+        );
+        self.field_defs = load!(
+            Il2CppFieldDefinition,
+            h.fields_offset,
+            h.fields_size,
+            h.fields_count
+        );
 
-        let mut field_defaults_vec = load!(Il2CppFieldDefaultValue, h.field_default_values_offset, h.field_default_values_size, 0);
+        let mut field_defaults_vec = load!(
+            Il2CppFieldDefaultValue,
+            h.field_default_values_offset,
+            h.field_default_values_size,
+            0
+        );
         // v104 appends a dummy trailing entry with a field index of -1; v106 changed
         // it to int.MaxValue. Neither is a field, and the old code only tested the
         // last entry for -1 *after* dropping every negative index, so on v106 the
@@ -447,7 +507,12 @@ impl Metadata {
             "field_default_values",
         );
 
-        let mut param_defaults = load!(Il2CppParameterDefaultValue, h.parameter_default_values_offset, h.parameter_default_values_size, 0);
+        let mut param_defaults = load!(
+            Il2CppParameterDefaultValue,
+            h.parameter_default_values_offset,
+            h.parameter_default_values_size,
+            0
+        );
         param_defaults.retain(|v| v.parameter_index >= 0);
         self.param_default_values = map_by_key_dedup(
             param_defaults,
@@ -455,7 +520,12 @@ impl Metadata {
             "parameter_default_values",
         );
 
-        self.property_defs = load!(Il2CppPropertyDefinition, h.properties_offset, h.properties_size, h.properties_count);
+        self.property_defs = load!(
+            Il2CppPropertyDefinition,
+            h.properties_offset,
+            h.properties_size,
+            h.properties_count
+        );
 
         self.interface_indices = {
             let type_idx_sz = IndexWidths::get_type_index_size(&h).max(1);
@@ -497,61 +567,132 @@ impl Metadata {
         {
             let size = signed_size_to_u64(h.nested_types_size, "nested_types_size")?;
             let off = signed_size_to_u64(h.nested_types_offset, "nested_types_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "nested_types")?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "nested_types",
+            )?;
             self.nested_type_indices = self.stream.read_i32_array(off, count)?;
         }
 
-        self.event_defs = load!(Il2CppEventDefinition, h.events_offset, h.events_size, h.events_count);
-        self.generic_containers = load!(Il2CppGenericContainer, h.generic_containers_offset, h.generic_containers_size, h.generic_containers_count);
+        self.event_defs = load!(
+            Il2CppEventDefinition,
+            h.events_offset,
+            h.events_size,
+            h.events_count
+        );
+        self.generic_containers = load!(
+            Il2CppGenericContainer,
+            h.generic_containers_offset,
+            h.generic_containers_size,
+            h.generic_containers_count
+        );
 
         if v38 {
-            let (generic_params, gp_offsets) = self.read_metadata_array_with_offsets::<Il2CppGenericParameter>(
-                signed_size_to_u64(h.generic_parameters_offset, "generic_parameters_offset")?,
-                signed_size_to_u64(h.generic_parameters_size, "generic_parameters_size")?,
-                if h.generic_parameters_count > 0 { Some(h.generic_parameters_count as usize) } else { None },
-            )?;
+            let (generic_params, gp_offsets) = self
+                .read_metadata_array_with_offsets::<Il2CppGenericParameter>(
+                    signed_size_to_u64(h.generic_parameters_offset, "generic_parameters_offset")?,
+                    signed_size_to_u64(h.generic_parameters_size, "generic_parameters_size")?,
+                    if h.generic_parameters_count > 0 {
+                        Some(h.generic_parameters_count as usize)
+                    } else {
+                        None
+                    },
+                )?;
             self.generic_parameters = generic_params;
             self.generic_param_offset_to_index = gp_offsets;
         } else {
-            self.generic_parameters = load!(Il2CppGenericParameter, h.generic_parameters_offset, h.generic_parameters_size, h.generic_parameters_count);
+            self.generic_parameters = load!(
+                Il2CppGenericParameter,
+                h.generic_parameters_offset,
+                h.generic_parameters_size,
+                h.generic_parameters_count
+            );
         }
 
         {
-            let size = signed_size_to_u64(h.generic_parameter_constraints_size, "generic_parameter_constraints_size")?;
-            let off = signed_size_to_u64(h.generic_parameter_constraints_offset, "generic_parameter_constraints_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "generic_parameter_constraints")?;
+            let size = signed_size_to_u64(
+                h.generic_parameter_constraints_size,
+                "generic_parameter_constraints_size",
+            )?;
+            let off = signed_size_to_u64(
+                h.generic_parameter_constraints_offset,
+                "generic_parameter_constraints_offset",
+            )?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "generic_parameter_constraints",
+            )?;
             self.constraint_indices = self.stream.read_i32_array(off, count)?;
         }
 
         {
             let size = signed_size_to_u64(h.vtable_methods_size, "vtable_methods_size")?;
             let off = signed_size_to_u64(h.vtable_methods_offset, "vtable_methods_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "vtable_methods")?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "vtable_methods",
+            )?;
             self.vtable_methods = self.stream.read_u32_array(off, count)?;
         }
 
-        self.string_literals = load!(Il2CppStringLiteral, h.string_literal_offset, h.string_literal_size, 0);
+        self.string_literals = load!(
+            Il2CppStringLiteral,
+            h.string_literal_offset,
+            h.string_literal_size,
+            0
+        );
 
         if self.version > 16.0 {
             self.field_refs = load!(Il2CppFieldRef, h.field_refs_offset, h.field_refs_size, 0);
 
             if self.version < 27.0 {
-                let usage_lists = load!(Il2CppMetadataUsageList, h.metadata_usage_lists_offset, h.metadata_usage_lists_count, 0);
-                let usage_pairs = load!(Il2CppMetadataUsagePair, h.metadata_usage_pairs_offset, h.metadata_usage_pairs_count, 0);
+                let usage_lists = load!(
+                    Il2CppMetadataUsageList,
+                    h.metadata_usage_lists_offset,
+                    h.metadata_usage_lists_count,
+                    0
+                );
+                let usage_pairs = load!(
+                    Il2CppMetadataUsagePair,
+                    h.metadata_usage_pairs_offset,
+                    h.metadata_usage_pairs_count,
+                    0
+                );
                 self.process_metadata_usage(&usage_lists, &usage_pairs);
             }
         }
 
         if self.version > 20.0 && self.version < 29.0 {
-            self.attribute_type_ranges = load!(Il2CppCustomAttributeTypeRange, h.attributes_info_offset, h.attributes_info_count, 0);
+            self.attribute_type_ranges = load!(
+                Il2CppCustomAttributeTypeRange,
+                h.attributes_info_offset,
+                h.attributes_info_count,
+                0
+            );
             let size = signed_size_to_u64(h.attribute_types_count, "attribute_types_count")?;
             let off = signed_size_to_u64(h.attribute_types_offset, "attribute_types_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "attribute_types")?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "attribute_types",
+            )?;
             self.attribute_types = self.stream.read_i32_array(off, count)?;
         }
 
         if self.version >= 29.0 {
-            self.attribute_data_ranges = load!(Il2CppCustomAttributeDataRange, h.attribute_data_range_offset, h.attribute_data_range_size, 0);
+            self.attribute_data_ranges = load!(
+                Il2CppCustomAttributeDataRange,
+                h.attribute_data_range_offset,
+                h.attribute_data_range_size,
+                0
+            );
         }
 
         if self.version > 24.0 {
@@ -562,16 +703,30 @@ impl Metadata {
 
         if v38 {
             self.type_inline_arrays = if self.version >= 104.0 {
-                load!(Il2CppInlineArrayLength, h.type_inline_arrays_offset, h.type_inline_arrays_size, h.type_inline_arrays_count)
+                load!(
+                    Il2CppInlineArrayLength,
+                    h.type_inline_arrays_offset,
+                    h.type_inline_arrays_size,
+                    h.type_inline_arrays_count
+                )
             } else {
                 Vec::new()
             };
         }
 
         if h.referenced_assemblies_offset > 0 && h.referenced_assemblies_size > 0 {
-            let size = signed_size_to_u64(h.referenced_assemblies_size, "referenced_assemblies_size")?;
-            let off = signed_size_to_u64(h.referenced_assemblies_offset, "referenced_assemblies_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "referenced_assemblies")?;
+            let size =
+                signed_size_to_u64(h.referenced_assemblies_size, "referenced_assemblies_size")?;
+            let off = signed_size_to_u64(
+                h.referenced_assemblies_offset,
+                "referenced_assemblies_offset",
+            )?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "referenced_assemblies",
+            )?;
             self.referenced_assemblies = self.stream.read_i32_array(off, count)?;
         }
 
@@ -612,7 +767,11 @@ impl Metadata {
         let on_generic_type_count = on_generic_type.len();
         let on_type_count = on_type.len();
         let full_count = full.len();
-        self.v108_method_specs = on_generic_type.into_iter().chain(on_type).chain(full).collect();
+        self.v108_method_specs = on_generic_type
+            .into_iter()
+            .chain(on_type)
+            .chain(full)
+            .collect();
 
         // Entries whose method has an adjustor thunk live in their own table.
         let plain = self.read_records(
@@ -649,12 +808,17 @@ impl Metadata {
             eprintln!(
                 "[v108] methodSpecs {} (onGenericType {}/{} + onType {}/{} + full {}/{}) | genericMethodTable {} | rgctxRanges {}/{} | rgctxValues {}/{}",
                 self.v108_method_specs.len(),
-                on_generic_type_count, h.method_specs_on_generic_type_count.max(0),
-                on_type_count, h.generic_method_specs_on_type_count.max(0),
-                full_count, h.method_specs_count.max(0),
+                on_generic_type_count,
+                h.method_specs_on_generic_type_count.max(0),
+                on_type_count,
+                h.generic_method_specs_on_type_count.max(0),
+                full_count,
+                h.method_specs_count.max(0),
                 self.v108_generic_method_table.len(),
-                self.v108_rgctx_ranges.len(), h.rgctx_ranges_count.max(0),
-                self.v108_rgctx_values.len(), h.rgctx_values_count.max(0),
+                self.v108_rgctx_ranges.len(),
+                h.rgctx_ranges_count.max(0),
+                self.v108_rgctx_values.len(),
+                h.rgctx_values_count.max(0),
             );
         }
 
@@ -710,10 +874,14 @@ impl Metadata {
         // RGCTX is per image: each image windows `v108_rgctx_ranges` and every
         // range indexes the single global value array by token.
         for image in &self.image_defs {
-            let Ok(image_name) = self.get_string_from_index(image.name_index) else { continue };
+            let Ok(image_name) = self.get_string_from_index(image.name_index) else {
+                continue;
+            };
             let start = image.rgctx_ranges_start.max(0) as usize;
             let len = image.rgctx_ranges_count.max(0) as usize;
-            let Some(ranges) = self.v108_rgctx_ranges.get(start..start.saturating_add(len)) else { continue };
+            let Some(ranges) = self.v108_rgctx_ranges.get(start..start.saturating_add(len)) else {
+                continue;
+            };
             let mut per_token: HashMap<u32, Vec<Il2CppRGCTXDefinition>> = HashMap::new();
             for range in ranges {
                 let from = range.range.start.max(0) as usize;
@@ -730,11 +898,14 @@ impl Metadata {
         if std::env::var("ILR_V108DBG").is_ok() {
             eprintln!(
                 "[v108] applied: methodSpecs {}/{}, genericMethodTable {}/{}, indexed {} methods -> {} spec addresses, rgctx {}/{} images",
-                il2cpp.method_specs.len(), self.v108_method_specs.len(),
-                il2cpp.generic_method_table.len(), self.v108_generic_method_table.len(),
+                il2cpp.method_specs.len(),
+                self.v108_method_specs.len(),
+                il2cpp.generic_method_table.len(),
+                self.v108_generic_method_table.len(),
                 il2cpp.method_definition_method_specs.len(),
                 il2cpp.method_spec_generic_method_pointers.len(),
-                il2cpp.rgctxs_dictionary.len(), self.image_defs.len(),
+                il2cpp.rgctxs_dictionary.len(),
+                self.image_defs.len(),
             );
         }
     }
@@ -759,13 +930,29 @@ impl Metadata {
         }
 
         self.image_defs = load_c!(Il2CppImageDefinition, h.images_offset, h.images_size);
-        self.assembly_defs = load_c!(Il2CppAssemblyDefinition, h.assemblies_offset, h.assemblies_size);
-        self.type_defs = load_c!(Il2CppTypeDefinition, h.type_definitions_offset, h.type_definitions_size);
+        self.assembly_defs = load_c!(
+            Il2CppAssemblyDefinition,
+            h.assemblies_offset,
+            h.assemblies_size
+        );
+        self.type_defs = load_c!(
+            Il2CppTypeDefinition,
+            h.type_definitions_offset,
+            h.type_definitions_size
+        );
         self.method_defs = load_c!(Il2CppMethodDefinition, h.methods_offset, h.methods_size);
-        self.parameter_defs = load_c!(Il2CppParameterDefinition, h.parameters_offset, h.parameters_size);
+        self.parameter_defs = load_c!(
+            Il2CppParameterDefinition,
+            h.parameters_offset,
+            h.parameters_size
+        );
         self.field_defs = load_c!(Il2CppFieldDefinition, h.fields_offset, h.fields_size);
 
-        let mut field_defaults_vec = load_std!(Il2CppFieldDefaultValue, h.field_default_values_offset, h.field_default_values_size);
+        let mut field_defaults_vec = load_std!(
+            Il2CppFieldDefaultValue,
+            h.field_default_values_offset,
+            h.field_default_values_size
+        );
         field_defaults_vec.retain(|v| v.field_index >= 0);
         self.field_default_values = map_by_key_dedup(
             field_defaults_vec,
@@ -773,7 +960,11 @@ impl Metadata {
             "field_default_values(codm)",
         );
 
-        let mut param_defaults = load_std!(Il2CppParameterDefaultValue, h.parameter_default_values_offset, h.parameter_default_values_size);
+        let mut param_defaults = load_std!(
+            Il2CppParameterDefaultValue,
+            h.parameter_default_values_offset,
+            h.parameter_default_values_size
+        );
         param_defaults.retain(|v| v.parameter_index >= 0);
         self.param_default_values = map_by_key_dedup(
             param_defaults,
@@ -781,7 +972,11 @@ impl Metadata {
             "parameter_default_values(codm)",
         );
 
-        self.property_defs = load_c!(Il2CppPropertyDefinition, h.properties_offset, h.properties_size);
+        self.property_defs = load_c!(
+            Il2CppPropertyDefinition,
+            h.properties_offset,
+            h.properties_size
+        );
 
         self.interface_indices = {
             let type_idx_sz = IndexWidths::get_type_index_size(&h).max(1);
@@ -823,43 +1018,93 @@ impl Metadata {
         {
             let size = signed_size_to_u64(h.nested_types_size, "nested_types_size")?;
             let off = signed_size_to_u64(h.nested_types_offset, "nested_types_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "nested_types(codm)")?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "nested_types(codm)",
+            )?;
             self.nested_type_indices = self.stream.read_i32_array(off, count)?;
         }
 
         self.event_defs = load_c!(Il2CppEventDefinition, h.events_offset, h.events_size);
-        self.generic_containers = load_c!(Il2CppGenericContainer, h.generic_containers_offset, h.generic_containers_size);
-        self.generic_parameters = load_c!(Il2CppGenericParameter, h.generic_parameters_offset, h.generic_parameters_size);
+        self.generic_containers = load_c!(
+            Il2CppGenericContainer,
+            h.generic_containers_offset,
+            h.generic_containers_size
+        );
+        self.generic_parameters = load_c!(
+            Il2CppGenericParameter,
+            h.generic_parameters_offset,
+            h.generic_parameters_size
+        );
 
         {
-            let size = signed_size_to_u64(h.generic_parameter_constraints_size, "generic_parameter_constraints_size")?;
-            let off = signed_size_to_u64(h.generic_parameter_constraints_offset, "generic_parameter_constraints_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "generic_parameter_constraints(codm)")?;
+            let size = signed_size_to_u64(
+                h.generic_parameter_constraints_size,
+                "generic_parameter_constraints_size",
+            )?;
+            let off = signed_size_to_u64(
+                h.generic_parameter_constraints_offset,
+                "generic_parameter_constraints_offset",
+            )?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "generic_parameter_constraints(codm)",
+            )?;
             self.constraint_indices = self.stream.read_i32_array(off, count)?;
         }
 
         {
             let size = signed_size_to_u64(h.vtable_methods_size, "vtable_methods_size")?;
             let off = signed_size_to_u64(h.vtable_methods_offset, "vtable_methods_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "vtable_methods(codm)")?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "vtable_methods(codm)",
+            )?;
             self.vtable_methods = self.stream.read_u32_array(off, count)?;
         }
 
-        self.string_literals = load_std!(Il2CppStringLiteral, h.string_literal_offset, h.string_literal_size);
+        self.string_literals = load_std!(
+            Il2CppStringLiteral,
+            h.string_literal_offset,
+            h.string_literal_size
+        );
 
         self.field_refs = load_c!(Il2CppFieldRef, h.field_refs_offset, h.field_refs_size);
 
         if self.version < 27.0 {
-            let usage_lists = load_c!(Il2CppMetadataUsageList, h.metadata_usage_lists_offset, h.metadata_usage_lists_count);
-            let usage_pairs = load_std!(Il2CppMetadataUsagePair, h.metadata_usage_pairs_offset, h.metadata_usage_pairs_count);
+            let usage_lists = load_c!(
+                Il2CppMetadataUsageList,
+                h.metadata_usage_lists_offset,
+                h.metadata_usage_lists_count
+            );
+            let usage_pairs = load_std!(
+                Il2CppMetadataUsagePair,
+                h.metadata_usage_pairs_offset,
+                h.metadata_usage_pairs_count
+            );
             self.process_metadata_usage(&usage_lists, &usage_pairs);
         }
 
         if self.version < 29.0 {
-            self.attribute_type_ranges = load_c!(Il2CppCustomAttributeTypeRange, h.attributes_info_offset, h.attributes_info_count);
+            self.attribute_type_ranges = load_c!(
+                Il2CppCustomAttributeTypeRange,
+                h.attributes_info_offset,
+                h.attributes_info_count
+            );
             let size = signed_size_to_u64(h.attribute_types_count, "attribute_types_count")?;
             let off = signed_size_to_u64(h.attribute_types_offset, "attribute_types_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "attribute_types(codm)")?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "attribute_types(codm)",
+            )?;
             self.attribute_types = self.stream.read_i32_array(off, count)?;
         }
 
@@ -870,16 +1115,29 @@ impl Metadata {
         self.metadata_usages_count = self.calculate_metadata_usages_count();
 
         if h.referenced_assemblies_offset > 0 && h.referenced_assemblies_size > 0 {
-            let size = signed_size_to_u64(h.referenced_assemblies_size, "referenced_assemblies_size")?;
-            let off = signed_size_to_u64(h.referenced_assemblies_offset, "referenced_assemblies_offset")?;
-            let count = checked_array_len(size / 4, 4, Some(self.stream.remaining_from(off)), "referenced_assemblies(codm)")?;
+            let size =
+                signed_size_to_u64(h.referenced_assemblies_size, "referenced_assemblies_size")?;
+            let off = signed_size_to_u64(
+                h.referenced_assemblies_offset,
+                "referenced_assemblies_offset",
+            )?;
+            let count = checked_array_len(
+                size / 4,
+                4,
+                Some(self.stream.remaining_from(off)),
+                "referenced_assemblies(codm)",
+            )?;
             self.referenced_assemblies = self.stream.read_i32_array(off, count)?;
         }
 
         Ok(())
     }
 
-    fn read_metadata_array_codm<T: CodmReadable>(&mut self, offset: u64, size: u64) -> Result<Vec<T>> {
+    fn read_metadata_array_codm<T: CodmReadable>(
+        &mut self,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<T>> {
         if offset == 0 || size == 0 {
             return Ok(Vec::new());
         }
@@ -909,7 +1167,10 @@ impl Metadata {
     /// and only the record size says which (see
     /// `Il2CppMethodDefinition::read_with_stride`).
     fn read_method_defs_strided(
-        &mut self, offset: u64, size: u64, stride: usize,
+        &mut self,
+        offset: u64,
+        size: u64,
+        stride: usize,
     ) -> Result<Vec<Il2CppMethodDefinition>> {
         if offset == 0 || size == 0 || stride == 0 {
             return Ok(Vec::new());
@@ -945,7 +1206,10 @@ impl Metadata {
     /// shows up as out-of-range indices — indistinguishable from encrypted
     /// metadata unless the layout is verified. `layout::detect_method_stride`
     /// ties the methods section to the parameter section to do that.
-    fn load_method_defs(&mut self, h: &Il2CppGlobalMetadataHeader) -> Result<Vec<Il2CppMethodDefinition>> {
+    fn load_method_defs(
+        &mut self,
+        h: &Il2CppGlobalMetadataHeader,
+    ) -> Result<Vec<Il2CppMethodDefinition>> {
         let off = signed_size_to_u64(h.methods_offset, "methods_offset")?;
         let size = signed_size_to_u64(h.methods_size, "methods_size")?;
         if off == 0 || size == 0 {
@@ -961,13 +1225,22 @@ impl Metadata {
         let string_size = signed_size_to_u64(h.string_size, "string_size").unwrap_or(0);
         let type_count = {
             let stride = Il2CppTypeDefinition::byte_size(self.version);
-            let tsize = signed_size_to_u64(h.type_definitions_size, "type_definitions_size").unwrap_or(0);
-            if stride > 0 { (tsize / stride as u64) as usize } else { 0 }
+            let tsize =
+                signed_size_to_u64(h.type_definitions_size, "type_definitions_size").unwrap_or(0);
+            if stride > 0 {
+                (tsize / stride as u64) as usize
+            } else {
+                0
+            }
         };
         let parameter_count = {
             let stride = Il2CppParameterDefinition::byte_size(self.version);
             let psize = signed_size_to_u64(h.parameters_size, "parameters_size").unwrap_or(0);
-            if stride > 0 { (psize / stride as u64) as usize } else { 0 }
+            if stride > 0 {
+                (psize / stride as u64) as usize
+            } else {
+                0
+            }
         };
 
         let evidence = crate::il2cpp::layout::detect_method_stride(
@@ -1001,7 +1274,12 @@ impl Metadata {
         self.read_metadata_array::<Il2CppMethodDefinition>(off, size, None)
     }
 
-    fn read_metadata_array<T: MetadataReadable>(&mut self, offset: u64, size: u64, count_override: Option<usize>) -> Result<Vec<T>> {
+    fn read_metadata_array<T: MetadataReadable>(
+        &mut self,
+        offset: u64,
+        size: u64,
+        count_override: Option<usize>,
+    ) -> Result<Vec<T>> {
         if offset == 0 || size == 0 {
             return Ok(Vec::new());
         }
@@ -1012,7 +1290,9 @@ impl Metadata {
             )));
         }
         let count = if let Some(c) = count_override {
-            if c == 0 { return Ok(Vec::new()); }
+            if c == 0 {
+                return Ok(Vec::new());
+            }
             checked_array_len(
                 c as u64,
                 1,
@@ -1060,7 +1340,10 @@ impl Metadata {
     }
 
     fn read_metadata_array_with_offsets<T: MetadataReadable>(
-        &mut self, offset: u64, size: u64, count_override: Option<usize>,
+        &mut self,
+        offset: u64,
+        size: u64,
+        count_override: Option<usize>,
     ) -> Result<(Vec<T>, HashMap<u64, usize>)> {
         if offset == 0 || size == 0 {
             return Ok((Vec::new(), HashMap::new()));
@@ -1073,7 +1356,9 @@ impl Metadata {
         }
 
         let count = if let Some(c) = count_override {
-            if c == 0 { return Ok((Vec::new(), HashMap::new())); }
+            if c == 0 {
+                return Ok((Vec::new(), HashMap::new()));
+            }
             checked_array_len(
                 c as u64,
                 1,
@@ -1181,7 +1466,8 @@ impl Metadata {
             let mut dic = HashMap::new();
             let mut dup_tokens = 0u32;
             let mut first_dup_token: Option<u32> = None;
-            let end = image_def.custom_attribute_start as usize + image_def.custom_attribute_count as usize;
+            let end = image_def.custom_attribute_start as usize
+                + image_def.custom_attribute_count as usize;
 
             for i in image_def.custom_attribute_start as usize..end {
                 let token = if self.version >= 29.0 {
@@ -1226,20 +1512,31 @@ impl Metadata {
 
     pub fn get_string_literal_from_index(&self, index: usize) -> Result<String> {
         if index >= self.string_literals.len() {
-            return Err(crate::error::Error::Other(format!("String literal index {} out of bounds (len {})", index, self.string_literals.len())));
+            return Err(crate::error::Error::Other(format!(
+                "String literal index {} out of bounds (len {})",
+                index,
+                self.string_literals.len()
+            )));
         }
         let sl = &self.string_literals[index];
         let data_base = self.header.string_literal_data_offset as u64;
         if self.version < 35.0 {
-            let bytes = self.stream.peek_bytes_at(data_base + sl.data_index as u64, sl.length as usize)?;
+            let bytes = self
+                .stream
+                .peek_bytes_at(data_base + sl.data_index as u64, sl.length as usize)?;
             Ok(String::from_utf8_lossy(bytes).to_string())
         } else {
-            let data_end = self.header.string_literal_data_offset as u64 + self.header.string_literal_data_size as u64;
-            let next_offset = self.string_literals.get(index + 1)
+            let data_end = self.header.string_literal_data_offset as u64
+                + self.header.string_literal_data_size as u64;
+            let next_offset = self
+                .string_literals
+                .get(index + 1)
                 .map(|n| n.data_index as u64)
                 .unwrap_or(data_end - data_base);
             let len = (next_offset - sl.data_index as u64) as usize;
-            let bytes = self.stream.peek_bytes_at(data_base + sl.data_index as u64, len)?;
+            let bytes = self
+                .stream
+                .peek_bytes_at(data_base + sl.data_index as u64, len)?;
             Ok(String::from_utf8_lossy(bytes).to_string())
         }
     }
@@ -1252,7 +1549,10 @@ impl Metadata {
         self.field_default_values.get(&field_index)
     }
 
-    pub fn get_parameter_default_value(&self, param_index: i32) -> Option<&Il2CppParameterDefaultValue> {
+    pub fn get_parameter_default_value(
+        &self,
+        param_index: i32,
+    ) -> Option<&Il2CppParameterDefaultValue> {
         self.param_default_values.get(&param_index)
     }
 
@@ -1283,7 +1583,9 @@ pub trait MetadataReadable: Sized {
     fn read(stream: &mut BinaryStream, version: f64) -> Result<Self>;
     fn byte_size(version: f64) -> usize;
     fn read_codm(_stream: &mut BinaryStream) -> Result<Self> {
-        Err(Error::InvalidMetadata("CODM variant not supported for this struct".into()))
+        Err(Error::InvalidMetadata(
+            "CODM variant not supported for this struct".into(),
+        ))
     }
     fn codm_byte_size() -> usize {
         0

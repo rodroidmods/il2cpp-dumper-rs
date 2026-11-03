@@ -42,7 +42,11 @@ fn probe_arm32_address_parallelism() {
     ];
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let lifted = lift_arm32::lift_arm32(&bytes, 0x1000, 64).unwrap();
-    println!("PROBE arm32: insns={} addresses={}", lifted.insns.len(), lifted.addresses.len());
+    println!(
+        "PROBE arm32: insns={} addresses={}",
+        lifted.insns.len(),
+        lifted.addresses.len()
+    );
     for (i, insn) in lifted.insns.iter().enumerate() {
         println!("  {i}: {insn}");
     }
@@ -91,7 +95,10 @@ fn probe_decode_window() {
     let start = rva as usize;
     let body = &data[start..start + len];
     let (decoded, fails) = super::verify::decode_all_arm64(body, rva);
-    println!("PROBE decode @{rva:#x} len={len:#x} insns={} fails={fails}", decoded.len());
+    println!(
+        "PROBE decode @{rva:#x} len={len:#x} insns={} fails={fails}",
+        decoded.len()
+    );
     let decoder = yaxpeax_arm::armv8::a64::InstDecoder::default();
     use yaxpeax_arch::{Decoder, U8Reader};
     let mut reader = U8Reader::new(body);
@@ -100,16 +107,19 @@ fn probe_decode_window() {
             Ok(i) => format!("opcode={:?} operands={:?}", i.opcode, i.operands),
             Err(e) => format!("DECODE-ERR {e:?}"),
         };
-        println!("  {:#010x}  {:<28} {:?}\n      {raw}", d.addr, d.mnemonic, d.class);
+        println!(
+            "  {:#010x}  {:<28} {:?}\n      {raw}",
+            d.addr, d.mnemonic, d.class
+        );
     }
 }
 
 #[test]
 fn probe_vec_shapes() {
     let words: Vec<u32> = vec![
-        0x0c230000, 0x0c670b01, 0x0d409123, 0x0d40c901, 0x0d009061,
-        0x2e25dc42, 0x2e25dce5, 0x2e22dc21, 0x2e22dca2, 0x2e21dc21,
-        0x2e23dc42, 0x0e0404c6, 0x0e040610, 0x0e040652, 0x0e040610,
+        0x0c230000, 0x0c670b01, 0x0d409123, 0x0d40c901, 0x0d009061, 0x2e25dc42, 0x2e25dce5,
+        0x2e22dc21, 0x2e22dca2, 0x2e21dc21, 0x2e23dc42, 0x0e0404c6, 0x0e040610, 0x0e040652,
+        0x0e040610,
     ];
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let decoder = yaxpeax_arm::armv8::a64::InstDecoder::default();
@@ -117,7 +127,10 @@ fn probe_vec_shapes() {
     for (wi, w) in words.iter().enumerate() {
         use yaxpeax_arch::Decoder;
         match decoder.decode(&mut reader) {
-            Ok(i) => println!("PROBE-V {:08x}: {}  | opcode={:?} operands={:?}", w, i, i.opcode, i.operands),
+            Ok(i) => println!(
+                "PROBE-V {:08x}: {}  | opcode={:?} operands={:?}",
+                w, i, i.opcode, i.operands
+            ),
             Err(e) => println!("PROBE-V {:08x}: DECODE-ERR {:?}", w, e),
         }
         let _ = wi;
@@ -133,8 +146,12 @@ fn probe_vec_shapes() {
 /// lifter must NOT invalidate `pending_cmp` on.
 #[test]
 fn probe_cond_gap() {
-    let Ok(list) = std::env::var("ILR_CONDLIST") else { return };
-    let Ok(text) = std::fs::read_to_string(&list) else { return };
+    let Ok(list) = std::env::var("ILR_CONDLIST") else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&list) else {
+        return;
+    };
     let Some(data) = probe_binary() else { return };
     let decoder = yaxpeax_arm::armv8::a64::InstDecoder::default();
     use yaxpeax_arch::{Decoder, U8Reader};
@@ -146,7 +163,9 @@ fn probe_cond_gap() {
         if line.is_empty() {
             continue;
         }
-        let Ok(addr) = u64::from_str_radix(line.trim_start_matches("0x"), 16) else { continue };
+        let Ok(addr) = u64::from_str_radix(line.trim_start_matches("0x"), 16) else {
+            continue;
+        };
         // window: 16 instructions (64 bytes) ending AT the branch
         let start = addr.saturating_sub(64);
         let body = &data[start as usize..addr as usize + 4];
@@ -180,7 +199,9 @@ fn probe_cond_gap() {
         if let Some(k) = prev {
             *tally.entry(k).or_default() += 1;
         }
-        let gap = last_cmp_gap.map(|c| branch_at.unwrap() - c - 1).unwrap_or(usize::MAX);
+        let gap = last_cmp_gap
+            .map(|c| branch_at.unwrap() - c - 1)
+            .unwrap_or(usize::MAX);
         *with_cmp.entry(gap.min(99)).or_default() += 1;
     }
     println!("PROBE-COND total={n}");
@@ -213,7 +234,10 @@ fn probe_words() {
     let mut reader = U8Reader::new(&bytes);
     for w in &words {
         match decoder.decode(&mut reader) {
-            Ok(i) => println!("WORD {w:#010x}  {i}  opcode={:?}  operands={:?}", i.opcode, i.operands),
+            Ok(i) => println!(
+                "WORD {w:#010x}  {i}  opcode={:?}  operands={:?}",
+                i.opcode, i.operands
+            ),
             Err(e) => println!("WORD {w:#010x}  DECODE-ERR {e:?}"),
         }
     }
@@ -257,10 +281,13 @@ fn probe_pinned_copies() {
                 .iter()
                 .take(20)
                 .map(|i| match i.operands.get(1) {
-                    Some(Op2::Register(r)) => format!("{}<={r}", match i.operands.first() {
-                        Some(Op2::Register(d)) => d.clone(),
-                        _ => "?".into(),
-                    }),
+                    Some(Op2::Register(r)) => format!(
+                        "{}<={r}",
+                        match i.operands.first() {
+                            Some(Op2::Register(d)) => d.clone(),
+                            _ => "?".into(),
+                        }
+                    ),
                     _ => String::new(),
                 })
                 .filter(|s| !s.is_empty())

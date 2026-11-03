@@ -23,9 +23,9 @@
 //! image, where address == file offset and a hole reads as the zeros the
 //! runtime would see.
 
-use crate::io::BinaryStream;
-use crate::search::{SectionHelper, SearchSection};
 use crate::error::{Error, Result};
+use crate::io::BinaryStream;
+use crate::search::{SearchSection, SectionHelper};
 
 pub const WASM_MAGIC: u32 = 0x6D736100;
 pub const WASM_VERSION: u32 = 1;
@@ -119,7 +119,10 @@ impl Wasm {
         }
         let version = self.stream.read_u32()?;
         if version != WASM_VERSION {
-            return Err(Error::InvalidFormat(format!("Unsupported WASM version: {}", version)));
+            return Err(Error::InvalidFormat(format!(
+                "Unsupported WASM version: {}",
+                version
+            )));
         }
 
         let mut declared_memory: Option<u64> = None;
@@ -144,7 +147,8 @@ impl Wasm {
                 _ => {}
             }
 
-            self.stream.set_position(section_offset + section_size as u64);
+            self.stream
+                .set_position(section_offset + section_size as u64);
         }
 
         self.materialize_memory(declared_memory)
@@ -193,7 +197,8 @@ impl Wasm {
 
             segment.size = self.read_leb128_unsigned()?;
             segment.data_offset = self.stream.position();
-            self.stream.set_position(self.stream.position() + segment.size as u64);
+            self.stream
+                .set_position(self.stream.position() + segment.size as u64);
             self.data_segments.push(segment);
         }
 
@@ -205,7 +210,7 @@ impl Wasm {
     fn read_offset_expression(&mut self) -> Result<i64> {
         let opcode = self.stream.read_u8()?;
         let value = match opcode {
-            0x41 => self.read_leb128_signed()?,          // i32.const
+            0x41 => self.read_leb128_signed()?, // i32.const
             0x23 => {
                 // `global.get <idx>`: the base only exists at instantiation
                 // time, so the segment address is unknown here. Record it as
@@ -217,7 +222,7 @@ impl Wasm {
                 }
                 return Ok(-1);
             }
-            0x42 => self.read_leb128_signed()?,          // i64.const (memory64)
+            0x42 => self.read_leb128_signed()?, // i64.const (memory64)
             _ => 0,
         };
         let _end = self.stream.read_u8()?;
@@ -328,7 +333,14 @@ impl Wasm {
         vec![SearchSection::new(0, len, 0, len)]
     }
 
-    pub fn get_section_helper(&self, method_count: usize, type_definitions_count: usize, metadata_usages_count: usize, image_count: usize, version: f64) -> SectionHelper<'_> {
+    pub fn get_section_helper(
+        &self,
+        method_count: usize,
+        type_definitions_count: usize,
+        metadata_usages_count: usize,
+        image_count: usize,
+        version: f64,
+    ) -> SectionHelper<'_> {
         // No executable sections: Wasm code lives in the code section as
         // bytecode and is never present in the linear memory, so a code
         // pointer search has nothing to look at (and must not be pointed at
@@ -443,7 +455,10 @@ mod tests {
 
         // address == offset, and the gap reads as zeros
         assert_eq!(wasm.map_vatr(0x100).unwrap(), 0x100);
-        assert_eq!(wasm.stream.peek_bytes_at(0x100, 4).unwrap(), 0x1000u32.to_le_bytes());
+        assert_eq!(
+            wasm.stream.peek_bytes_at(0x100, 4).unwrap(),
+            0x1000u32.to_le_bytes()
+        );
         assert_eq!(wasm.stream.peek_bytes_at(0x110, 8).unwrap(), [0u8; 8]);
         assert_eq!(
             wasm.stream.peek_bytes_at(0x118, 4).unwrap(),
@@ -463,10 +478,11 @@ mod tests {
         assert_eq!(sections[0].offset_end, wasm.stream.len() as u64);
         // the string is visible to a scan of the image
         assert_eq!(wasm.initialized_bytes, 13);
-        assert!(wasm
-            .stream
-            .peek_bytes_at(0x40, 13)
-            .unwrap()
-            .starts_with(b"mscorlib.dll"));
+        assert!(
+            wasm.stream
+                .peek_bytes_at(0x40, 13)
+                .unwrap()
+                .starts_with(b"mscorlib.dll")
+        );
     }
 }

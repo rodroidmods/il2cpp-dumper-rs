@@ -2,7 +2,7 @@
 //! FieldRVA (PrivateImplementationDetails) fields.
 
 use crate::il2cpp::base::Il2Cpp;
-use crate::il2cpp::enums::{field_attributes, Il2CppTypeEnum};
+use crate::il2cpp::enums::{Il2CppTypeEnum, field_attributes};
 use crate::il2cpp::metadata::Metadata;
 use crate::il2cpp::structures::{Il2CppFieldDefinition, Il2CppType, Il2CppTypeDefinition};
 
@@ -162,6 +162,120 @@ fn primitive_size(field_type: &Il2CppType, il2cpp: &Il2Cpp) -> Option<usize> {
     }
 }
 
+/// Compute static field offsets for a type from type sizes/alignments.
+///
+/// Used as a fallback when the binary's field offset data is zeroed out
+/// (common in Unity 2022+ / IL2CPP v29+ where field offsets are runtime-initialized).
+/// Returns a vec indexed by field_index_in_type for STATIC fields only,
+/// or None if the type has no static fields or sizes are unavailable.
+pub fn compute_static_field_offsets(
+    td: &Il2CppTypeDefinition,
+    metadata: &Metadata,
+    il2cpp: &Il2Cpp,
+) -> Option<Vec<u32>> {
+    let field_start = td.field_start as usize;
+    let field_count = td.field_count as usize;
+    let ptr_size: u32 = if il2cpp.is_32bit { 4 } else { 8 };
+
+    let mut offsets = Vec::with_capacity(field_count);
+    let mut current_offset: u32 = 0;
+    let mut has_any_static = false;
+
+    for fi in 0..field_count {
+        let global_fi = field_start + fi;
+        let Some(field_def) = metadata.field_defs.get(global_fi) else {
+            offsets.push(0);
+            continue;
+        };
+        let Some(field_type) = il2cpp.types.get(field_def.type_index as usize) else {
+            offsets.push(0);
+            continue;
+        };
+
+        let is_static = (field_type.attrs & field_attributes::STATIC) != 0;
+        let is_literal = (field_type.attrs & field_attributes::LITERAL) != 0;
+        let has_field_rva = (field_type.attrs & field_attributes::HAS_FIELD_RVA) != 0;
+
+        if !is_static || is_literal || has_field_rva {
+            offsets.push(0);
+            continue;
+        }
+
+        has_any_static = true;
+        let (size, align) = static_field_size_and_align(field_type, il2cpp, metadata, ptr_size);
+        if align > 0 {
+            let align_mask = align - 1;
+            current_offset = (current_offset + align_mask) & !align_mask;
+        }
+        offsets.push(current_offset);
+        current_offset += size;
+    }
+
+    if !has_any_static {
+        return None;
+    }
+    Some(offsets)
+}
+
+fn static_field_size_and_align(
+    field_type: &Il2CppType,
+    il2cpp: &Il2Cpp,
+    metadata: &Metadata,
+    ptr_size: u32,
+) -> (u32, u32) {
+    if let Some(prim) = primitive_size(field_type, il2cpp) {
+        return (prim as u32, prim as u32);
+    }
+    match Il2CppTypeEnum::from_u8(field_type.type_enum) {
+        Some(Il2CppTypeEnum::String)
+        | Some(Il2CppTypeEnum::Object)
+        | Some(Il2CppTypeEnum::Class)
+        | Some(Il2CppTypeEnum::Array)
+        | Some(Il2CppTypeEnum::SzArray)
+        | Some(Il2CppTypeEnum::Ptr)
+        | Some(Il2CppTypeEnum::ByRef) => (ptr_size, ptr_size),
+        Some(Il2CppTypeEnum::ValueType) | Some(Il2CppTypeEnum::Enum) => {
+            let klass_idx = field_type.datapoint as usize;
+            if let Some(sizes) = il2cpp.type_definition_sizes.get(klass_idx) {
+                let size = sizes.instance_size;
+                if size > 0 {
+                    let align = if Il2CppTypeEnum::from_u8(field_type.type_enum)
+                        == Some(Il2CppTypeEnum::Enum)
+                    {
+                        size.min(8)
+                    } else {
+                        value_type_alignment(size, metadata, il2cpp, klass_idx)
+                    };
+                    return (size, align);
+                }
+            }
+            (ptr_size, ptr_size)
+        }
+        Some(Il2CppTypeEnum::GenericInst) => {
+            if field_type.valuetype != 0 {
+                let klass_idx = field_type.datapoint as usize;
+                if let Some(sizes) = il2cpp.type_definition_sizes.get(klass_idx) {
+                    let size = sizes.instance_size;
+                    if size > 0 {
+                        return (size, value_type_alignment(size, metadata, il2cpp, klass_idx));
+                    }
+                }
+            }
+            (ptr_size, ptr_size)
+        }
+        _ => (ptr_size, ptr_size),
+    }
+}
+
+fn value_type_alignment(
+    size: u32,
+    _metadata: &Metadata,
+    _il2cpp: &Il2Cpp,
+    _klass_idx: usize,
+) -> u32 {
+    if size >= 8 { 8 } else if size >= 4 { 4 } else if size >= 2 { 2 } else { 1 }
+}
+
 /// Read `size` bytes out of the metadata's `fieldAndParameterDefaultValueData`
 /// section. Returns `None` unless the *whole* requested range is inside both the
 /// declared section and the file — silently returning a short slice would report
@@ -170,8 +284,15 @@ pub fn read_metadata_bytes(metadata: &Metadata, offset: u64, size: usize) -> Opt
     if size == 0 {
         return Some(Vec::new());
     }
-    let data_base = metadata.header.field_and_parameter_default_value_data_offset as u64;
-    let data_end = data_base.saturating_add(metadata.header.field_and_parameter_default_value_data_size.max(0) as u64);
+    let data_base = metadata
+        .header
+        .field_and_parameter_default_value_data_offset as u64;
+    let data_end = data_base.saturating_add(
+        metadata
+            .header
+            .field_and_parameter_default_value_data_size
+            .max(0) as u64,
+    );
     let end = offset.checked_add(size as u64)?;
     if offset < data_base || end > data_end {
         return None;
@@ -199,11 +320,7 @@ pub fn analyze_field_layout(
     let is_static = (field_type.attrs & field_attributes::STATIC) != 0;
     let has_field_rva = (field_type.attrs & field_attributes::HAS_FIELD_RVA) != 0;
 
-    let raw_offset = il2cpp.get_raw_field_offset(
-        type_def_index,
-        field_index_in_type,
-        field_index,
-    );
+    let raw_offset = il2cpp.get_raw_field_offset(type_def_index, field_index_in_type, field_index);
     let decoded = decode_field_offset(raw_offset);
 
     let type_sizes = il2cpp.type_definition_sizes.get(type_def_index);
@@ -229,7 +346,9 @@ pub fn analyze_field_layout(
     let rva_data_size = if has_field_rva {
         estimate_field_rva_size(field_type, il2cpp, metadata).min(max_rva_bytes)
     } else if is_literal {
-        primitive_size(field_type, il2cpp).unwrap_or(0).min(max_rva_bytes)
+        primitive_size(field_type, il2cpp)
+            .unwrap_or(0)
+            .min(max_rva_bytes)
     } else {
         0
     };
@@ -317,13 +436,28 @@ mod tests {
 
     #[test]
     fn static_array_init_size_comes_from_the_type_name() {
-        assert_eq!(parse_static_array_init_size("__StaticArrayInitTypeSize=108"), Some(108));
-        assert_eq!(parse_static_array_init_size("__StaticArrayInitTypeSize=1"), Some(1));
+        assert_eq!(
+            parse_static_array_init_size("__StaticArrayInitTypeSize=108"),
+            Some(108)
+        );
+        assert_eq!(
+            parse_static_array_init_size("__StaticArrayInitTypeSize=1"),
+            Some(1)
+        );
         // A type that is not a blob, a blob without a length, and a zero-length
         // blob (which would make the byte count meaningless) all yield nothing.
         assert_eq!(parse_static_array_init_size("Vector3"), None);
-        assert_eq!(parse_static_array_init_size("__StaticArrayInitTypeSize="), None);
-        assert_eq!(parse_static_array_init_size("__StaticArrayInitTypeSize=0"), None);
-        assert_eq!(parse_static_array_init_size("__StaticArrayInitTypeSize=abc"), None);
+        assert_eq!(
+            parse_static_array_init_size("__StaticArrayInitTypeSize="),
+            None
+        );
+        assert_eq!(
+            parse_static_array_init_size("__StaticArrayInitTypeSize=0"),
+            None
+        );
+        assert_eq!(
+            parse_static_array_init_size("__StaticArrayInitTypeSize=abc"),
+            None
+        );
     }
 }

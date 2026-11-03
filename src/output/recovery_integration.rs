@@ -13,7 +13,9 @@ use dotnetdll::prelude::*;
 use dotnetdll::resolved::signature::{
     CallingConvention, ManagedMethod, Parameter, ParameterType, ReturnType,
 };
-use dotnetdll::resolved::types::{BaseType, ExternalTypeReference, ResolutionScope, TypeSource, ValueKind};
+use dotnetdll::resolved::types::{
+    BaseType, ExternalTypeReference, ResolutionScope, TypeSource, ValueKind,
+};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,13 +35,15 @@ impl<'r, 'res, 'a> ResolutionBackedResolver<'r, 'res, 'a> {
         if let Some(existing) = self.assembly_refs.borrow().get(name) {
             return *existing;
         }
-        let idx = self
-            .resolution
+        let idx =
+            self.resolution
+                .borrow_mut()
+                .push_assembly_reference(ExternalAssemblyReference::new(Cow::<str>::Owned(
+                    name.to_string(),
+                )));
+        self.assembly_refs
             .borrow_mut()
-            .push_assembly_reference(ExternalAssemblyReference::new(
-                Cow::<str>::Owned(name.to_string()),
-            ));
-        self.assembly_refs.borrow_mut().insert(name.to_string(), idx);
+            .insert(name.to_string(), idx);
         idx
     }
 
@@ -65,7 +69,11 @@ impl<'r, 'res, 'a> ResolutionBackedResolver<'r, 'res, 'a> {
         }
         let asm = key.2.clone();
         let idx = self.push_type_ref(
-            if nt.namespace.is_empty() { None } else { Some(nt.namespace.clone()) },
+            if nt.namespace.is_empty() {
+                None
+            } else {
+                Some(nt.namespace.clone())
+            },
             nt.name.clone(),
             &asm,
         );
@@ -143,7 +151,8 @@ impl<'r, 'res, 'a> ResolutionBackedResolver<'r, 'res, 'a> {
             ReturnType(
                 vec![],
                 Some(ParameterType::Value(
-                    self.managed_to_method_type(&m.sig.ret).unwrap_or_else(object_mt),
+                    self.managed_to_method_type(&m.sig.ret)
+                        .unwrap_or_else(object_mt),
                 )),
             )
         };
@@ -199,7 +208,9 @@ impl<'r, 'res, 'a> ResolutionBackedResolver<'r, 'res, 'a> {
                 failed_no_rva += 1;
                 continue;
             }
-            let Some(method_def) = metadata.method_defs.get(*mi_global) else { continue };
+            let Some(method_def) = metadata.method_defs.get(*mi_global) else {
+                continue;
+            };
             let is_static = (method_def.flags & 0x0010) != 0;
             let ret = il2cpp
                 .types
@@ -247,32 +258,48 @@ impl<'r, 'res, 'a> ResolutionBackedResolver<'r, 'res, 'a> {
                         if nt.type_def_index >= 0
                             && nt.type_def_index < metadata.type_defs.len() as i32 =>
                     {
-                        crate::recovery::hfa_float_components(
-                            nt.type_def_index,
-                            metadata,
-                            il2cpp,
-                        )
+                        crate::recovery::hfa_float_components(nt.type_def_index, metadata, il2cpp)
                     }
                     _ => Vec::new(),
                 })
                 .collect();
             let ret_hidden_buffer = ctx.is_arm32
                 && crate::recovery::arm32_ret_uses_hidden_buffer(&ret, metadata, il2cpp);
+            // Extract parameter display names from metadata so the local table
+            // can render named parameters instead of positional arg0/arg1.
+            let param_names: Vec<String> = (0..method_def.parameter_count as usize)
+                .filter_map(|j| {
+                    let pidx = method_def.parameter_start as usize + j;
+                    let pd = metadata.parameter_defs.get(pidx)?;
+                    Some(
+                        metadata
+                            .get_string_from_index(pd.name_index)
+                            .unwrap_or_else(|_| format!("arg{j}")),
+                    )
+                })
+                .collect();
             let seed = crate::recovery::locals::SeedInfo {
                 param_types: params.clone(),
                 ret_type: ret,
                 is_static,
                 declaring,
-                param_names: Vec::new(),
+                param_names,
                 param_comp_names: param_comps,
-                arm32_param_words: params.iter().map(|ty| match ty {
-                    crate::recovery::types::ManagedType::Class(nt) => {
-                        crate::recovery::arm32_value_type_size(nt.type_def_index, metadata, il2cpp)
+                arm32_param_words: params
+                    .iter()
+                    .map(|ty| match ty {
+                        crate::recovery::types::ManagedType::Class(nt) => {
+                            crate::recovery::arm32_value_type_size(
+                                nt.type_def_index,
+                                metadata,
+                                il2cpp,
+                            )
                             .map(|size| size.saturating_add(3) / 4)
                             .unwrap_or(1)
-                    }
-                    _ => 1,
-                }).collect(),
+                        }
+                        _ => 1,
+                    })
+                    .collect(),
                 is_arm32: ctx.is_arm32,
                 ret_hidden_buffer,
             };
@@ -290,7 +317,8 @@ impl<'r, 'res, 'a> ResolutionBackedResolver<'r, 'res, 'a> {
             crate::recovery::verify::set_tv_source("dll");
             match ctx.recover_method(&bytes, rva, &seed, self, metadata, il2cpp) {
                 Some(out) => {
-                    let Some(ti) = (**self.resolution.borrow()).type_definition_index(dotnet_ty) else {
+                    let Some(ti) = (**self.resolution.borrow()).type_definition_index(dotnet_ty)
+                    else {
                         failed_analysis += 1;
                         continue;
                     };
@@ -299,16 +327,15 @@ impl<'r, 'res, 'a> ResolutionBackedResolver<'r, 'res, 'a> {
                         failed_analysis += 1;
                         continue;
                     }
-                    res[ti].methods[method_pos].body =
-                        Some(dotnetdll::resolved::body::Method {
-                            header: dotnetdll::resolved::body::Header {
-                                initialize_locals: true,
-                                maximum_stack_size: out.max_stack,
-                                local_variables: out.locals,
-                            },
-                            instructions: out.instructions,
-                            data_sections: vec![],
-                        });
+                    res[ti].methods[method_pos].body = Some(dotnetdll::resolved::body::Method {
+                        header: dotnetdll::resolved::body::Header {
+                            initialize_locals: true,
+                            maximum_stack_size: out.max_stack,
+                            local_variables: out.locals,
+                        },
+                        instructions: out.instructions,
+                        data_sections: vec![],
+                    });
                     recovered += 1;
                 }
                 None => {
@@ -319,6 +346,9 @@ impl<'r, 'res, 'a> ResolutionBackedResolver<'r, 'res, 'a> {
         // breakdown available via debug logging when needed
         let _ = (failed_no_rva, failed_size, failed_bytes);
         failed_analysis += failed_size + failed_bytes;
+        if std::env::var("ILR_TIMING").is_ok() {
+            eprintln!("{}", crate::recovery::timing::report());
+        }
         (recovered, failed_analysis)
     }
 }
@@ -347,7 +377,9 @@ impl<'r, 'res, 'a> TokenResolver for ResolutionBackedResolver<'r, 'res, 'a> {
                 type_def_index: f.type_def_index,
             })?)),
         }));
-        let fty = self.managed_to_method_type(&f.field_type).unwrap_or_else(object_mt);
+        let fty = self
+            .managed_to_method_type(&f.field_type)
+            .unwrap_or_else(object_mt);
         let efr = ExternalFieldReference::new(
             FieldReferenceParent::Type(parent_ty),
             member_from_method(fty),
@@ -403,11 +435,8 @@ impl<'r, 'res, 'a> TokenResolver for ResolutionBackedResolver<'r, 'res, 'a> {
             return_type: ReturnType::VOID,
             varargs: None,
         };
-        let emr = ExternalMethodReference::new(
-            MethodReferenceParent::Type(console),
-            "WriteLine",
-            sig,
-        );
+        let emr =
+            ExternalMethodReference::new(MethodReferenceParent::Type(console), "WriteLine", sig);
         let idx = self.resolution.borrow_mut().push_method_reference(emr);
         *self.console_write_line_cache.borrow_mut() = Some(idx);
         Some(MethodSource::User(UserMethod::Reference(idx)))

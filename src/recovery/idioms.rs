@@ -34,7 +34,7 @@
 //! Every counter is process-wide and reported beside the structural census, so
 //! the effect of each idiom on a real corpus is a number rather than a claim.
 
-use super::csharp::{cleanup, BinOp, CmpKind, Expr, Stmt};
+use super::csharp::{BinOp, CmpKind, Expr, Stmt, cleanup};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -97,30 +97,133 @@ pub static IDIOMS: IdiomCensus = IdiomCensus {
 /// again (propagation inserts an assignment, which can itself orphan the
 /// statement that used to compute the value inline).
 pub fn apply(stmts: &mut Vec<Stmt>) {
+    // `ILR_LABELDBG=1`: attribute new dangling gotos to the idiom step that
+    // orphaned their labels (see `label_goto_census`).
+    let labeldbg = crate::recovery::env_flags::flag("ILR_LABELDBG");
+    let trace = crate::recovery::env_flags::flag("ILR_TRACE");
+    macro_rules! step {
+        ($idx:expr, $e:expr) => {{
+            let before = if labeldbg { missing_labels(stmts) } else { 0 };
+            let labels_before: HashSet<String> = if trace {
+                let mut out = HashSet::new();
+                collect_labels(stmts, &mut out);
+                out
+            } else {
+                HashSet::new()
+            };
+            $e;
+            if labeldbg {
+                let after = missing_labels(stmts);
+                if after > before {
+                    IDIOM_LABEL_LOST[$idx]
+                        .fetch_add((after - before) as u64, Ordering::Relaxed);
+                }
+            }
+            if trace && !labels_before.is_empty() {
+                let mut after = HashSet::new();
+                collect_labels(stmts, &mut after);
+                let gotos = goto_targets(stmts);
+                for l in labels_before.difference(&after) {
+                    if gotos.contains(l) {
+                        eprintln!(
+                            "[labdrop] {:#x} {} {l}",
+                            crate::recovery::reconstruct::trace_rva_pub(),
+                            IDIOM_STEP_NAMES[$idx]
+                        );
+                    }
+                }
+            }
+        }};
+    }
     // The enumerator collapse runs FIRST: it removes the acquisition, the
     // `MoveNext` test and the `.Current` read as a UNIT, and every later rewrite
     // would see those three separately and could fold a guard between them into
     // something the shape test no longer recognises.
-    collapse_enumerator_loops(stmts);
+    step!(0, collapse_enumerator_loops(stmts));
     // Masked-assembly folding runs next: it removes whole statements, so
     // doing it before dead-code means the orphaned labels/gotos it can leave
     // are swept by the same pass rather than surviving to the printer.
-    collapse_class_init_guards(stmts);
-    dead_code(stmts);
-    propagate_fields(stmts);
-    dead_code(stmts);
+    step!(1, collapse_class_init_guards(stmts));
+    step!(2, dead_code(stmts));
+    step!(3, propagate_fields(stmts));
+    step!(4, dead_code(stmts));
     // Restatement runs LAST, on the cleaned tree: a folded ternary or a
     // combined guard produces an `if`/assign the earlier passes have already
     // had their chance at, and a `goto` turned into `break` can newly orphan
     // the label it used to name (swept by `drop_unreferenced_labels` below).
-    drop_self_assignments(stmts);
-    fold_if_assign_to_ternary(stmts);
-    combine_nested_ifs(stmts);
-    collapse_goto_to_loop_break(stmts);
+    step!(5, {
+        drop_self_assignments(stmts);
+        fold_if_assign_to_ternary(stmts);
+        combine_nested_ifs(stmts);
+        collapse_goto_to_loop_break(stmts);
+    });
     // A converted `break` terminates its statement list, so whatever followed
     // it in the same arm is now unreachable.
-    dead_code(stmts);
-    drop_unreferenced_labels(stmts);
+    step!(6, dead_code(stmts));
+    step!(7, drop_unreferenced_labels(stmts));
+}
+
+/// Dangling-goto growth per idiom step (`ILR_LABELDBG=1`).
+static IDIOM_LABEL_LOST: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+pub(crate) const IDIOM_STEP_NAMES: [&str; 8] = [
+    "idioms:enumerator",
+    "idioms:classinit",
+    "idioms:dead1",
+    "idioms:propagate",
+    "idioms:dead2",
+    "idioms:restate",
+    "idioms:dead3",
+    "idioms:labels",
+];
+
+pub(crate) fn idiom_label_loss() -> [u64; 8] {
+    std::array::from_fn(|i| IDIOM_LABEL_LOST[i].load(Ordering::Relaxed))
+}
+
+/// Every label name a `goto` in the tree targets (trace helper).
+fn goto_targets(stmts: &[Stmt]) -> HashSet<String> {
+    fn walk(list: &[Stmt], out: &mut HashSet<String>) {
+        for s in list {
+            if let Stmt::Goto(l) = s {
+                out.insert(l.clone());
+            }
+            let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+            super::reconstruct::children(s, &mut kids);
+            for k in kids {
+                walk(k, out);
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(stmts, &mut out);
+    out
+}
+
+/// `goto` targets in `stmts` with no definition anywhere in the tree.
+fn missing_labels(stmts: &[Stmt]) -> usize {
+    fn walk(list: &[Stmt], defs: &mut std::collections::HashSet<String>, gotos: &mut std::collections::HashSet<String>) {
+        for s in list {
+            match s {
+                Stmt::Label(l) => {
+                    defs.insert(l.clone());
+                }
+                Stmt::Goto(l) => {
+                    gotos.insert(l.clone());
+                }
+                _ => {}
+            }
+            let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+            super::reconstruct::children(s, &mut kids);
+            for k in kids {
+                walk(k, defs, gotos);
+            }
+        }
+    }
+    let mut defs = std::collections::HashSet::new();
+    let mut gotos = std::collections::HashSet::new();
+    walk(stmts, &mut defs, &mut gotos);
+    gotos.difference(&defs).count()
 }
 
 /// The idiom counts for the run report, or an empty string if nothing fired.
@@ -221,14 +324,22 @@ pub fn collapse_class_init_guards(stmts: &mut Vec<Stmt>) {
     // emptiness is judged (a folded inner guard leaves the parent identical).
     for s in stmts.iter_mut() {
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collapse_class_init_guards(then_body);
                 collapse_class_init_guards(else_body);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
                 collapse_class_init_guards(body)
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 collapse_class_init_guards(try_body);
                 for (_, b) in catches.iter_mut() {
                     collapse_class_init_guards(b);
@@ -237,11 +348,14 @@ pub fn collapse_class_init_guards(stmts: &mut Vec<Stmt>) {
                     collapse_class_init_guards(f);
                 }
             }
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch { cases, tail, default, .. } => {
                 for (_, b) in cases.iter_mut() {
                     collapse_class_init_guards(b);
                 }
                 collapse_class_init_guards(tail);
+                if let Some(arm) = default {
+                    collapse_class_init_guards(arm);
+                }
             }
             _ => {}
         }
@@ -271,6 +385,188 @@ pub fn collapse_class_init_guards(stmts: &mut Vec<Stmt>) {
             .class_init_guards
             .fetch_add(removed, Ordering::Relaxed);
     }
+    // FLAT-GUARD FORM: the IL2CPP init guard often survives into the statement
+    // tree as a flat sequence rather than the nested if-body form:
+    //
+    //   if (cond) goto L;   ← guard branch (then-arm is a lone goto)
+    //   <call>;             ← runtime class-init call
+    //   *(byte*)(addr) = 1; ← init flag store
+    //   L:                  ← join label
+    //
+    // `branch_repair`'s `fold_branch_over_join` normally converts this to the
+    // if-body form the `is_class_init_guard` test above matches. But the fold
+    // is blocked when an outside edge targets a label in the region (a shared
+    // merge point, a second guard chain's join, etc.). The flat guard then
+    // survives ALL the way to the output. This sweep catches it directly.
+    //
+    // The safety argument is the same as the if-body form: the entire sequence
+    // is runtime bookkeeping (a byte-vs-zero test, a runtime call, a literal-1
+    // store into a static byte) that managed C# does not contain.
+    let flat_removed = collapse_flat_init_guards(stmts);
+    if flat_removed > 0 {
+        IDIOMS
+            .class_init_guards
+            .fetch_add(flat_removed, Ordering::Relaxed);
+    }
+}
+
+/// Remove flat init-guard sequences from a statement list.
+///
+/// Scans for the pattern `if(c) goto L; <call>; <store-1>; L:` and removes the
+/// first three statements, keeping the label so other gotos still work.
+/// Returns the number of guards removed.
+fn collapse_flat_init_guards(stmts: &mut Vec<Stmt>) -> u64 {
+    let mut removed = 0u64;
+    let mut i = 0;
+    while i + 3 < stmts.len() {
+        if let Some((goto_label, call_idx, store_idx, label_idx)) =
+            match_flat_init_guard(stmts, i)
+        {
+            // Verify the label matches the goto target.
+            if let Stmt::Label(ref l) = stmts[label_idx] {
+                if *l == goto_label {
+                    // Remove the three statements in reverse order to keep
+                    // indices stable.
+                    stmts.remove(store_idx);
+                    stmts.remove(call_idx);
+                    stmts.remove(i);
+                    removed += 1;
+                    // Don't advance `i`: the next statement (now at index `i`)
+                    // may be the start of another flat guard chain.
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    removed
+}
+
+/// Check if a flat init guard starts at position `start` in `stmts`.
+///
+/// Returns `Some((goto_label, call_idx, store_idx, label_idx))` when the
+/// pattern matches, or `None` when it does not.
+///
+/// The pattern is:
+///   `stmts[start]`   = `if (cond) { goto L; }` (else empty, then = lone goto)
+///   `stmts[start+1]` = call statement
+///   `stmts[start+2]` = `*(static_addr) = 1`
+///   `stmts[start+3]` = `Label(L)`
+///
+/// Comments and attributes between the statements are skipped.
+fn match_flat_init_guard(
+    stmts: &[Stmt],
+    start: usize,
+) -> Option<(String, usize, usize, usize)> {
+    // Position `start`: the guard `if`.
+    let Stmt::If {
+        cond: _,
+        then_body,
+        else_body,
+    } = &stmts[start]
+    else {
+        return None;
+    };
+    // Else arm must be empty (no execution on the false path).
+    if else_body.iter().any(|s| !is_trivia(s)) {
+        return None;
+    }
+    // Then arm must be a lone goto (labels/comments around it are scaffolding).
+    let mut payload = then_body
+        .iter()
+        .filter(|s| !matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. } | Stmt::Label(_)));
+    let (Some(Stmt::Goto(label)), None) = (payload.next(), payload.next()) else {
+        return None;
+    };
+    let goto_label = label.clone();
+
+    // The condition must test a static word (same safety gate as the if-body
+    // form — keeps this from firing on a user's branch).
+    let Stmt::If { cond, .. } = &stmts[start] else {
+        return None;
+    };
+    if !flat_guard_cond_tests_static_word(cond) {
+        return None;
+    }
+
+    // Position `start+1`: skip comments/attributes to find the call.
+    let call_idx = next_non_trivia(stmts, start + 1)?;
+    if !is_call_stmt(&stmts[call_idx]) {
+        return None;
+    }
+
+    // Position after the call: skip comments/attributes to find the store.
+    let store_idx = next_non_trivia(stmts, call_idx + 1)?;
+    if !is_flat_init_store(&stmts[store_idx]) {
+        return None;
+    }
+
+    // Position after the store: skip comments/attributes to find the label.
+    // The label itself is trivia to `next_non_trivia`, so that helper cannot
+    // be used here — it would skip the join label and find the code after it.
+    let mut label_idx = store_idx + 1;
+    while label_idx < stmts.len()
+        && matches!(stmts[label_idx], Stmt::Comment(_) | Stmt::Attribute { .. })
+    {
+        label_idx += 1;
+    }
+    if label_idx >= stmts.len() || !matches!(stmts[label_idx], Stmt::Label(_)) {
+        return None;
+    }
+
+    // The label must be exactly 3 meaningful positions after the if (call,
+    // store, label) — but with possible comments interspersed, we just need
+    // the label to follow the store. The `next_non_trivia` calls above ensure
+    // there is nothing else between them.
+
+    Some((goto_label, call_idx, store_idx, label_idx))
+}
+
+/// Does this condition test a static word against zero (or a masked static
+/// word)? The flat form uses the same shapes as the if-body form.
+fn flat_guard_cond_tests_static_word(cond: &Expr) -> bool {
+    // Strip a leading `Not` wrapper (the condition may have been inverted).
+    let inner = match cond {
+        Expr::Not(e) => e.as_ref(),
+        other => other,
+    };
+    // Must be a comparison.
+    let Expr::Cmp(k, a, b) = inner else {
+        return false;
+    };
+    if !matches!(k, CmpKind::Eq | CmpKind::Ne) {
+        return false;
+    }
+    // One side must be zero; the other must read a static word.
+    let load = if matches!(**b, Expr::Int(0)) {
+        &**a
+    } else if matches!(**a, Expr::Int(0)) {
+        &**b
+    } else {
+        return false;
+    };
+    reads_static_word(load)
+}
+
+/// Is this statement a `*(static_addr) = 1` store (the init flag write)?
+fn is_flat_init_store(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::Assign(lhs, _, Expr::Int(1) | Expr::Bool(true)) if lhs.starts_with('*')
+    )
+}
+
+/// Index of the next non-trivia statement at or after `from`, or `None`.
+fn next_non_trivia(stmts: &[Stmt], from: usize) -> Option<usize> {
+    let mut j = from;
+    while j < stmts.len() {
+        if is_trivia(&stmts[j]) {
+            j += 1;
+        } else {
+            return Some(j);
+        }
+    }
+    None
 }
 
 /// Class-init guards standing in a statement list, keyed by the address of the
@@ -310,7 +606,9 @@ impl GuardFolds {
 
 /// The runtime call an already-recognised class-init guard would erase.
 fn class_init_guard_call(s: &Stmt) -> Option<u64> {
-    let Stmt::If { then_body, .. } = s else { return None };
+    let Stmt::If { then_body, .. } = s else {
+        return None;
+    };
     then_body.iter().find_map(|st| match st {
         Stmt::Eval(Expr::RawCall(a, ..)) => Some(*a),
         Stmt::Assign(_, _, Expr::RawCall(a, ..)) => Some(*a),
@@ -331,14 +629,22 @@ pub fn count_class_init_guards(stmts: &[Stmt]) -> GuardFolds {
         }
         let mut inner = GuardFolds::default();
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 inner.merge(&count_class_init_guards(then_body));
                 inner.merge(&count_class_init_guards(else_body));
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
                 inner.merge(&count_class_init_guards(body));
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 inner.merge(&count_class_init_guards(try_body));
                 for (_, b) in catches.iter() {
                     inner.merge(&count_class_init_guards(b));
@@ -347,22 +653,99 @@ pub fn count_class_init_guards(stmts: &[Stmt]) -> GuardFolds {
                     inner.merge(&count_class_init_guards(f));
                 }
             }
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch { cases, tail, default, .. } => {
                 for (_, b) in cases {
                     inner.merge(&count_class_init_guards(b));
                 }
                 inner.merge(&count_class_init_guards(tail));
+                if let Some(arm) = default {
+                    inner.merge(&count_class_init_guards(arm));
+                }
             }
             _ => {}
         }
         f.merge(&inner);
     }
+    // Also count flat-form guards (the `if(c) goto L; call; store; L:` shape).
+    count_flat_init_guards(stmts, &mut f);
     f
 }
 
-/// Label / comment — carries no execution.
+/// Count flat-form init guards in a statement list and their nested bodies.
+fn count_flat_init_guards(stmts: &[Stmt], out: &mut GuardFolds) {
+    let mut i = 0;
+    while i + 3 < stmts.len() {
+        if let Some((goto_label, call_idx, _store_idx, label_idx)) =
+            match_flat_init_guard(stmts, i)
+        {
+            if let Stmt::Label(ref l) = stmts[label_idx] {
+                if *l == goto_label {
+                    // Extract the call target for ledgering.
+                    match flat_guard_call(&stmts[call_idx]) {
+                        Some(a) => *out.by_target.entry(a).or_insert(0) += 1,
+                        None => out.unmappable += 1,
+                    }
+                    // Skip past this guard.
+                    i = label_idx + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // Recurse into nested bodies.
+    for s in stmts {
+        match s {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                count_flat_init_guards(then_body, out);
+                count_flat_init_guards(else_body, out);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                count_flat_init_guards(body, out);
+            }
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
+                count_flat_init_guards(try_body, out);
+                for (_, b) in catches {
+                    count_flat_init_guards(b, out);
+                }
+                if let Some(f) = finally_body {
+                    count_flat_init_guards(f, out);
+                }
+            }
+            Stmt::Switch { cases, tail, default, .. } => {
+                for (_, b) in cases {
+                    count_flat_init_guards(b, out);
+                }
+                count_flat_init_guards(tail, out);
+                if let Some(arm) = default {
+                    count_flat_init_guards(arm, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The runtime call target from a flat guard's call statement.
+fn flat_guard_call(s: &Stmt) -> Option<u64> {
+    match s {
+        Stmt::Eval(Expr::RawCall(a, ..)) => Some(*a),
+        Stmt::Assign(_, _, Expr::RawCall(a, ..)) => Some(*a),
+        _ => None,
+    }
+}
+
+/// Label / comment / attribute — carries no execution.
 fn is_trivia(s: &Stmt) -> bool {
-    matches!(s, Stmt::Label(_) | Stmt::Comment(_))
+    matches!(s, Stmt::Label(_) | Stmt::Comment(_) | Stmt::Attribute { .. })
 }
 
 /// A call evaluated for its side effect, in either the bare or the
@@ -387,7 +770,9 @@ fn is_call_stmt(s: &Stmt) -> bool {
 fn reads_static_word(e: &Expr) -> bool {
     match e {
         Expr::StaticField(..) | Expr::Int(_) => true,
-        Expr::RawDeref(b, _, _) | Expr::RawAddr(b, _) => reads_static_word(b) || roots_in_immediate(e),
+        Expr::RawDeref(b, _, _) | Expr::RawAddr(b, _) => {
+            reads_static_word(b) || roots_in_immediate(e)
+        }
         Expr::Field(b, _) => reads_static_word(b),
         _ => roots_in_immediate(e),
     }
@@ -395,7 +780,12 @@ fn reads_static_word(e: &Expr) -> bool {
 
 /// Recognise the static-init guard at the statement level.
 fn is_class_init_guard(s: &Stmt) -> bool {
-    let Stmt::If { cond, then_body, else_body } = s else {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = s
+    else {
         return false;
     };
     // The else arm must carry no execution — the guard has no false branch.
@@ -403,7 +793,9 @@ fn is_class_init_guard(s: &Stmt) -> bool {
         return false;
     }
     // Condition: `<static word> == 0` / `!= 0` (either operand order).
-    let Expr::Cmp(k, a, b) = cond else { return false };
+    let Expr::Cmp(k, a, b) = cond else {
+        return false;
+    };
     if !matches!(k, CmpKind::Eq | CmpKind::Ne) {
         return false;
     }
@@ -457,7 +849,7 @@ fn is_terminator(s: &Stmt) -> bool {
 fn next_control_index(list: &[Stmt], i: usize) -> Option<usize> {
     let mut j = i + 1;
     while j < list.len() {
-        if matches!(list[j], Stmt::Comment(_)) {
+        if matches!(list[j], Stmt::Comment(_) | Stmt::Attribute { .. }) {
             j += 1;
             continue;
         }
@@ -467,26 +859,34 @@ fn next_control_index(list: &[Stmt], i: usize) -> Option<usize> {
 }
 
 fn dead_code(stmts: &mut Vec<Stmt>) {
+    // Labels named by ANY `goto` in the method. A statement after a
+    // terminator that CONTAINS such a label is a jump-target container, not
+    // a dead sibling: dropping it orphans the jump. This is the traced origin
+    // of 1,157 of the 5,713 final marker lines (`ILR_TRACE` join: 20.3 %,
+    // `idioms:dead1`), and the guard was A/B-measured with duplication at the
+    // baseline (R175: 2,741 vs 2,780 sequences).
+    let targets = goto_targets(stmts);
+    dead_code_with(stmts, &targets);
+}
+
+/// Does this statement (or anything nested) define a label in `targets`?
+fn holds_targeted_label(s: &Stmt, targets: &HashSet<String>) -> bool {
+    if let Stmt::Label(l) = s {
+        if targets.contains(l) {
+            return true;
+        }
+    }
+    let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+    super::reconstruct::children(s, &mut kids);
+    kids.iter()
+        .any(|k| k.iter().any(|x| holds_targeted_label(x, targets)))
+}
+
+fn dead_code_with(stmts: &mut Vec<Stmt>, targets: &HashSet<String>) {
     // Bottom-up: a nested block's dead tail must go before the parent's
     // adjacency checks look at it.
     for s in stmts.iter_mut() {
-        match s {
-            Stmt::If { then_body, else_body, .. } => {
-                dead_code(then_body);
-                dead_code(else_body);
-            }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => dead_code(body),
-            Stmt::Try { try_body, catches, finally_body } => {
-                dead_code(try_body);
-                for (_, b) in catches.iter_mut() {
-                    dead_code(b);
-                }
-                if let Some(f) = finally_body {
-                    dead_code(f);
-                }
-            }
-            _ => {}
-        }
+        recurse_into_bodies(s, &mut |body| dead_code_with(body, targets));
     }
 
     // --- 1. `goto L;` immediately followed by `L:` --------------------------
@@ -500,10 +900,14 @@ fn dead_code(stmts: &mut Vec<Stmt>) {
     let mut keep = vec![true; old.len()];
     for i in 0..old.len() {
         let Stmt::Goto(l) = &old[i] else { continue };
-        let Some(j) = next_control_index(&old, i) else { continue };
+        let Some(j) = next_control_index(&old, i) else {
+            continue;
+        };
         if matches!(&old[j], Stmt::Label(x) if x == l) {
             keep[i] = false;
-            IDIOMS.dead_goto_to_next_label.fetch_add(1, Ordering::Relaxed);
+            IDIOMS
+                .dead_goto_to_next_label
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -540,7 +944,7 @@ fn dead_code(stmts: &mut Vec<Stmt>) {
     let mut dropped = false;
     stmts.retain(|s| {
         if dropped {
-            if !matches!(s, Stmt::Label(_)) {
+            if !matches!(s, Stmt::Label(_)) && !holds_targeted_label(s, targets) {
                 IDIOMS
                     .dead_statements_after_terminator
                     .fetch_add(1, Ordering::Relaxed);
@@ -553,6 +957,29 @@ fn dead_code(stmts: &mut Vec<Stmt>) {
         }
         true
     });
+}
+
+/// Remove statements that follow a terminator in each statement list.
+///
+/// Coverage repair appends labelled regions after the structured body. Since
+/// labels are control-flow entry points, `dead_code` stops at each one and can
+/// safely clean unreachable tails inside the repaired output as well.
+pub(crate) fn prune_dead_code(stmts: &mut Vec<Stmt>) {
+    // The coverage-repair tail can contain cold EH landing pads. Their entry
+    // edges come from the unwinder, not a C# goto, so label-reference cleanup
+    // may have removed the label that would otherwise stop `dead_code`.
+    // Restrict this final sweep to the structured body before the marker; the
+    // repair output itself has already had the ordinary idiom cleanup pass.
+    let repair_start = stmts
+        .iter()
+        .position(|s| matches!(s, Stmt::Comment(c) if c.starts_with("[recovery] emitted ")));
+    if let Some(at) = repair_start {
+        let mut repair_tail = stmts.split_off(at);
+        dead_code(stmts);
+        stmts.append(&mut repair_tail);
+    } else {
+        dead_code(stmts);
+    }
 }
 
 /// Drop labels that no `goto` and no `switch` arm can reach.
@@ -569,31 +996,18 @@ fn drop_unreferenced_labels(stmts: &mut Vec<Stmt>) {
 
 fn collect_jump_targets(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
-        match s {
-            Stmt::Goto(l) => {
-                out.insert(l.clone());
-            }
-            Stmt::Switch { cases, tail, .. } => {
-                for (_, body) in cases {
-                    collect_jump_targets(body, out);
-                }
-                collect_jump_targets(tail, out);
-            }
-            Stmt::If { then_body, else_body, .. } => {
-                collect_jump_targets(then_body, out);
-                collect_jump_targets(else_body, out);
-            }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_jump_targets(body, out),
-            Stmt::Try { try_body, catches, finally_body } => {
-                collect_jump_targets(try_body, out);
-                for (_, b) in catches {
-                    collect_jump_targets(b, out);
-                }
-                if let Some(f) = finally_body {
-                    collect_jump_targets(f, out);
-                }
-            }
-            _ => {}
+        if let Stmt::Goto(l) = s {
+            out.insert(l.clone());
+        }
+        // Exhaustive visitor: the hand-rolled match here used to omit
+        // For/ForEach/Lock/Using/StringSwitch bodies, so a label referenced
+        // only from inside one of those was judged "unreferenced" and
+        // deleted — leaving `goto L<missing>` behind (part of the
+        // target-not-emitted class).
+        let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+        super::reconstruct::children(s, &mut kids);
+        for k in kids {
+            collect_jump_targets(k, out);
         }
     }
 }
@@ -605,22 +1019,8 @@ fn remove_labels(stmts: &mut Vec<Stmt>, referenced: &HashSet<String>) {
         .dead_unreferenced_label
         .fetch_add((before - stmts.len()) as u64, Ordering::Relaxed);
     for s in stmts.iter_mut() {
-        match s {
-            Stmt::If { then_body, else_body, .. } => {
-                remove_labels(then_body, referenced);
-                remove_labels(else_body, referenced);
-            }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => remove_labels(body, referenced),
-            Stmt::Try { try_body, catches, finally_body } => {
-                remove_labels(try_body, referenced);
-                for (_, b) in catches.iter_mut() {
-                    remove_labels(b, referenced);
-                }
-                if let Some(f) = finally_body {
-                    remove_labels(f, referenced);
-                }
-            }
-            _ => {}
+        for k in super::reconstruct::children_mut(s) {
+            remove_labels(k, referenced);
         }
     }
 }
@@ -665,12 +1065,20 @@ fn remove_labels(stmts: &mut Vec<Stmt>, referenced: &HashSet<String>) {
 fn propagate_fields(stmts: &mut Vec<Stmt>) {
     for s in stmts.iter_mut() {
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 propagate_fields(then_body);
                 propagate_fields(else_body);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => propagate_fields(body),
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 propagate_fields(try_body);
                 for (_, b) in catches.iter_mut() {
                     propagate_fields(b);
@@ -733,15 +1141,6 @@ fn propagate_fields_one_list(stmts: &mut Vec<Stmt>) {
         if (first + 1..last).any(|i| stmt_may_write(&stmts[i], &shadowed)) {
             continue;
         }
-        let name = loop {
-            let n = format!("sf{next_temp}");
-            next_temp += 1;
-            if !used_names.contains(&n) {
-                break n;
-            }
-        };
-        used_names.insert(name.clone());
-
         // Materialize the load ONCE, immediately before its first use — exactly
         // where the machine evaluated it.
         let mut value = None;
@@ -751,6 +1150,29 @@ fn propagate_fields_one_list(stmts: &mut Vec<Stmt>) {
             }
         });
         let Some(value) = value else { continue };
+        let name = if let Some(base) = field_load_role(&value) {
+            if !used_names.contains(&base) {
+                base
+            } else {
+                let mut k = 2usize;
+                loop {
+                    let n = format!("{base}{k}");
+                    if !used_names.contains(&n) {
+                        break n;
+                    }
+                    k += 1;
+                }
+            }
+        } else {
+            loop {
+                let n = format!("sf{next_temp}");
+                next_temp += 1;
+                if !used_names.contains(&n) {
+                    break n;
+                }
+            }
+        };
+        used_names.insert(name.clone());
         stmts.insert(first, Stmt::Assign(name.clone(), None, value));
         // Indices at and after the insertion point shift by one.
         let last = last + 1;
@@ -839,16 +1261,23 @@ fn stmt_may_write(s: &Stmt, names: &HashSet<String>) -> bool {
                 || expr_mentions_any_var(rhs, names)
         }
         Stmt::Return(Some(e)) | Stmt::Throw(e) => cleanup::expr_has_side_effect(e),
-        Stmt::If { cond, then_body, else_body } => {
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
             cleanup::expr_has_side_effect(cond)
                 || then_body.iter().any(|s| stmt_may_write(s, names))
                 || else_body.iter().any(|s| stmt_may_write(s, names))
         }
         Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
-            cleanup::expr_has_side_effect(cond)
-                || body.iter().any(|s| stmt_may_write(s, names))
+            cleanup::expr_has_side_effect(cond) || body.iter().any(|s| stmt_may_write(s, names))
         }
-        Stmt::Try { try_body, catches, finally_body } => {
+        Stmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => {
             try_body.iter().any(|s| stmt_may_write(s, names))
                 || catches
                     .iter()
@@ -864,6 +1293,72 @@ fn stmt_may_write(s: &Stmt, names: &HashSet<String>) -> bool {
 /// Identifier-shaped tokens of a rendered expression, so `stmt_may_write` can ask
 /// whether a write rebinds one of them. Only used to be CONSERVATIVE: a spurious
 /// match merely declines the optimisation.
+/// A source-style name for a materialized repeated FIELD LOAD:
+/// `contents.Length` → `contentsLength`, `this._state` → `state`.
+/// The old pass always called these `sfN`, which reads like a static field
+/// and hides the one piece of evidence the load carries — the field itself.
+fn field_load_role(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Field(base, field) => {
+            let field = unwrap_backing_name(field);
+            if field.is_empty() {
+                return None;
+            }
+            let lower = lower_first(field);
+            let name = match base.as_ref() {
+                Expr::Var(b) if plain_name(b) && !b.starts_with('v') => {
+                    let mut c = field.chars();
+                    let cap = c.next()?.to_ascii_uppercase();
+                    format!("{b}{cap}{}", c.as_str())
+                }
+                _ => lower,
+            };
+            valid_identifier(&name).then_some(name)
+        }
+        Expr::StaticField(_, field) => {
+            let field = unwrap_backing_name(field);
+            let name = lower_first(field);
+            valid_identifier(&name).then_some(name)
+        }
+        _ => None,
+    }
+}
+
+fn unwrap_backing_name(field: &str) -> &str {
+    if let Some(rest) = field.strip_prefix('<') {
+        if let Some(end) = rest.find(">k__BackingField") {
+            return &rest[..end];
+        }
+    }
+    field.trim_start_matches('_').trim_start_matches("m_")
+}
+
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => std::iter::once(f.to_ascii_lowercase()).chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+fn plain_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn valid_identifier(n: &str) -> bool {
+    plain_name(n)
+        && n.len() >= 3
+        && !matches!(
+            n,
+            "this" | "base" | "null" | "true" | "false" | "new" | "default" | "class"
+                | "int" | "long" | "float" | "double" | "bool" | "string" | "object"
+                | "void" | "return" | "break" | "continue" | "if" | "else" | "while"
+                | "for" | "foreach" | "switch" | "case" | "try" | "catch" | "finally"
+        )
+}
+
 fn vars_in_key(key: &str) -> HashSet<String> {
     key.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|t| !t.is_empty())
@@ -895,6 +1390,13 @@ fn expr_mentions_any_var(e: &Expr, names: &HashSet<String>) -> bool {
         Expr::RawCall(_, args, _) | Expr::NewObj(_, args) | Expr::NewArr(_, args) => {
             args.iter().any(|a| expr_mentions_any_var(a, names))
         }
+        Expr::ArrayInit { items, .. } => items.iter().any(|a| expr_mentions_any_var(a, names)),
+        Expr::CollectionInit {
+            ctor_args, items, ..
+        } => {
+            ctor_args.iter().any(|a| expr_mentions_any_var(a, names))
+                || items.iter().any(|a| expr_mentions_any_var(a, names))
+        }
         _ => false,
     }
 }
@@ -905,12 +1407,20 @@ fn collect_var_names(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::Assign(t, _, _) => {
                 out.insert(t.clone());
             }
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collect_var_names(then_body, out);
                 collect_var_names(else_body, out);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_var_names(body, out),
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 collect_var_names(try_body, out);
                 for (_, b) in catches {
                     collect_var_names(b, out);
@@ -960,9 +1470,7 @@ fn drop_self_assignments(stmts: &mut Vec<Stmt>) {
 
 fn is_self_assignment(s: &Stmt) -> bool {
     match s {
-        Stmt::Assign(t, ty, Expr::Var(n)) => {
-            ty.is_none() && t == n && !t.starts_with('*')
-        }
+        Stmt::Assign(t, ty, Expr::Var(n)) => ty.is_none() && t == n && !t.starts_with('*'),
         _ => false,
     }
 }
@@ -993,7 +1501,12 @@ fn fold_if_assign_to_ternary(stmts: &mut Vec<Stmt>) {
     }
     let mut n = 0u64;
     for s in stmts.iter_mut() {
-        let Stmt::If { cond, then_body, else_body } = s else {
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = s
+        else {
             continue;
         };
         let (Some((tv, tt, te)), Some((ev, et, ee))) =
@@ -1021,7 +1534,7 @@ fn sole_assignment(body: &[Stmt]) -> Option<(String, Option<String>, Expr)> {
     let mut found: Option<(String, Option<String>, Expr)> = None;
     for s in body {
         match s {
-            Stmt::Comment(_) => continue,
+            Stmt::Comment(_) | Stmt::Attribute { .. } => continue,
             // A label is a jump target: the folded form cannot hold one.
             Stmt::Label(_) => return None,
             Stmt::Assign(t, ty, e) => {
@@ -1054,7 +1567,12 @@ fn combine_nested_ifs(stmts: &mut Vec<Stmt>) {
     }
     let mut n = 0u64;
     for s in stmts.iter_mut() {
-        let Stmt::If { cond, then_body, else_body } = s else {
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = s
+        else {
             continue;
         };
         if else_body.iter().any(|x| !is_trivia(x)) {
@@ -1065,12 +1583,16 @@ fn combine_nested_ifs(stmts: &mut Vec<Stmt>) {
         let mut ok = true;
         for x in then_body.iter() {
             match x {
-                Stmt::Comment(_) => continue,
+                Stmt::Comment(_) | Stmt::Attribute { .. } => continue,
                 Stmt::Label(_) => {
                     ok = false;
                     break;
                 }
-                Stmt::If { cond: c2, then_body: t2, else_body: e2 } => {
+                Stmt::If {
+                    cond: c2,
+                    then_body: t2,
+                    else_body: e2,
+                } => {
                     if inner.is_some() || e2.iter().any(|y| !is_trivia(y)) {
                         ok = false;
                         break;
@@ -1148,9 +1670,11 @@ fn combine_nested_ifs(stmts: &mut Vec<Stmt>) {
 /// `«collection».GetEnumerator()` / `.get_Enumerator()`.
 fn enumerator_acquire(e: &Expr) -> Option<Expr> {
     match e {
-        Expr::Call { recv: Some(c), name, args }
-            if args.is_empty() && (name == "GetEnumerator" || name == "get_Enumerator") =>
-        {
+        Expr::Call {
+            recv: Some(c),
+            name,
+            args,
+        } if args.is_empty() && (name == "GetEnumerator" || name == "get_Enumerator") => {
             Some((**c).clone())
         }
         _ => None,
@@ -1160,12 +1684,14 @@ fn enumerator_acquire(e: &Expr) -> Option<Expr> {
 /// The local an `«local».MoveNext()` expression is called on.
 fn move_next_receiver(e: &Expr) -> Option<&str> {
     match e {
-        Expr::Call { recv: Some(r), name, args } if args.is_empty() && name == "MoveNext" => {
-            match &**r {
-                Expr::Var(v) => Some(v),
-                _ => None,
-            }
-        }
+        Expr::Call {
+            recv: Some(r),
+            name,
+            args,
+        } if args.is_empty() && name == "MoveNext" => match &**r {
+            Expr::Var(v) => Some(v),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1176,9 +1702,11 @@ fn is_current_of(e: &Expr, v: &str) -> bool {
         Expr::Field(b, name) if name == "Current" => {
             matches!(&**b, Expr::Var(x) if x == v)
         }
-        Expr::Call { recv: Some(r), name, args }
-            if args.is_empty() && (name == "get_Current" || name == "Current") =>
-        {
+        Expr::Call {
+            recv: Some(r),
+            name,
+            args,
+        } if args.is_empty() && (name == "get_Current" || name == "Current") => {
             matches!(&**r, Expr::Var(x) if x == v)
         }
         _ => false,
@@ -1220,7 +1748,7 @@ fn collapse_enumerator_loops_here(stmts: &mut Vec<Stmt>, reads: &HashMap<String,
                 // LABEL may not (a jump could enter the loop, bypassing the
                 // foreach header).
                 let mut k = 0usize;
-                while k < buf.len() && matches!(buf[k], Stmt::Comment(_)) {
+                while k < buf.len() && matches!(buf[k], Stmt::Comment(_) | Stmt::Attribute { .. }) {
                     k += 1;
                 }
                 if k < buf.len() {
@@ -1320,7 +1848,11 @@ fn try_collapse_enumerator(
     }
     let mut coll_s = String::new();
     coll.render(&mut coll_s);
-    Some(Stmt::ForEach { var_name: elem, collection: coll_s, body })
+    Some(Stmt::ForEach {
+        var_name: elem,
+        collection: coll_s,
+        body,
+    })
 }
 
 /// `true` / `1` / `0 == 0` — a loop condition that never exits.
@@ -1371,14 +1903,19 @@ fn cond_is_move_next_failure(cond: &Expr, v: &str) -> bool {
 /// temporary it binds is read anywhere the fold would no longer define it.
 fn take_body_move_next_test(body: &mut Vec<Stmt>, v: &str) -> bool {
     let mut i = 0usize;
-    while i < body.len() && matches!(body[i], Stmt::Comment(_)) {
+    while i < body.len() && matches!(body[i], Stmt::Comment(_) | Stmt::Attribute { .. }) {
         i += 1;
     }
     // `t = e.MoveNext(); if (t == 0) break;`
     if let Some(Stmt::Assign(t, _, rhs)) = body.get(i) {
         if move_next_receiver(rhs) == Some(v) && !t.starts_with('*') {
             let t = t.clone();
-            if let Some(Stmt::If { cond, then_body, else_body }) = body.get(i + 1) {
+            if let Some(Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            }) = body.get(i + 1)
+            {
                 if else_body.is_empty()
                     && then_body.len() == 1
                     && matches!(then_body[0], Stmt::Break)
@@ -1391,7 +1928,12 @@ fn take_body_move_next_test(body: &mut Vec<Stmt>, v: &str) -> bool {
         }
     }
     // `if (!e.MoveNext()) break;`
-    if let Some(Stmt::If { cond, then_body, else_body }) = body.get(i) {
+    if let Some(Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    }) = body.get(i)
+    {
         if else_body.is_empty()
             && then_body.len() == 1
             && matches!(then_body[0], Stmt::Break)
@@ -1444,19 +1986,30 @@ fn count_goto_targets(stmts: &[Stmt], out: &mut HashMap<String, usize>) {
     for s in stmts {
         match s {
             Stmt::Goto(l) => *out.entry(l.clone()).or_insert(0) += 1,
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 count_goto_targets(then_body, out);
                 count_goto_targets(else_body, out);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => count_goto_targets(body, out),
             Stmt::ForEach { body, .. } => count_goto_targets(body, out),
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch { cases, tail, default, .. } => {
                 for (_, b) in cases {
                     count_goto_targets(b, out);
                 }
                 count_goto_targets(tail, out);
+                if let Some(arm) = default {
+                    count_goto_targets(arm, out);
+                }
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 count_goto_targets(try_body, out);
                 for (_, b) in catches {
                     count_goto_targets(b, out);
@@ -1474,15 +2027,22 @@ fn count_goto_targets(stmts: &[Stmt], out: &mut HashMap<String, usize>) {
 ///
 /// The runtime's null check before a call on the enumerator is one of
 ///
-///     if (v != 0) goto L;   helper(…);   L:     // branch form
-///     if (v == 0) helper(…);                    // guard form
+/// ```text
+/// if (v != 0) goto L;   helper(…);   L:     // branch form
+/// if (v == 0) helper(…);                    // guard form
+/// ```
 ///
 /// where `helper` is the null-reference thrower (an unresolved raw call). A
 /// `foreach` over `v` cannot be null, so neither evaluates anything the program
 /// needs. The branch form is only recognised when THIS guard is the label's one
 /// and only target, so no `goto` is left pointing at a deleted label.
 fn guard_len_at(body: &[Stmt], i: usize, v: &str, targets: &HashMap<String, usize>) -> usize {
-    let Stmt::If { cond, then_body, else_body } = &body[i] else {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = &body[i]
+    else {
         return 0;
     };
     if !else_body.is_empty()
@@ -1531,7 +2091,11 @@ fn fresh_loop_var(body: &[Stmt]) -> String {
         }
     });
     for i in 0..1000u32 {
-        let n = if i == 0 { "item".to_string() } else { format!("item{i}") };
+        let n = if i == 0 {
+            "item".to_string()
+        } else {
+            format!("item{i}")
+        };
         if !names.contains(&n) {
             return n;
         }
@@ -1552,21 +2116,30 @@ fn count_writes_go(stmts: &[Stmt], name: &str, n: &mut usize) {
             *n += 1;
         }
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 count_writes_go(then_body, name, n);
                 count_writes_go(else_body, name, n);
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
-                count_writes_go(body, name, n)
-            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => count_writes_go(body, name, n),
             Stmt::ForEach { body, .. } => count_writes_go(body, name, n),
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch { cases, tail, default, .. } => {
                 for (_, b) in cases {
                     count_writes_go(b, name, n);
                 }
                 count_writes_go(tail, name, n);
+                if let Some(arm) = default {
+                    count_writes_go(arm, name, n);
+                }
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 count_writes_go(try_body, name, n);
                 for (_, b) in catches {
                     count_writes_go(b, name, n);
@@ -1582,9 +2155,10 @@ fn count_writes_go(stmts: &[Stmt], name: &str, n: &mut usize) {
 
 /// Drop the first top-level `«_» = «v».Current;`.
 fn remove_first_assign(body: &mut Vec<Stmt>, v: &str) {
-    if let Some(i) = body.iter().position(
-        |s| matches!(s, Stmt::Assign(_, None, rhs) if is_current_of(rhs, v)),
-    ) {
+    if let Some(i) = body
+        .iter()
+        .position(|s| matches!(s, Stmt::Assign(_, None, rhs) if is_current_of(rhs, v)))
+    {
         body.remove(i);
     }
 }
@@ -1595,7 +2169,11 @@ fn for_each_expr_node<F: FnMut(&Expr)>(stmts: &[Stmt], f: &mut F) {
         match s {
             Stmt::Eval(e) | Stmt::Assign(_, _, e) | Stmt::Throw(e) => walk_expr(e, f),
             Stmt::Return(Some(e)) => walk_expr(e, f),
-            Stmt::If { cond, then_body, else_body } => {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
                 walk_expr(cond, f);
                 for_each_expr_node(then_body, f);
                 for_each_expr_node(else_body, f);
@@ -1609,13 +2187,20 @@ fn for_each_expr_node<F: FnMut(&Expr)>(stmts: &[Stmt], f: &mut F) {
                 walk_expr(cond, f);
             }
             Stmt::ForEach { body, .. } => for_each_expr_node(body, f),
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch { cases, tail, default, .. } => {
                 for (_, b) in cases {
                     for_each_expr_node(b, f);
                 }
                 for_each_expr_node(tail, f);
+                if let Some(arm) = default {
+                    for_each_expr_node(arm, f);
+                }
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 for_each_expr_node(try_body, f);
                 for (_, b) in catches {
                     for_each_expr_node(b, f);
@@ -1635,7 +2220,11 @@ fn for_each_expr_node_mut<F: FnMut(&mut Expr)>(stmts: &mut [Stmt], f: &mut F) {
         match s {
             Stmt::Eval(e) | Stmt::Assign(_, _, e) | Stmt::Throw(e) => walk_expr_mut(e, f),
             Stmt::Return(Some(e)) => walk_expr_mut(e, f),
-            Stmt::If { cond, then_body, else_body } => {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
                 walk_expr_mut(cond, f);
                 for_each_expr_node_mut(then_body, f);
                 for_each_expr_node_mut(else_body, f);
@@ -1649,13 +2238,20 @@ fn for_each_expr_node_mut<F: FnMut(&mut Expr)>(stmts: &mut [Stmt], f: &mut F) {
                 walk_expr_mut(cond, f);
             }
             Stmt::ForEach { body, .. } => for_each_expr_node_mut(body, f),
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch { cases, tail, default, .. } => {
                 for (_, b) in cases {
                     for_each_expr_node_mut(b, f);
                 }
                 for_each_expr_node_mut(tail, f);
+                if let Some(arm) = default {
+                    for_each_expr_node_mut(arm, f);
+                }
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 for_each_expr_node_mut(try_body, f);
                 for (_, b) in catches {
                     for_each_expr_node_mut(b, f);
@@ -1712,6 +2308,64 @@ fn for_each_expr_node_mut<F: FnMut(&mut Expr)>(stmts: &mut [Stmt], f: &mut F) {
 /// `goto` frequently still sits between the two — the label was emitted by the
 /// coverage repair, the goto was not. That sweep removes the stale jump a pass
 /// later, which is what makes the idiom reachable at all.
+
+/// Drop the `return;` a void method does not need.
+///
+/// Falling off the end of a `void` method IS a return, so a `return;` in the
+/// method's TAIL POSITION is pure noise: the last statement of the body, or
+/// the last statement of either arm of an `if`/`try` that is itself in tail
+/// position. 27,334 `return;` in the TR2 corpus sit directly before a closing
+/// brace; the tail-position ones are removed here, which is what hand-written
+/// C# looks like and what every decompiler emits.
+///
+/// NOT removed: a `return;` at the end of a LOOP body (it exits the method on
+/// that iteration — falling out would iterate), one at the end of a `switch`
+/// arm (the arm needs a terminator), or one in a non-void method.
+pub fn drop_tail_returns(stmts: &mut Vec<Stmt>) -> usize {
+    drop_tail_list(stmts)
+}
+
+fn drop_tail_list(list: &mut Vec<Stmt>) -> usize {
+    // Trailing comments are not statements; step over them.
+    let mut end = list.len();
+    while end > 0 && matches!(list[end - 1], Stmt::Comment(_)) {
+        end -= 1;
+    }
+    if end == 0 {
+        return 0;
+    }
+    let mut n = 0usize;
+    match &mut list[end - 1] {
+        Stmt::Return(None) => {
+            list.remove(end - 1);
+            n += 1;
+        }
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            n += drop_tail_list(then_body);
+            n += drop_tail_list(else_body);
+        }
+        Stmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => {
+            n += drop_tail_list(try_body);
+            for (_, b) in catches.iter_mut() {
+                n += drop_tail_list(b);
+            }
+            if let Some(f) = finally_body {
+                n += drop_tail_list(f);
+            }
+        }
+        _ => {}
+    }
+    n
+}
+
 pub fn collapse_goto_to_loop_break(stmts: &mut Vec<Stmt>) {
     let root = BreakCtx {
         exit: HashSet::new(),
@@ -1825,7 +2479,11 @@ fn rewrite_loop_breaks(list: &mut [Stmt], ctx: &BreakCtx) -> (u64, u64) {
                 nb += b;
                 nc += c;
             }
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 let (b, c) = rewrite_loop_breaks(then_body, ctx);
                 nb += b;
                 nc += c;
@@ -1833,7 +2491,11 @@ fn rewrite_loop_breaks(list: &mut [Stmt], ctx: &BreakCtx) -> (u64, u64) {
                 nb += b;
                 nc += c;
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 let (b, c) = rewrite_loop_breaks(try_body, ctx);
                 nb += b;
                 nc += c;
@@ -1848,7 +2510,7 @@ fn rewrite_loop_breaks(list: &mut [Stmt], ctx: &BreakCtx) -> (u64, u64) {
                     nc += c;
                 }
             }
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch { cases, tail, default, .. } => {
                 // `break` inside a `case` leaves the SWITCH; `continue` still
                 // means the enclosing loop, so it keeps the loop's scope.
                 let no_break = BreakCtx {
@@ -1860,6 +2522,11 @@ fn rewrite_loop_breaks(list: &mut [Stmt], ctx: &BreakCtx) -> (u64, u64) {
                 };
                 for (_, b) in cases.iter_mut() {
                     let (b2, c) = rewrite_loop_breaks(b, &no_break);
+                    nb += b2;
+                    nc += c;
+                }
+                if let Some(arm) = default {
+                    let (b2, c) = rewrite_loop_breaks(arm, &no_break);
                     nb += b2;
                     nc += c;
                 }
@@ -1878,7 +2545,7 @@ fn labels_after(stmts: &[Stmt], i: usize) -> HashSet<String> {
     let mut out = HashSet::new();
     for s in stmts.iter().skip(i + 1) {
         match s {
-            Stmt::Comment(_) => continue,
+            Stmt::Comment(_) | Stmt::Attribute { .. } => continue,
             Stmt::Label(l) => {
                 out.insert(l.clone());
             }
@@ -1898,7 +2565,7 @@ fn labels_before(stmts: &[Stmt], i: usize) -> HashSet<String> {
     while j > 0 {
         j -= 1;
         match &stmts[j] {
-            Stmt::Comment(_) => continue,
+            Stmt::Comment(_) | Stmt::Attribute { .. } => continue,
             Stmt::Label(l) => {
                 out.insert(l.clone());
             }
@@ -1921,19 +2588,30 @@ fn collect_labels(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::Label(l) => {
                 out.insert(l.clone());
             }
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collect_labels(then_body, out);
                 collect_labels(else_body, out);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_labels(body, out),
             Stmt::ForEach { body, .. } => collect_labels(body, out),
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch { cases, tail, default, .. } => {
                 for (_, b) in cases {
                     collect_labels(b, out);
                 }
                 collect_labels(tail, out);
+                if let Some(arm) = default {
+                    collect_labels(arm, out);
+                }
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 collect_labels(try_body, out);
                 for (_, b) in catches {
                     collect_labels(b, out);
@@ -1950,13 +2628,32 @@ fn collect_labels(stmts: &[Stmt], out: &mut HashSet<String>) {
 /// Recurse into every nested statement list of `s` with `f`.
 fn recurse_into_bodies<F: FnMut(&mut Vec<Stmt>)>(s: &mut Stmt, f: &mut F) {
     match s {
-        Stmt::If { then_body, else_body, .. } => {
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
             f(then_body);
             f(else_body);
         }
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => f(body),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Lock { body, .. } => f(body),
         Stmt::ForEach { body, .. } => f(body),
-        Stmt::Try { try_body, catches, finally_body } => {
+        Stmt::For {
+            init, incr, body, ..
+        } => {
+            f(init);
+            f(incr);
+            f(body);
+        }
+        Stmt::Using { decl, body } => {
+            recurse_into_bodies(decl, f);
+            f(body);
+        }
+        Stmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => {
             f(try_body);
             for (_, b) in catches.iter_mut() {
                 f(b);
@@ -1965,11 +2662,14 @@ fn recurse_into_bodies<F: FnMut(&mut Vec<Stmt>)>(s: &mut Stmt, f: &mut F) {
                 f(b);
             }
         }
-        Stmt::Switch { cases, tail, .. } => {
+        Stmt::Switch { cases, tail, default, .. } => {
             for (_, b) in cases.iter_mut() {
                 f(b);
             }
             f(tail);
+            if let Some(arm) = default {
+                f(arm);
+            }
         }
         _ => {}
     }
@@ -2033,6 +2733,18 @@ fn walk_expr<F: FnMut(&Expr)>(e: &Expr, f: &mut F) {
                 walk_expr(a, f);
             }
         }
+        Expr::ArrayInit { items, .. } => {
+            for a in items {
+                walk_expr(a, f);
+            }
+        }
+        Expr::CollectionInit {
+            ctor_args, items, ..
+        } => {
+            for a in ctor_args.iter().chain(items) {
+                walk_expr(a, f);
+            }
+        }
         _ => {}
     }
 }
@@ -2067,6 +2779,55 @@ fn walk_expr_mut<F: FnMut(&mut Expr)>(e: &mut Expr, f: &mut F) {
                 walk_expr_mut(a, f);
             }
         }
+        Expr::ArrayInit { items, .. } => {
+            for a in items {
+                walk_expr_mut(a, f);
+            }
+        }
+        Expr::CollectionInit {
+            ctor_args, items, ..
+        } => {
+            for a in ctor_args.iter_mut().chain(items) {
+                walk_expr_mut(a, f);
+            }
+        }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod dead_code_guard_tests {
+    use super::*;
+    use crate::recovery::csharp::{Expr, Stmt};
+
+    fn if_then(body: Vec<Stmt>) -> Stmt {
+        Stmt::If {
+            cond: Expr::Bool(true),
+            then_body: body,
+            else_body: vec![],
+        }
+    }
+
+    /// A container after a terminator that holds a label some `goto` names is
+    /// a jump target, not dead code (traced: `idioms:dead1`, 1,157 markers).
+    #[test]
+    fn a_dead_container_holding_a_referenced_label_is_kept() {
+        let mut s = vec![
+            if_then(vec![Stmt::Goto("L1".into())]),
+            Stmt::Return(None),
+            if_then(vec![Stmt::Label("L1".into()), Stmt::Eval(Expr::Int(1))]),
+        ];
+        dead_code(&mut s);
+        assert_eq!(s.len(), 3, "{s:?}");
+    }
+
+    #[test]
+    fn a_dead_container_without_a_referenced_label_is_dropped() {
+        let mut s = vec![
+            Stmt::Return(None),
+            if_then(vec![Stmt::Label("L9".into()), Stmt::Eval(Expr::Int(1))]),
+        ];
+        dead_code(&mut s);
+        assert_eq!(s.len(), 1, "{s:?}");
     }
 }

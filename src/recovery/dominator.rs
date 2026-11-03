@@ -28,9 +28,7 @@ impl DominatorInfo {
     /// branch merging collapsed to the bounded reachability fallback.
     pub fn compute_from(cfg: &Cfg, entry: usize) -> Self {
         let n = cfg.blocks.len();
-        let succs: Vec<Vec<usize>> = (0..n)
-            .map(|i| cfg.successors[i].clone())
-            .collect();
+        let succs: Vec<Vec<usize>> = (0..n).map(|i| cfg.successors[i].clone()).collect();
         let preds: Vec<Vec<usize>> = {
             let mut p = vec![Vec::new(); n];
             for (i, s) in succs.iter().enumerate() {
@@ -137,7 +135,12 @@ impl DominatorInfo {
             }
         }
 
-        Self { idom, rpo, frontiers, dom_children }
+        Self {
+            idom,
+            rpo,
+            frontiers,
+            dom_children,
+        }
     }
 
     fn reverse_postorder_from(succs: &[Vec<usize>], entry: usize) -> Vec<usize> {

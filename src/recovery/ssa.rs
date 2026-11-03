@@ -33,7 +33,10 @@ fn transform(
     // (phi elimination removes block-start phis that branches point at)
     let mut removed_map = vec![usize::MAX; insns.len()];
     // reverse so `.last()` is the smallest scheduled point
-    let mut pending: Vec<(usize, Vec<Insn>)> = insertions.iter_mut().map(|(k, v)| (*k, std::mem::take(v))).collect();
+    let mut pending: Vec<(usize, Vec<Insn>)> = insertions
+        .iter_mut()
+        .map(|(k, v)| (*k, std::mem::take(v)))
+        .collect();
     pending.sort_by(|a, b| b.0.cmp(&a.0));
 
     for (i, insn) in insns.iter().enumerate() {
@@ -168,8 +171,9 @@ pub fn rebuild_cfg(insns: &[Insn]) -> Cfg {
         .iter()
         .map(|b| {
             let last = &insns[b.end - 1];
-            let tgt =
-                |t: usize| -> Option<usize> { block_of.get(t).copied().filter(|&x| x != usize::MAX) };
+            let tgt = |t: usize| -> Option<usize> {
+                block_of.get(t).copied().filter(|&x| x != usize::MAX)
+            };
             let fall = || -> Option<usize> {
                 if b.end < n {
                     Some(block_of[b.end])
@@ -223,8 +227,6 @@ pub fn predecessors(cfg: &Cfg) -> Vec<Vec<usize>> {
 /// per-slot `counters` map. Real register names can never collide with it.
 const GLOBAL_COUNTER_SLOT: &str = "#global";
 
-
-
 fn def_slot(insn: &Insn) -> Option<Slot> {
     match insn.dest()? {
         Operand::Register(name) => Some(name.clone()),
@@ -235,6 +237,9 @@ fn def_slot(insn: &Insn) -> Option<Slot> {
 fn use_slots(insn: &Insn) -> Vec<Slot> {
     let mut out = Vec::new();
     fn walk(op: &Operand, out: &mut Vec<Slot>) {
+        // Exhaustive: this runs on the pre-typing register IR, where
+        // `InstanceField` cannot exist yet, but a catch-all would silently
+        // stop descending into whatever sub-operand a future variant adds.
         match op {
             Operand::Register(n) => out.push(n.clone()),
             Operand::Memory { base, index, .. } => {
@@ -248,7 +253,17 @@ fn use_slots(insn: &Insn) -> Vec<Slot> {
                 walk(array, out);
                 walk(index, out);
             }
-            _ => {}
+            Operand::InstanceField { base, .. } => walk(base, out),
+            Operand::Local(_)
+            | Operand::Immediate(_)
+            | Operand::FloatLiteral(_)
+            | Operand::DoubleLiteral(_)
+            | Operand::StringLiteral { .. }
+            | Operand::Method(_)
+            | Operand::Field(_)
+            | Operand::Type(_)
+            | Operand::MissingAbiArg
+            | Operand::Unknown => {}
         }
     }
     for (i, op) in insn.operands.iter().enumerate() {
@@ -261,8 +276,8 @@ fn use_slots(insn: &Insn) -> Vec<Slot> {
         // operand#0 wholesale left ~175k raw `Register` operands in the
         // post-SSA listing — the `this`/frame pointer of every store, which
         // the renderer can only print as `__unknown`.
-        let is_pure_def = Insn::dest_position(&insn.op) == Some(i)
-            && matches!(op, Operand::Register(_));
+        let is_pure_def =
+            Insn::dest_position(&insn.op) == Some(i) && matches!(op, Operand::Register(_));
         if !is_pure_def {
             walk(op, &mut out);
         }
@@ -285,9 +300,48 @@ pub struct SsaOutput {
     pub phis: Vec<PhiRecord>,
     /// Local version id → originating slot name
     pub version_slot: HashMap<u32, Slot>,
+    /// Versions defined by a CALL's ABI clobber (no listing instruction).
+    pub call_defined: HashSet<u32>,
 }
 
-pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
+fn op_is_call(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Call | Op::CallVoid | Op::IndirectCall | Op::ObjcMsgSend { .. }
+    )
+}
+
+pub fn build(
+    insns: &[Insn],
+    cfg: &Cfg,
+    dom: &DominatorInfo,
+    clobber_slots: &[Slot],
+) -> SsaOutput {
+    build_with_handler_entries(insns, cfg, dom, clobber_slots, &HashSet::new())
+}
+
+/// As [`build`], with EH handler-entry blocks treated as SSA KILL POINTS.
+///
+/// A landing pad is entered by the unwinder, which supplies the exception
+/// object in the first argument register and preserves NOTHING else. The CFG
+/// cannot express that edge: it only carries synchronous edges, and the
+/// compiler leaves an unreachable `b <pad>` after a noreturn raise call,
+/// which manufactures a false predecessor. Renaming the pad along that edge
+/// bound `x0` to whatever the loop body last wrote there, and the handler
+/// rendered the body's call receiver as the exception:
+/// `IL2CPP_IsInst((&enumerator).MoveNext(), MethodInfo(...))`.
+///
+/// At a handler entry every slot therefore starts from its ENTRY version
+/// (the value the method was called with), never from the dominator path,
+/// and no phi may be placed there. Slots the handler itself defines before
+/// use keep their in-block definition.
+pub fn build_with_handler_entries(
+    insns: &[Insn],
+    cfg: &Cfg,
+    dom: &DominatorInfo,
+    clobber_slots: &[Slot],
+    handler_entries: &HashSet<usize>,
+) -> SsaOutput {
     let n_blocks = cfg.blocks.len();
     let preds = predecessors(cfg);
 
@@ -305,6 +359,16 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
     for (i, insn) in insns.iter().enumerate() {
         if let Some(s) = def_slot(insn) {
             def_sites.entry(s).or_default().insert(i);
+        }
+        // A call is an ABI definition of the caller-saved FP return
+        // registers. Modeling it is a CORRECTNESS requirement: without it a
+        // read after the call names the pre-call SSA version, and the merge
+        // rules can fold two different returned components to one value —
+        // measured as `(z - z)` in real Vector3 distance math.
+        if op_is_call(&insn.op) {
+            for slot in clobber_slots {
+                def_sites.entry(slot.clone()).or_default().insert(i);
+            }
         }
     }
     let escaped: HashSet<Slot> = insns
@@ -326,7 +390,7 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
     let live_in = compute_live_in(insns, cfg);
 
     let mut phi_sites: HashMap<Slot, BTreeSet<usize>> = HashMap::new();
-    let ssa_dbg = std::env::var("ILR_SSA_DBG").is_ok()
+    let ssa_dbg = crate::recovery::env_flags::flag("ILR_SSA_DBG")
         && insns.first().is_some_and(|i| {
             let a = i.address;
             a >= 0x2db38 && a < 0x2dc80
@@ -357,8 +421,18 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
                 .enumerate()
                 .any(|(b, set)| set.contains(slot) && !dom.dominates(def_block, b));
             if ssa_dbg {
-                eprintln!("[ssa1def] slot={} def_blk={} need={} livein_blocks={:?}", slot, def_block, need,
-                    live_in.iter().enumerate().filter(|(_, s)| s.contains(slot)).map(|(b, _)| b).collect::<Vec<_>>());
+                eprintln!(
+                    "[ssa1def] slot={} def_blk={} need={} livein_blocks={:?}",
+                    slot,
+                    def_block,
+                    need,
+                    live_in
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.contains(slot))
+                        .map(|(b, _)| b)
+                        .collect::<Vec<_>>()
+                );
             }
             if need {
                 candidates.push(slot.clone());
@@ -378,6 +452,9 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
                         set.contains(slot)
                             && preds[*b].len() >= 2
                             && !dom.dominates(def_block, *b)
+                            // A handler entry kills every slot: a phi here
+                            // would merge values that never reach the pad.
+                            && !handler_entries.contains(b)
                     })
                     .map(|(b, _)| b)
                     .collect();
@@ -401,27 +478,40 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
             eprintln!("[ssa-cand] slot={} sites={:?}", slot, def_sites[&slot]);
         }
         // quick reject: never live anywhere → no phis
-        let mut work: VecDeque<usize> =
-            def_sites[&slot].iter().map(|&i| block_of[i]).collect();
+        let mut work: VecDeque<usize> = def_sites[&slot].iter().map(|&i| block_of[i]).collect();
         let mut queued: BTreeSet<usize> = work.iter().copied().collect();
         while let Some(b) = work.pop_front() {
             queued.remove(&b);
             if ssa_dbg {
-                eprintln!("[ssa-work] slot={} pop_blk={} frontiers={:?}", slot, b, dom.frontiers[b]);
+                eprintln!(
+                    "[ssa-work] slot={} pop_blk={} frontiers={:?}",
+                    slot, b, dom.frontiers[b]
+                );
             }
             for &f in &dom.frontiers[b] {
                 // prune: skip joins where the slot is not live-in
                 if !live_in.get(f).is_some_and(|set| set.contains(&slot)) {
                     continue;
                 }
+                // handler entries are kill points, never merge points
+                if handler_entries.contains(&f) {
+                    continue;
+                }
                 // placing a phi makes f a def site → iterate its frontier too
-                if phi_sites.entry(slot.clone()).or_default().insert(f)
-                    && queued.insert(f)
-                {
+                if phi_sites.entry(slot.clone()).or_default().insert(f) && queued.insert(f) {
                     work.push_back(f);
                 }
             }
         }
+    }
+
+    // Belt and braces: the single-def path above can enqueue a handler block
+    // outside the frontier walk, so scrub the finished sets too.
+    if !handler_entries.is_empty() {
+        for set in phi_sites.values_mut() {
+            set.retain(|b| !handler_entries.contains(b));
+        }
+        phi_sites.retain(|_, set| !set.is_empty());
     }
 
     if ssa_dbg {
@@ -434,6 +524,7 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
     let mut counters: HashMap<Slot, u32> = HashMap::new();
     let mut versions: HashMap<Slot, Vec<u32>> = HashMap::new();
     let mut version_slot: HashMap<u32, Slot> = HashMap::new();
+    let mut call_defined: HashSet<u32> = HashSet::new();
 
     // GLOBAL version counter: version ids must be unique across ALL slots.
     // The per-slot `counters` map handed the SAME id to different slots (each
@@ -532,13 +623,13 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
         }
     }
     phis.sort_by(|a, b| a.block.cmp(&b.block).then(a.slot.cmp(&b.slot)));
-    let phis_by_block: HashMap<usize, Vec<usize>> = phis.iter().enumerate().fold(
-        HashMap::new(),
-        |mut acc, (i, p)| {
-            acc.entry(p.block).or_default().push(i);
-            acc
-        },
-    );
+    let phis_by_block: HashMap<usize, Vec<usize>> =
+        phis.iter()
+            .enumerate()
+            .fold(HashMap::new(), |mut acc, (i, p)| {
+                acc.entry(p.block).or_default().push(i);
+                acc
+            });
 
     let mut use_rewrites: HashMap<usize, Vec<(Slot, Operand)>> = HashMap::new();
     let mut dest_rewrite: HashMap<usize, u32> = HashMap::new();
@@ -569,7 +660,11 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
 
     let mut visited = vec![false; n_blocks];
     if n_blocks > 0 {
-        let mut stack = vec![Frame { block: 0, child_i: 0, pushed: Vec::new() }];
+        let mut stack = vec![Frame {
+            block: 0,
+            child_i: 0,
+            pushed: Vec::new(),
+        }];
 
         while let Some(frame) = stack.last_mut() {
             let block = frame.block;
@@ -589,22 +684,50 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
 
                 // 2. body uses + defs
                 let b = &cfg.blocks[block];
+                let handler_entry = handler_entries.contains(&block);
+                let mut handler_defs: HashMap<Slot, u32> = HashMap::new();
                 for i in b.start..b.end {
                     for slot in use_slots(&insns[i]) {
-                        let val = match versions.get(&slot).and_then(|v| v.last()) {
-                            Some(&v) => Operand::Local(v),
-                            None => Operand::Unknown,
+                        let val = if handler_entry {
+                            // The pad's entry state is its own: unwinding
+                            // preserves no register. Values defined earlier in
+                            // THIS block are real; everything else is the
+                            // method-entry value, never a dominator-path def.
+                            match handler_defs.get(&slot) {
+                                Some(&v) => Operand::Local(v),
+                                None => versions
+                                    .get(&slot)
+                                    .and_then(|v| v.first().copied())
+                                    .map(Operand::Local)
+                                    .unwrap_or(Operand::Unknown),
+                            }
+                        } else {
+                            match versions.get(&slot).and_then(|v| v.last()) {
+                                Some(&v) => Operand::Local(v),
+                                None => Operand::Unknown,
+                            }
                         };
                         use_rewrites.entry(i).or_default().push((slot, val));
                     }
                     if let Some(slot) = def_slot(&insns[i]) {
                         let v = fresh(&mut counters, &mut version_slot, &slot);
                         versions.entry(slot.clone()).or_default().push(v);
-                        frame.pushed.push(slot);
+                        frame.pushed.push(slot.clone());
+                        if handler_entry {
+                            handler_defs.insert(slot, v);
+                        }
                         if insns[i].op == Op::Call {
                             call_ret_rewrite.insert(i, v);
                         } else {
                             dest_rewrite.insert(i, v);
+                        }
+                    }
+                    if op_is_call(&insns[i].op) {
+                        for slot in clobber_slots {
+                            let v = fresh(&mut counters, &mut version_slot, slot);
+                            versions.entry(slot.clone()).or_default().push(v);
+                            frame.pushed.push(slot.clone());
+                            call_defined.insert(v);
                         }
                     }
                 }
@@ -625,8 +748,11 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
                             .get(&phis[pid].slot)
                             .and_then(|v| v.last().copied());
                         if let Some(edge) = phis[pid].preds.iter().position(|&p| p == block) {
-                            if std::env::var("ILR_SSA_DBG").is_ok() {
-                                eprintln!("[ssa-fill] B{} -> B{} phi slot={:?} edge={} dest_set={} ver={:?}", block, succ, phis[pid].slot, edge, dest_set, ver);
+                            if crate::recovery::env_flags::flag("ILR_SSA_DBG") {
+                                eprintln!(
+                                    "[ssa-fill] B{} -> B{} phi slot={:?} edge={} dest_set={} ver={:?}",
+                                    block, succ, phis[pid].slot, edge, dest_set, ver
+                                );
                             }
                             phis[pid].args[edge] = ver;
                         }
@@ -644,7 +770,11 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
             if frame.child_i < children.len() {
                 let child = children[frame.child_i];
                 frame.child_i += 1;
-                stack.push(Frame { block: child, child_i: 0, pushed: Vec::new() });
+                stack.push(Frame {
+                    block: child,
+                    child_i: 0,
+                    pushed: Vec::new(),
+                });
             } else {
                 for slot in frame.pushed.drain(..) {
                     if let Some(v) = versions.get_mut(&slot) {
@@ -664,7 +794,7 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
         .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
     let ssa_method_matches =
         ssa_method_only.is_none_or(|a| insns.first().map(|i| i.address) == Some(a));
-    if std::env::var("ILR_SSA_UNVISIT").is_ok() && ssa_method_matches {
+    if crate::recovery::env_flags::flag("ILR_SSA_UNVISIT") && ssa_method_matches {
         for (bi, b) in cfg.blocks.iter().enumerate() {
             if bi == 0 || visited.get(bi).copied().unwrap_or(false) {
                 continue;
@@ -681,11 +811,21 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
                 Some(v) => format!("{v:?}"),
                 None => "None".into(),
             };
-            eprintln!("[ssa-unvisited] B{bi} range={}..{} insns={} idom={:?} in_rpo={} preds={:?} succs={}",
-                b.start, b.end, b.end - b.start, dom.idom.get(bi).copied().flatten(),
-                dom.rpo.contains(&bi), preds.get(bi), s);
+            eprintln!(
+                "[ssa-unvisited] B{bi} range={}..{} insns={} idom={:?} in_rpo={} preds={:?} succs={}",
+                b.start,
+                b.end,
+                b.end - b.start,
+                dom.idom.get(bi).copied().flatten(),
+                dom.rpo.contains(&bi),
+                preds.get(bi),
+                s
+            );
             if let Some(li) = insns.get(lasti) {
-                eprintln!("    last i{lasti} @{:#x} op={:?} ops={:?}", li.address, li.op, li.operands);
+                eprintln!(
+                    "    last i{lasti} @{:#x} op={:?} ops={:?}",
+                    li.address, li.op, li.operands
+                );
             }
             if let Some(pi) = prev {
                 if let Some(pi_insn) = insns.get(pi) {
@@ -693,11 +833,19 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
                 }
             }
             for i in b.start..b.end {
-                eprintln!("    i{i} @{:#x} op={:?} operands={:?}", insns[i].address, insns[i].op, insns[i].operands);
+                eprintln!(
+                    "    i{i} @{:#x} op={:?} operands={:?}",
+                    insns[i].address, insns[i].op, insns[i].operands
+                );
             }
         }
         let claimed: usize = cfg.blocks.iter().map(|b| b.end - b.start).sum();
-        eprintln!("[ssa-coverage] insns={} claimed_by_blocks={} blocks={}", insns.len(), claimed, cfg.blocks.len());
+        eprintln!(
+            "[ssa-coverage] insns={} claimed_by_blocks={} blocks={}",
+            insns.len(),
+            claimed,
+            cfg.blocks.len()
+        );
     }
 
     // ---- sweep: blocks the dominator DFS never reached ----------------------
@@ -715,17 +863,31 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
                 continue;
             }
             let b = &cfg.blocks[bi];
+            let handler_entry = handler_entries.contains(&bi);
+            let mut handler_defs: HashMap<Slot, u32> = HashMap::new();
             for i in b.start..b.end {
                 for slot in use_slots(&insns[i]) {
-                    let val = match versions.get(&slot).and_then(|v| v.last().copied()) {
-                        Some(v) => Operand::Local(v),
-                        // Never seen anywhere: bind a fresh version to the slot
-                        // so `locals::create` can still map it by slot name
-                        // (x0→this, x1→param0, …) instead of printing nothing.
-                        None => {
-                            let nv = fresh(&mut counters, &mut version_slot, &slot);
-                            versions.entry(slot.clone()).or_default().push(nv);
-                            Operand::Local(nv)
+                    let val = if handler_entry {
+                        match handler_defs.get(&slot) {
+                            Some(&v) => Operand::Local(v),
+                            None => versions
+                                .get(&slot)
+                                .and_then(|v| v.first().copied())
+                                .map(Operand::Local)
+                                .unwrap_or(Operand::Unknown),
+                        }
+                    } else {
+                        match versions.get(&slot).and_then(|v| v.last().copied()) {
+                            Some(v) => Operand::Local(v),
+                            // Never seen anywhere: bind a fresh version to the
+                            // slot so `locals::create` can still map it by slot
+                            // name (x0→this, x1→param0, …) instead of printing
+                            // nothing.
+                            None => {
+                                let nv = fresh(&mut counters, &mut version_slot, &slot);
+                                versions.entry(slot.clone()).or_default().push(nv);
+                                Operand::Local(nv)
+                            }
                         }
                     };
                     use_rewrites.entry(i).or_default().push((slot, val));
@@ -733,6 +895,9 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
                 if let Some(slot) = def_slot(&insns[i]) {
                     let v = fresh(&mut counters, &mut version_slot, &slot);
                     versions.entry(slot.clone()).or_default().push(v);
+                    if handler_entry {
+                        handler_defs.insert(slot, v);
+                    }
                     if insns[i].op == Op::Call {
                         call_ret_rewrite.insert(i, v);
                     } else {
@@ -800,7 +965,7 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
         out_insns = transform(&out_insns, insertions, &BTreeSet::new());
     }
 
-    if std::env::var("ILR_VERIFY").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_VERIFY") {
         fn count_regs(op: &Operand, n: &mut usize) {
             match op {
                 Operand::Register(_) => *n += 1,
@@ -853,7 +1018,12 @@ pub fn build(insns: &[Insn], cfg: &Cfg, dom: &DominatorInfo) -> SsaOutput {
         }
     }
 
-    SsaOutput { insns: out_insns, phis, version_slot }
+    SsaOutput {
+        insns: out_insns,
+        phis,
+        version_slot,
+        call_defined,
+    }
 }
 
 /// Splice phi insns into the listing at block starts so downstream passes see
@@ -956,8 +1126,7 @@ pub fn materialize(output: &mut SsaOutput, cfg: &mut Cfg) {
 
 /// Lower every surviving `Op::Phi` into Moves at predecessor edges and remove
 /// the phi instructions themselves.
-pub fn eliminate(output: &mut SsaOutput, cfg: &mut Cfg) {
-
+pub fn eliminate(output: &mut SsaOutput, cfg: &Cfg) {
     // locate surviving phi insns: one pass over the listing matched against
     // a version→phi map (was O(phixinsns) — dominated large methods)
     let dest_to_pid: HashMap<u32, usize> = output
@@ -989,11 +1158,179 @@ pub fn eliminate(output: &mut SsaOutput, cfg: &mut Cfg) {
     // phis were materialized in; the edge loop below stays in edge order.
     let mut phi_order: Vec<(usize, usize)> = phi_at.iter().map(|(&i, &pid)| (i, pid)).collect();
     phi_order.sort_unstable();
+
+    // The PHI INSTRUCTIONS carry the args that were actually materialized into
+    // the listing. `output.phis[pid].args` can be stale by now: later passes
+    // (`highvar`, `restore_phi_structure`) rewrite the listing, and the record
+    // keeps the pre-rewrite values. Building the collapse decision and the
+    // edge copies from the record left degenerate x4/x5 join phis (`phi(a,a)`)
+    // un-collapsed, then removed the phi insn without planting a definition —
+    // tens of thousands of undefined locals in the dump. The listing is the
+    // authority.
+    let materialized_args: HashMap<usize, Vec<Option<u32>>> = phi_at
+        .keys()
+        .map(|&idx| {
+            let args = output.insns[idx]
+                .operands
+                .iter()
+                .skip(1)
+                .map(|o| match o {
+                    Operand::Local(v) => Some(*v),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (idx, args)
+        })
+        .collect();
+    let args_for = |insn_idx: usize, pid: usize| -> Vec<Option<u32>> {
+        match materialized_args.get(&insn_idx) {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => output.phis[pid].args.clone(),
+        }
+    };
+
+    // ---- degenerate-phi collapse ----------------------------------------
+    //
+    // When a phi's REAL args (dropping `None` slots from unreachable preds)
+    // all name the SAME version, the merge is a rename: every predecessor
+    // hands the same SSA version to `dest_version`. Instead of planting a
+    // Move at every pred's terminator — the 30% of temp references the agent
+    // traced to SSA phi elimination — we substitute every use of
+    // `dest_version` with the common arg and skip inserting any Moves for
+    // this phi. The phi insn itself is already in `removals`.
+    //
+    // This is always value-correct because SSA's uniqueness of def means the
+    // common arg is the ONLY definition that can reach the phi's block on any
+    // live edge; there is no other value that could be observed at a use.
+    //
+    // The `dest_version` never leaks out: it is fresh (allocated in `build`)
+    // and only this phi writes it, so after substitution no reference to it
+    // remains.
+    //
+    // The decision is a FIXPOINT, not one pass. Collapsing `phi(a,a)` turns a
+    // consumer `phi(dest,dest)` into `phi(a,a)` only once the first collapse
+    // is known, and a long if/else chain ends in exactly such a cascade: the
+    // shared tail `phi(x5, x5, x5, …)` names the intermediate join destinations,
+    // so a single-pass decision left it un-collapsed and planted edge copies
+    // reading versions whose phis had just been deleted (24 undefined locals on
+    // `BundleStoreItem.Initialize` @0x166D8F8). Every round re-reads the
+    // arguments with all collapses proved so far applied, so the decision sees
+    // terminal values.
+    let entry_args: Vec<Vec<Option<u32>>> = phi_order
+        .iter()
+        .map(|&(insn_idx, pid)| args_for(insn_idx, pid))
+        .collect();
+    let mut phi_args: Vec<Vec<Option<u32>>> = entry_args.clone();
+    let mut substitution: HashMap<u32, u32> = HashMap::new();
+    // Phis whose collapse would close a cycle stay materialized. SSA cannot
+    // construct a phi cycle (dest versions are fresh), but we defend against
+    // the pathological and must not strand a read on a removed phi.
+    let mut blocked: HashSet<u32> = HashSet::new();
+    if !crate::recovery::env_flags::flag("ILR_NOSSA") {
+        loop {
+            // Re-derive the arguments from the materialized listing with the
+            // current substitution — never from the previous round's vector, so
+            // a value cannot composite with a stale one.
+            for (k, args) in phi_args.iter_mut().enumerate() {
+                *args = entry_args[k].clone();
+                for a in args.iter_mut() {
+                    if let Some(v) = a {
+                        if let Some(&t) = substitution.get(v) {
+                            *v = t;
+                        }
+                    }
+                }
+            }
+            let mut round: Vec<(u32, u32)> = Vec::new();
+            for (k, &(_insn_idx, pid)) in phi_order.iter().enumerate() {
+                let dest = output.phis[pid].dest_version;
+                if substitution.contains_key(&dest) || blocked.contains(&dest) {
+                    continue;
+                }
+                let mut iter = phi_args[k].iter().flatten().copied();
+                let Some(first) = iter.next() else { continue };
+                if iter.all(|a| a == first) {
+                    round.push((dest, first));
+                }
+            }
+            if round.is_empty() {
+                break;
+            }
+            let round_map: HashMap<u32, u32> = round.iter().copied().collect();
+            let mut accepted: Vec<(u32, u32)> = Vec::new();
+            let mut progress = false;
+            for &(dest, _arg) in &round {
+                // Chase dest → arg → … through this round's collapses and the
+                // substitution already proved, to the terminal version. A
+                // repeated version means a cycle.
+                let mut cur = dest;
+                let mut seen: HashSet<u32> = HashSet::new();
+                let mut cycled = false;
+                while let Some(&nxt) = round_map.get(&cur).or_else(|| substitution.get(&cur)) {
+                    if !seen.insert(cur) {
+                        cycled = true;
+                        break;
+                    }
+                    cur = nxt;
+                }
+                if cycled {
+                    blocked.insert(dest);
+                    progress = true;
+                } else if cur != dest {
+                    accepted.push((dest, cur));
+                    progress = true;
+                }
+            }
+            for (dest, terminal) in accepted {
+                substitution.insert(dest, terminal);
+            }
+            if !progress {
+                break;
+            }
+        }
+        // One last refresh so the edge-copy insertion below reads the same
+        // terminal arguments the collapse decision settled on.
+        for (k, args) in phi_args.iter_mut().enumerate() {
+            *args = entry_args[k].clone();
+            for a in args.iter_mut() {
+                if let Some(v) = a {
+                    if let Some(&t) = substitution.get(v) {
+                        *v = t;
+                    }
+                }
+            }
+        }
+    }
+
+    if !substitution.is_empty() {
+        // Rewrite every Local operand referring to a collapsed dest, in-place
+        // over the listing. The phi insns themselves are already scheduled for
+        // removal, so we don't need to skip them.
+        for insn in &mut output.insns {
+            for op in &mut insn.operands {
+                rewrite_dest(op, &substitution);
+            }
+        }
+    }
+
+    let collapsed_set: HashSet<usize> = phi_order
+        .iter()
+        .filter(|(_i, pid)| substitution.contains_key(&output.phis[*pid].dest_version))
+        .map(|(i, _)| *i)
+        .collect();
+
     let mut insertions: BTreeMap<usize, Vec<Insn>> = BTreeMap::new();
-    for (_insn_idx, pid) in phi_order {
+    for (k, &(insn_idx, pid)) in phi_order.iter().enumerate() {
+        // Skip the collapsed phis — their edge copies are dead now that every
+        // use of `dest_version` names the common arg directly.
+        if collapsed_set.contains(&insn_idx) {
+            continue;
+        }
         let phi = &output.phis[pid];
+        let args = &phi_args[k];
+        let mut placed = 0usize;
         for (edge, &p) in phi.preds.iter().enumerate() {
-            let Some(Some(arg)) = phi.args.get(edge).map(|a| *a) else {
+            let Some(Some(arg)) = args.get(edge).map(|a| *a) else {
                 continue;
             };
             // Bounds-guard every index: phi.preds were recorded against the
@@ -1020,13 +1357,61 @@ pub fn eliminate(output: &mut SsaOutput, cfg: &mut Cfg) {
                 Operand::Local(arg),
                 addr,
             ));
+            placed += 1;
+        }
+        // No edge could be materialized (stale predecessor list): define the
+        // dest at the block head rather than removing the phi and leaving
+        // every use undefined. If the args disagree this is a best-effort
+        // value, but it is still a definition on every path.
+        if placed == 0 {
+            if let Some(arg) = args.iter().flatten().next().copied() {
+                let at = cfg
+                    .blocks
+                    .get(phi.block)
+                    .map(|b| b.start)
+                    .unwrap_or(0);
+                let addr = output.insns.get(at).map(|x| x.address).unwrap_or(0);
+                insertions.entry(at).or_default().push(Insn::move_(
+                    Operand::Local(phi.dest_version),
+                    Operand::Local(arg),
+                    addr,
+                ));
+            }
         }
     }
 
     let removals: BTreeSet<usize> = phi_at.keys().copied().collect();
     output.insns = transform(&output.insns, insertions, &removals);
     output.phis.clear();
-    *cfg = rebuild_cfg(&output.insns);
+    // The CFG is left stale on purpose: `materialize`/`eliminate` are the last
+    // consumers of it, and rebuilding costs a full CFG construction per method.
+    // Callers that need a fresh CFG after phi elimination build their own.
+}
+
+/// Rewrite every `Operand::Local(v)` referring to a phi dest that collapsed
+/// to its common arg. Recurses through compound operands so Memory bases and
+/// ArrayAccess indices also see the substitution.
+fn rewrite_dest(op: &mut Operand, map: &HashMap<u32, u32>) {
+    match op {
+        Operand::Local(v) => {
+            if let Some(&new_v) = map.get(v) {
+                *v = new_v;
+            }
+        }
+        Operand::Memory { base, index, .. } => {
+            rewrite_dest(base, map);
+            if let Some(i) = index {
+                rewrite_dest(i, map);
+            }
+        }
+        Operand::AddressOf(inner) | Operand::ArrayLength(inner) => rewrite_dest(inner, map),
+        Operand::ArrayAccess { array, index } => {
+            rewrite_dest(array, map);
+            rewrite_dest(index, map);
+        }
+        Operand::InstanceField { base, .. } => rewrite_dest(base, map),
+        _ => {}
+    }
 }
 
 fn replace_use_in_place(insn: &mut Insn, slot: &str, rep: &Operand) {
@@ -1044,14 +1429,24 @@ fn replace_use_in_place(insn: &mut Insn, slot: &str, rep: &Operand) {
                 walk(array, slot, rep);
                 walk(index, slot, rep);
             }
-            _ => {}
+            Operand::InstanceField { base, .. } => walk(base, slot, rep),
+            Operand::Register(_)
+            | Operand::Local(_)
+            | Operand::Immediate(_)
+            | Operand::FloatLiteral(_)
+            | Operand::DoubleLiteral(_)
+            | Operand::StringLiteral { .. }
+            | Operand::Method(_)
+            | Operand::Field(_)
+            | Operand::Type(_)
+            | Operand::MissingAbiArg
+            | Operand::Unknown => {}
         }
     }
     for op in &mut insn.operands {
         walk(op, slot, rep);
     }
 }
-
 
 /// Backward liveness dataflow over slots (register names pre-renaming).
 /// Returns per-block live-IN slot sets. Iterates to fixpoint (bounded by
@@ -1079,28 +1474,35 @@ pub fn compute_live_in(insns: &[Insn], cfg: &Cfg) -> Vec<HashSet<String>> {
     let mut live_out: Vec<HashSet<String>> = vec![HashSet::new(); n_blocks];
     let mut changed = true;
     let mut guard = 0usize;
+    // Buffer reuse: the old shape allocated one fresh OUT set plus a clone of
+    // IN for EVERY block on EVERY fixpoint pass. Swapping the new sets into
+    // the tables keeps the same values and the same schedule; only the
+    // allocations are recycled (values are membership/equality tested only,
+    // so set bucket order cannot reach the output).
+    let mut scratch_out: HashSet<String> = HashSet::new();
+    let mut scratch_in: HashSet<String> = HashSet::new();
     while changed && guard < 10_000 {
         changed = false;
         guard += 1;
         for bi in (0..n_blocks).rev() {
             // out = ∪ in(succ) — full n-way successor set
-            let mut new_out: HashSet<String> = HashSet::new();
+            scratch_out.clear();
             for succ in cfg.successors[bi].iter().copied() {
-                new_out.extend(live_in[succ].iter().cloned());
+                scratch_out.extend(live_in[succ].iter().cloned());
             }
             // in = use ∪ (out - def)
-            let mut new_in: HashSet<String> = use_sets[bi].clone();
-            for s in &new_out {
+            scratch_in.clone_from(&use_sets[bi]);
+            for s in &scratch_out {
                 if !def_sets[bi].contains(s) {
-                    new_in.insert(s.clone());
+                    scratch_in.insert(s.clone());
                 }
             }
-            if new_out != live_out[bi] {
-                live_out[bi] = new_out;
+            if scratch_out != live_out[bi] {
+                std::mem::swap(&mut live_out[bi], &mut scratch_out);
                 changed = true;
             }
-            if new_in != live_in[bi] {
-                live_in[bi] = new_in;
+            if scratch_in != live_in[bi] {
+                std::mem::swap(&mut live_in[bi], &mut scratch_in);
                 changed = true;
             }
         }

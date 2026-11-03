@@ -3,30 +3,27 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use dotnetdll::resolved::body;
-use dotnetdll::resolved::il::Instruction;
-use dotnetdll::resolved::members::{self, Field, Method, Property, Event, ParameterMetadata};
-use dotnetdll::resolved::module::Module;
-use dotnetdll::resolved::signature::{
-    MethodSignature, Parameter, ReturnType,
-};
-use dotnetdll::resolved::types::{
-    BaseType, ExternalTypeReference, MemberType, MethodType,
-    TypeDefinition as DotNetTypeDef, TypeFlags, TypeSource,
-    ResolutionScope, UserType, ValueKind, Accessibility as TypeAccessibility,
-};
+use dotnetdll::resolution::{MethodRefIndex, Resolution};
 use dotnetdll::resolved::assembly::ExternalAssemblyReference;
+use dotnetdll::resolved::attribute::{Attribute, CustomAttributeData, FixedArg, NamedArg};
+use dotnetdll::resolved::body;
 use dotnetdll::resolved::generic;
-use dotnetdll::resolved::attribute::{Attribute, CustomAttributeData, NamedArg, FixedArg};
-use dotnetdll::resolution::{Resolution, MethodRefIndex};
+use dotnetdll::resolved::il::Instruction;
+use dotnetdll::resolved::members::{self, Event, Field, Method, ParameterMetadata, Property};
+use dotnetdll::resolved::module::Module;
+use dotnetdll::resolved::signature::{MethodSignature, Parameter, ReturnType};
+use dotnetdll::resolved::types::{
+    Accessibility as TypeAccessibility, BaseType, ExternalTypeReference, MemberType, MethodType,
+    ResolutionScope, TypeDefinition as DotNetTypeDef, TypeFlags, TypeSource, UserType, ValueKind,
+};
 
-use crate::il2cpp::metadata::Metadata;
-use crate::il2cpp::base::Il2Cpp;
-use crate::il2cpp::enums::Il2CppTypeEnum;
-use crate::il2cpp::structures::*;
-use crate::executor::Il2CppExecutor;
 use crate::config::Config;
 use crate::error::Result;
+use crate::executor::Il2CppExecutor;
+use crate::il2cpp::base::Il2Cpp;
+use crate::il2cpp::enums::Il2CppTypeEnum;
+use crate::il2cpp::metadata::Metadata;
+use crate::il2cpp::structures::*;
 
 #[allow(dead_code)]
 struct AttrCtors {
@@ -40,12 +37,15 @@ struct AttrCtors {
 }
 
 fn make_named_string_attr<'a>(ctor: MethodRefIndex, fields: Vec<(&str, String)>) -> Attribute<'a> {
-    let named_args = fields.into_iter().map(|(name, value)| {
-        NamedArg::Field(
-            Cow::Owned(name.to_string()),
-            FixedArg::String(Some(Cow::Owned(value))),
-        )
-    }).collect();
+    let named_args = fields
+        .into_iter()
+        .map(|(name, value)| {
+            NamedArg::Field(
+                Cow::Owned(name.to_string()),
+                FixedArg::String(Some(Cow::Owned(value))),
+            )
+        })
+        .collect();
     Attribute::new(
         members::UserMethod::Reference(ctor),
         CustomAttributeData {
@@ -55,39 +55,50 @@ fn make_named_string_attr<'a>(ctor: MethodRefIndex, fields: Vec<(&str, String)>)
     )
 }
 
-fn push_attr_ctor(resolution: &mut Resolution<'_>, asm_ref: dotnetdll::resolution::AssemblyRefIndex, name: String) -> MethodRefIndex {
-    let type_ref = resolution.push_type_reference(
-        ExternalTypeReference::new(
-            None,
-            Cow::Owned(name),
-            ResolutionScope::Assembly(asm_ref),
-        ),
-    );
+fn push_attr_ctor(
+    resolution: &mut Resolution<'_>,
+    asm_ref: dotnetdll::resolution::AssemblyRefIndex,
+    name: String,
+) -> MethodRefIndex {
+    let type_ref = resolution.push_type_reference(ExternalTypeReference::new(
+        None,
+        Cow::Owned(name),
+        ResolutionScope::Assembly(asm_ref),
+    ));
     let parent_type = MethodType::Base(Box::new(BaseType::Type {
         value_kind: Some(ValueKind::Class),
         source: TypeSource::User(UserType::Reference(type_ref)),
     }));
-    resolution.push_method_reference(
-        members::ExternalMethodReference::new(
-            members::MethodReferenceParent::Type(parent_type),
-            ".ctor",
-            MethodSignature::new(true, ReturnType::VOID, vec![]),
-        ),
-    )
+    resolution.push_method_reference(members::ExternalMethodReference::new(
+        members::MethodReferenceParent::Type(parent_type),
+        ".ctor",
+        MethodSignature::new(true, ReturnType::VOID, vec![]),
+    ))
 }
 
 fn setup_il2cpp_dummy_dll_refs(resolution: &mut Resolution<'_>) -> AttrCtors {
-    let dummy_asm_ref = resolution.push_assembly_reference(
-        ExternalAssemblyReference::new("Il2CppDummyDll"),
-    );
+    let dummy_asm_ref =
+        resolution.push_assembly_reference(ExternalAssemblyReference::new("Il2CppDummyDll"));
 
     AttrCtors {
         address_ctor: push_attr_ctor(resolution, dummy_asm_ref, "AddressAttribute".to_string()),
-        field_offset_ctor: push_attr_ctor(resolution, dummy_asm_ref, "FieldOffsetAttribute".to_string()),
+        field_offset_ctor: push_attr_ctor(
+            resolution,
+            dummy_asm_ref,
+            "FieldOffsetAttribute".to_string(),
+        ),
         token_ctor: push_attr_ctor(resolution, dummy_asm_ref, "TokenAttribute".to_string()),
         attribute_ctor: push_attr_ctor(resolution, dummy_asm_ref, "AttributeAttribute".to_string()),
-        metadata_offset_ctor: push_attr_ctor(resolution, dummy_asm_ref, "MetadataOffsetAttribute".to_string()),
-        thread_static_ctor: push_attr_ctor(resolution, dummy_asm_ref, "ThreadStaticAttribute".to_string()),
+        metadata_offset_ctor: push_attr_ctor(
+            resolution,
+            dummy_asm_ref,
+            "MetadataOffsetAttribute".to_string(),
+        ),
+        thread_static_ctor: push_attr_ctor(
+            resolution,
+            dummy_asm_ref,
+            "ThreadStaticAttribute".to_string(),
+        ),
         field_rva_ctor: push_attr_ctor(resolution, dummy_asm_ref, "FieldRvaAttribute".to_string()),
     }
 }
@@ -148,8 +159,8 @@ pub fn generate_dummy_dlls(
 ) -> Result<()> {
     use rayon::prelude::*;
 
-use std::cell::RefCell;
-use dotnetdll::resolution::TypeIndex;
+    use dotnetdll::resolution::TypeIndex;
+    use std::cell::RefCell;
 
     let dummy_dir = Path::new(output_dir).join("DummyDll");
     fs::create_dir_all(&dummy_dir)
@@ -1004,7 +1015,11 @@ fn make_stub_event_method<'a>(name: &str, etype: &MemberType, skip_body: bool) -
         dotnetdll::resolved::Accessibility::Public,
         sig,
         Cow::Owned(name.to_string()),
-        if !skip_body { Some(body::Method::new(vec![Instruction::Return])) } else { None },
+        if !skip_body {
+            Some(body::Method::new(vec![Instruction::Return]))
+        } else {
+            None
+        },
     )
 }
 
@@ -1019,10 +1034,11 @@ fn add_attribute_attributes<'a>(
     attr_ctors: &AttrCtors,
     target_attrs: &mut Vec<Attribute<'a>>,
 ) {
-    let attr_idx = match metadata.get_custom_attribute_index(image_index, custom_attribute_index, token) {
-        Some(idx) => idx,
-        None => return,
-    };
+    let attr_idx =
+        match metadata.get_custom_attribute_index(image_index, custom_attribute_index, token) {
+            Some(idx) => idx,
+            None => return,
+        };
 
     if metadata.version < 29.0 {
         if attr_idx >= metadata.attribute_type_ranges.len() {
@@ -1072,7 +1088,8 @@ fn add_attribute_attributes<'a>(
             return;
         }
 
-        let data_offset = metadata.header.attribute_data_offset as u64 + start_range.start_offset as u64;
+        let data_offset =
+            metadata.header.attribute_data_offset as u64 + start_range.start_offset as u64;
         let data_size = (end_range.start_offset - start_range.start_offset) as usize;
         if data_size == 0 || data_size > 1024 * 1024 {
             return;
@@ -1083,10 +1100,11 @@ fn add_attribute_attributes<'a>(
             Err(_) => return,
         };
 
-        let mut reader = match crate::executor::custom_attribute_reader::CustomAttributeDataReader::new(data) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
+        let mut reader =
+            match crate::executor::custom_attribute_reader::CustomAttributeDataReader::new(data) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
 
         if reader.count == 0 {
             return;
@@ -1114,9 +1132,17 @@ fn get_type_name_from_il2cpp_type(
         Some(Il2CppTypeEnum::Class) | Some(Il2CppTypeEnum::ValueType) => {
             let td_idx = il2cpp_type.datapoint as usize;
             if let Some(td) = type_defs.get(td_idx) {
-                let ns = metadata.get_string_from_index(td.namespace_index).unwrap_or_default();
-                let name = metadata.get_string_from_index(td.name_index).unwrap_or_default();
-                if ns.is_empty() { name } else { format!("{ns}.{name}") }
+                let ns = metadata
+                    .get_string_from_index(td.namespace_index)
+                    .unwrap_or_default();
+                let name = metadata
+                    .get_string_from_index(td.name_index)
+                    .unwrap_or_default();
+                if ns.is_empty() {
+                    name
+                } else {
+                    format!("{ns}.{name}")
+                }
             } else {
                 format!("Type_{td_idx}")
             }
@@ -1127,20 +1153,19 @@ fn get_type_name_from_il2cpp_type(
 
 fn generate_il2cpp_dummy_dll(dummy_dir: &Path) -> Result<()> {
     let mut resolution = Resolution::new(Module::new("Il2CppDummyDll.dll"));
-    resolution.assembly = Some(dotnetdll::resolved::assembly::Assembly::new("Il2CppDummyDll"));
+    resolution.assembly = Some(dotnetdll::resolved::assembly::Assembly::new(
+        "Il2CppDummyDll",
+    ));
     resolution.type_definitions.clear();
 
-    let mscorlib_ref = resolution.push_assembly_reference(
-        ExternalAssemblyReference::new("mscorlib"),
-    );
+    let mscorlib_ref =
+        resolution.push_assembly_reference(ExternalAssemblyReference::new("mscorlib"));
 
-    let attribute_base_ref = resolution.push_type_reference(
-        ExternalTypeReference::new(
-            Some(Cow::Borrowed("System")),
-            "Attribute",
-            ResolutionScope::Assembly(mscorlib_ref),
-        ),
-    );
+    let attribute_base_ref = resolution.push_type_reference(ExternalTypeReference::new(
+        Some(Cow::Borrowed("System")),
+        "Attribute",
+        ResolutionScope::Assembly(mscorlib_ref),
+    ));
     let attribute_base = TypeSource::User(UserType::Reference(attribute_base_ref));
 
     let string_type = MemberType::Base(Box::new(BaseType::String));
@@ -1194,7 +1219,9 @@ fn generate_il2cpp_dummy_dll(dummy_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn default_value_to_constant(dv: &crate::executor::il2cpp_executor::DefaultValue) -> members::Constant {
+fn default_value_to_constant(
+    dv: &crate::executor::il2cpp_executor::DefaultValue,
+) -> members::Constant {
     use crate::executor::il2cpp_executor::DefaultValue;
     match dv {
         DefaultValue::Bool(v) => members::Constant::Boolean(*v),
@@ -1237,7 +1264,10 @@ fn base_member_to_method(b: &BaseType<MemberType>) -> BaseType<MethodType> {
                 TypeSource::User(u) => TypeSource::User(*u),
                 TypeSource::Generic { base, parameters } => TypeSource::Generic {
                     base: *base,
-                    parameters: parameters.iter().map(|p| method_type_from_member(p)).collect(),
+                    parameters: parameters
+                        .iter()
+                        .map(|p| method_type_from_member(p))
+                        .collect(),
                 },
             },
         },
@@ -1293,13 +1323,11 @@ fn resolve_type_source_for_typedef(
         }
     }
 
-    let type_ref = resolution.push_type_reference(
-        ExternalTypeReference::new(
-            Some(Cow::Owned(String::new())),
-            format!("__External_{td_index}"),
-            ResolutionScope::Assembly(ctx.mscorlib_ref),
-        ),
-    );
+    let type_ref = resolution.push_type_reference(ExternalTypeReference::new(
+        Some(Cow::Owned(String::new())),
+        format!("__External_{td_index}"),
+        ResolutionScope::Assembly(ctx.mscorlib_ref),
+    ));
     TypeSource::User(UserType::Reference(type_ref))
 }
 
@@ -1315,7 +1343,10 @@ fn il2cpp_type_to_type_source(
         Il2CppTypeEnum::Class | Il2CppTypeEnum::ValueType => {
             let td_index = il2cpp_type.datapoint as usize;
             Some(resolve_type_source_for_typedef(
-                td_index, type_map, resolution, ctx,
+                td_index,
+                type_map,
+                resolution,
+                ctx,
                 type_enum == Il2CppTypeEnum::ValueType,
             ))
         }
@@ -1323,7 +1354,10 @@ fn il2cpp_type_to_type_source(
             let mt = il2cpp_type_to_member(il2cpp_type, types, type_map, resolution, ctx);
             match mt {
                 MemberType::Base(b) => match *b {
-                    BaseType::Type { value_kind: _, source } => Some(source),
+                    BaseType::Type {
+                        value_kind: _,
+                        source,
+                    } => Some(source),
                     _ => None,
                 },
                 _ => None,
@@ -1365,21 +1399,22 @@ fn il2cpp_type_to_base_member(
             } else {
                 Some(ValueKind::Class)
             };
-            let source = resolve_type_source_for_typedef(td_index, type_map, resolution, ctx, vk == Some(ValueKind::ValueType));
-            BaseType::Type { value_kind: vk, source }
+            let source = resolve_type_source_for_typedef(
+                td_index,
+                type_map,
+                resolution,
+                ctx,
+                vk == Some(ValueKind::ValueType),
+            );
+            BaseType::Type {
+                value_kind: vk,
+                source,
+            }
         }
-        Some(Il2CppTypeEnum::SzArray) => {
-            BaseType::vector(member_object())
-        }
-        Some(Il2CppTypeEnum::Array) => {
-            BaseType::vector(member_object())
-        }
-        Some(Il2CppTypeEnum::Ptr) => {
-            BaseType::ValuePointer(vec![], None)
-        }
-        Some(Il2CppTypeEnum::GenericInst) => {
-            BaseType::Object
-        }
+        Some(Il2CppTypeEnum::SzArray) => BaseType::vector(member_object()),
+        Some(Il2CppTypeEnum::Array) => BaseType::vector(member_object()),
+        Some(Il2CppTypeEnum::Ptr) => BaseType::ValuePointer(vec![], None),
+        Some(Il2CppTypeEnum::GenericInst) => BaseType::Object,
         _ => BaseType::Object,
     }
 }
@@ -1394,10 +1429,20 @@ fn il2cpp_type_to_member(
     let type_enum = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);
     if let Some(Il2CppTypeEnum::Var) = type_enum {
         let dp = il2cpp_type.datapoint as usize;
-        let idx = if ctx.gen_param_total > 0 && dp < ctx.gen_param_total { dp } else { 0 };
+        let idx = if ctx.gen_param_total > 0 && dp < ctx.gen_param_total {
+            dp
+        } else {
+            0
+        };
         return MemberType::TypeGeneric(idx);
     }
-    MemberType::Base(Box::new(il2cpp_type_to_base_member(il2cpp_type, types, type_map, resolution, ctx)))
+    MemberType::Base(Box::new(il2cpp_type_to_base_member(
+        il2cpp_type,
+        types,
+        type_map,
+        resolution,
+        ctx,
+    )))
 }
 
 fn il2cpp_type_to_base_method(
@@ -1433,25 +1478,31 @@ fn il2cpp_type_to_base_method(
             } else {
                 Some(ValueKind::Class)
             };
-            let source = resolve_type_source_for_typedef(td_index, type_map, resolution, ctx, vk == Some(ValueKind::ValueType));
+            let source = resolve_type_source_for_typedef(
+                td_index,
+                type_map,
+                resolution,
+                ctx,
+                vk == Some(ValueKind::ValueType),
+            );
             let method_source = match source {
                 TypeSource::User(u) => TypeSource::User(u),
                 TypeSource::Generic { base, parameters } => TypeSource::Generic {
                     base,
-                    parameters: parameters.into_iter().map(|p| method_type_from_member(&p)).collect(),
+                    parameters: parameters
+                        .into_iter()
+                        .map(|p| method_type_from_member(&p))
+                        .collect(),
                 },
             };
-            BaseType::Type { value_kind: vk, source: method_source }
+            BaseType::Type {
+                value_kind: vk,
+                source: method_source,
+            }
         }
-        Some(Il2CppTypeEnum::SzArray) => {
-            BaseType::vector(method_object())
-        }
-        Some(Il2CppTypeEnum::Array) => {
-            BaseType::vector(method_object())
-        }
-        Some(Il2CppTypeEnum::Ptr) => {
-            BaseType::ValuePointer(vec![], None)
-        }
+        Some(Il2CppTypeEnum::SzArray) => BaseType::vector(method_object()),
+        Some(Il2CppTypeEnum::Array) => BaseType::vector(method_object()),
+        Some(Il2CppTypeEnum::Ptr) => BaseType::ValuePointer(vec![], None),
         _ => BaseType::Object,
     }
 }
@@ -1466,15 +1517,29 @@ fn il2cpp_type_to_method_type(
     let type_enum = Il2CppTypeEnum::from_u8(il2cpp_type.type_enum);
     if let Some(Il2CppTypeEnum::Var) = type_enum {
         let dp = il2cpp_type.datapoint as usize;
-        let idx = if ctx.gen_param_total > 0 && dp < ctx.gen_param_total { dp } else { 0 };
+        let idx = if ctx.gen_param_total > 0 && dp < ctx.gen_param_total {
+            dp
+        } else {
+            0
+        };
         return MethodType::TypeGeneric(idx);
     }
     if let Some(Il2CppTypeEnum::MVar) = type_enum {
         let dp = il2cpp_type.datapoint as usize;
-        let idx = if ctx.gen_param_total > 0 && dp < ctx.gen_param_total { dp } else { 0 };
+        let idx = if ctx.gen_param_total > 0 && dp < ctx.gen_param_total {
+            dp
+        } else {
+            0
+        };
         return MethodType::MethodGeneric(idx);
     }
-    MethodType::Base(Box::new(il2cpp_type_to_base_method(il2cpp_type, types, type_map, resolution, ctx)))
+    MethodType::Base(Box::new(il2cpp_type_to_base_method(
+        il2cpp_type,
+        types,
+        type_map,
+        resolution,
+        ctx,
+    )))
 }
 
 fn il2cpp_type_to_return(

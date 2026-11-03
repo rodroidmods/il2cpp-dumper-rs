@@ -11,10 +11,13 @@
 //! recovery must never fail a dump (Cpp2IL IlRecovery policy).
 
 pub mod cfg;
+pub mod concord;
+pub mod conform;
 pub mod csharp;
 pub mod dominator;
-pub mod exceptions;
 pub mod emit;
+pub mod exceptions;
+pub mod split_loops;
 /// High-variable recovery (Ghidra `merge.cc` / `varmap.cc` / `unify.cc` port):
 /// collapses SSA copy chains, resolves phi confluences whose arguments agree,
 /// unifies identical pure computations, and merges the names of one register
@@ -24,6 +27,12 @@ pub mod highvar;
 /// Statement-tree idiom recognition (dead-end blocks, structure-field
 /// propagation). Runs after the structurer, on the finished pseudo-C.
 pub mod idioms;
+pub mod env_flags;
+/// Interprocedural type analysis — propagates types across method call
+/// boundaries using metadata signatures as ground truth. Two phases:
+/// (1) post-resolve re-propagation within each method, (2) cross-method
+/// call graph analysis for enriched seeding.
+pub mod interprocedural;
 pub mod ir;
 pub mod lift;
 pub mod lift_arm32;
@@ -39,12 +48,11 @@ pub mod resolve;
 /// Identity for calls into the IL2CPP runtime itself (static-init guards,
 /// dispatch trampolines), which no symbol table can name. See the module docs.
 pub mod runtime_helpers;
-pub mod stack_analyzer;
 pub mod ssa;
+pub mod stack_analyzer;
 pub mod types;
-pub mod conform;
-pub mod concord;
 pub mod verify;
+pub mod heuristic_types;
 
 /// Per-stage wall-clock telemetry for the recovery pipeline (aggregated over
 /// all methods; printed by the drivers when `ILR_TIMING=1`). Atomics keep the
@@ -118,10 +126,17 @@ pub mod timing {
     /// all. Those two need completely different fixes and the total alone
     /// cannot tell them apart.
     pub static ABI_MISS_BY_POS: [AtomicU64; 11] = [
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
     ];
     /// Of the `ABI_MISS_BY_POS` placeholders, how many wanted a register the
     /// ABI's argument file does not have — a `stack_-N` slot, or (on x64) an
@@ -134,6 +149,61 @@ pub mod timing {
     /// instead of `fn_<address>(...)`, so this is the number of `fn_` sites
     /// removed by that classification.
     pub static RT_CLASSINIT_SITES: AtomicU64 = AtomicU64::new(0);
+    /// Call-site argument locals that received a type from the callee's
+    /// declared parameter signature (back-propagation in `propagate_types`).
+    pub static CALLSITE_PARAM_TYPED: AtomicU64 = AtomicU64::new(0);
+    /// Immediate call targets that `align_call_arguments` resolved to a method
+    /// and embedded as `Operand::Method` so downstream passes see the signature.
+    pub static CALLSITE_EMBEDDED: AtomicU64 = AtomicU64::new(0);
+    /// Parameters seeded with a non-Unknown type from metadata at method entry
+    /// (includes `this` typed with the declaring class).
+    pub static PARAMS_SEEDED_TYPED: AtomicU64 = AtomicU64::new(0);
+    /// Parameters seeded at method entry (total denominator).
+    pub static PARAMS_SEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+    /// Render sub-stages (parallel-sum microseconds). `R_TOTAL` is the whole
+    /// `render_method_csharp_full_chains` call; the rest are segments of it,
+    /// so their sum plus loop bookkeeping is `R_TOTAL`. Printed by `report()`
+    /// as `[render-split]` so a runtime regression can be attributed without
+    /// guessing which of the three walks or two previews got slower.
+    pub static R_TOTAL: AtomicU64 = AtomicU64::new(0);
+    /// Duplicated listing: clone + shared-tail split + CFG/loops of both
+    /// listings + EH block maps.
+    pub static R_DUP: AtomicU64 = AtomicU64::new(0);
+    /// Binding-discovery walk (throwaway body, keeps `bound_calls`).
+    pub static R_DISCOVERY: AtomicU64 = AtomicU64::new(0);
+    /// Structured trial: MethodCtx + emit_struct on the duplicated listing.
+    pub static R_TRIAL: AtomicU64 = AtomicU64::new(0);
+    /// Address-walker body emission (only when the trial was not jump-free).
+    pub static R_WALK: AtomicU64 = AtomicU64::new(0);
+    /// Both `preview_stats` runs (late-pass clones).
+    pub static R_PREVIEW: AtomicU64 = AtomicU64::new(0);
+    /// MethodCtx::build sub-steps (parallel-summed).
+    pub static B_DEFS: AtomicU64 = AtomicU64::new(0);
+    pub static B_REACHING: AtomicU64 = AtomicU64::new(0);
+    pub static B_VARREADS: AtomicU64 = AtomicU64::new(0);
+    pub static B_READCNT: AtomicU64 = AtomicU64::new(0);
+    pub static B_ADDR: AtomicU64 = AtomicU64::new(0);
+    pub static B_SHARED: AtomicU64 = AtomicU64::new(0);
+    pub static B_REFUSED: AtomicU64 = AtomicU64::new(0);
+    pub static B_NAMES: AtomicU64 = AtomicU64::new(0);
+    /// The real `MethodCtx::build` (reaching-definition fixpoint over the
+    /// original listing) between the discovery walk and the trial. The
+    /// discovery walk builds an identical ctx for itself, so this is the
+    /// duplicate-cost candidate.
+    pub static R_CTX: AtomicU64 = AtomicU64::new(0);
+    /// The real late-pass pipeline + header/body emission + trailing filters.
+    pub static R_LATE: AtomicU64 = AtomicU64::new(0);
+    /// Late-segment buckets: `R_L1` = header setup + rewrites/catalog/cleanup/
+    /// idioms/reconstruct, `R_L2` = type maps + sugar passes, `R_L3` = the
+    /// structural cleanup batch (sanitize/branch_repair/goto/for/guards),
+    /// `R_L4` = naming, const/role/adjacent/liveness folds + kinds inference +
+    /// `declare_locals`, `R_L5` = final emission and text filters.
+    pub static R_L1: AtomicU64 = AtomicU64::new(0);
+    pub static R_L2: AtomicU64 = AtomicU64::new(0);
+    pub static R_L3: AtomicU64 = AtomicU64::new(0);
+    pub static R_L4: AtomicU64 = AtomicU64::new(0);
+    pub static R_L5: AtomicU64 = AtomicU64::new(0);
 
     fn ms(a: &AtomicU64) -> f64 {
         a.load(Ordering::Relaxed) as f64 / 1000.0
@@ -148,7 +218,8 @@ pub mod timing {
              slow>100ms={} >500ms={} >1s={} deadline_hits={} aligned_call_args={} \
              virtual_calls={} vc_misses={} folded_picked={} folded_guessed={} \
              folded_no_recv={} folded_no_class={} folded_no_member={} folded_multi={} \
-             addr_escapes={} rt_classinit={} \
+             addr_escapes={} rt_classinit={} callsite_embedded={} callsite_params_typed={} \
+             params_seeded_typed={}/{} \
              | lift={:.0} cfg={:.0} stack={:.0} ssa={:.0} propagate={:.0} \
              resolve={:.0} guards={:.0} opt={:.0} structural={:.0} eliminate={:.0} \
              render={:.0} (ms total)",
@@ -168,6 +239,10 @@ pub mod timing {
             SHARED_MULTI.load(Ordering::Relaxed),
             ADDR_ESCAPES.load(Ordering::Relaxed),
             RT_CLASSINIT_SITES.load(Ordering::Relaxed),
+            CALLSITE_EMBEDDED.load(Ordering::Relaxed),
+            CALLSITE_PARAM_TYPED.load(Ordering::Relaxed),
+            PARAMS_SEEDED_TYPED.load(Ordering::Relaxed),
+            PARAMS_SEEDED_TOTAL.load(Ordering::Relaxed),
             ms(&LIFT),
             ms(&CFG),
             ms(&STACK),
@@ -180,6 +255,61 @@ pub mod timing {
             ms(&ELIMINATE),
             ms(&RENDER),
         );
+        if R_TOTAL.load(Ordering::Relaxed) > 0 {
+            s.push_str(&format!(
+                "\n[render-split] total={:.0} dup={:.0} discovery={:.0} trial={:.0} \
+                 walk={:.0} preview={:.0} late={:.0} (parallel-sum ms)",
+                ms(&R_TOTAL),
+                ms(&R_DUP),
+                ms(&R_DISCOVERY),
+                ms(&R_TRIAL),
+                ms(&R_WALK),
+                ms(&R_PREVIEW),
+                ms(&R_LATE),
+            ));
+            s.push_str(&format!(
+                "\n[ctx] method_ctx={:.0}ms (parallel-sum)",
+                ms(&R_CTX)
+            ));
+            s.push_str(&format!(
+                "\n[ctx-split] defs={:.0} reaching={:.0} varreads={:.0} readcnt={:.0} addr={:.0} shared={:.0} refused={:.0} names={:.0} (parallel-sum ms)",
+                ms(&B_DEFS),
+                ms(&B_REACHING),
+                ms(&B_VARREADS),
+                ms(&B_READCNT),
+                ms(&B_ADDR),
+                ms(&B_SHARED),
+                ms(&B_REFUSED),
+                ms(&B_NAMES)
+            ));
+            s.push_str(&format!(
+                "\n[late-split] l1={:.0} l2={:.0} l3={:.0} l4={:.0} l5={:.0} (parallel-sum ms)",
+                ms(&R_L1),
+                ms(&R_L2),
+                ms(&R_L3),
+                ms(&R_L4),
+                ms(&R_L5),
+            ));
+            s.push_str(&format!(
+                "\n{}",
+                crate::recovery::reconstruct::pass_timing_report(12)
+            ));
+            s.push_str(&format!(
+                "\n{}",
+                crate::recovery::reconstruct::il2cpp_cleanup::cleanup_timing_report(8)
+            ));
+            s.push_str(&crate::recovery::csharp::dangle_report());
+            let ll = crate::recovery::reconstruct::label_loss_report(12);
+            if !ll.is_empty() {
+                s.push('\n');
+                s.push_str(&ll);
+            }
+            let l3 = crate::recovery::csharp::l3_timing_report(14);
+            if !l3.is_empty() {
+                s.push('\n');
+                s.push_str(&l3);
+            }
+        }
         // A second line only when there is something to report; see
         // `ABI_MISS_BY_POS` for how to read the bucket shape.
         let a: Vec<u64> = ABI_MISS_BY_POS
@@ -192,7 +322,17 @@ pub mod timing {
                 "\n[abi-miss] total={abi_total} beyond_regfile={} by_pos=[recv={} p0={} \
                  p1={} p2={} p3={} p4={} p5={} p6={} p7={} p8={} p9+={}]",
                 ABI_MISS_STACK.load(Ordering::Relaxed),
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10],
+                a[0],
+                a[1],
+                a[2],
+                a[3],
+                a[4],
+                a[5],
+                a[6],
+                a[7],
+                a[8],
+                a[9],
+                a[10],
             ));
         }
         // Guarded field-address seeds, always reported (a zero applied count is
@@ -204,6 +344,8 @@ pub mod timing {
                 "\n[field-addr] applied={applied} refused_ref_enum={ref_enum} refused_no_layout={no_layout} refused_unproven={unproven}"
             ));
         }
+        // Interprocedural type propagation impact.
+        s.push_str(&super::interprocedural::report());
         s
     }
 }
@@ -213,7 +355,10 @@ use timing as tm;
 
 #[inline]
 fn tm_add(c: &std::sync::atomic::AtomicU64, started: std::time::Instant) {
-    c.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    c.fetch_add(
+        started.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 use crate::executor::Il2CppExecutor;
@@ -230,6 +375,66 @@ use types::{FieldRef, ManagedType, MethodRef, NamedType, PrimKind};
 // ---------------------------------------------------------------------------
 // il2cpp ↔ ManagedType bridge (Resolution-independent)
 // ---------------------------------------------------------------------------
+
+/// HFA component fields of a value type, as IR `FieldRef`s.
+///
+/// `hfa_float_components` gives the same layout as NAMES; retyping a call
+/// return needs the full field reference so the renderer can emit
+/// `result.x` and type propagation can see `float`.
+pub fn hfa_field_refs(
+    nt: &NamedType,
+    metadata: &Metadata,
+    il2cpp: &Il2Cpp,
+) -> Vec<FieldRef> {
+    let tdi = nt.type_def_index;
+    if tdi < 0 {
+        return Vec::new();
+    }
+    let Some(td) = metadata.type_defs.get(tdi as usize) else {
+        return Vec::new();
+    };
+    if !td.is_value_type() || td.is_enum() {
+        return Vec::new();
+    }
+    let declaring = if nt.namespace.is_empty() {
+        nt.name.clone()
+    } else {
+        format!("{}.{}", nt.namespace, nt.name)
+    };
+    let mut out: Vec<FieldRef> = Vec::new();
+    for fi in 0..td.field_count as usize {
+        let global_fi = td.field_start as usize + fi;
+        let Some(field_def) = metadata.field_defs.get(global_fi) else {
+            return Vec::new();
+        };
+        let Some(t) = il2cpp.types.get(field_def.type_index as usize) else {
+            return Vec::new();
+        };
+        if (t.attrs & 0x0010) != 0 {
+            continue;
+        }
+        match Il2CppTypeEnum::from_u8(t.type_enum) {
+            Some(Il2CppTypeEnum::R4) => {
+                let name = metadata
+                    .get_string_from_index(field_def.name_index)
+                    .unwrap_or_else(|_| format!("f{}", out.len()));
+                out.push(FieldRef {
+                    type_def_index: tdi,
+                    field_index: global_fi as u32,
+                    name,
+                    declaring_type_name: declaring.clone(),
+                    field_type: ManagedType::Primitive(PrimKind::R4),
+                    is_static: false,
+                });
+                if out.len() > 4 {
+                    return Vec::new();
+                }
+            }
+            _ => return Vec::new(),
+        }
+    }
+    out
+}
 
 /// Convert an `Il2CppType` into the analysis-side `ManagedType`.
 pub fn managed_type_of(
@@ -253,7 +458,7 @@ pub fn managed_type_of_gn(
         return ManagedType::Unknown;
     }
     let te = Il2CppTypeEnum::from_u8(t.type_enum);
-    match te {
+    let base = match te {
         Some(Il2CppTypeEnum::Void) => ManagedType::Primitive(PrimKind::Void),
         Some(Il2CppTypeEnum::Boolean) => ManagedType::Primitive(PrimKind::Boolean),
         Some(Il2CppTypeEnum::Char) => ManagedType::Primitive(PrimKind::Char),
@@ -271,9 +476,7 @@ pub fn managed_type_of_gn(
         Some(Il2CppTypeEnum::U) => ManagedType::IntPtr,
         Some(Il2CppTypeEnum::String) => ManagedType::String,
         Some(Il2CppTypeEnum::Object) => ManagedType::Object,
-        Some(Il2CppTypeEnum::TypedByRef) => {
-            opaque_named("System", "TypedReference", -1)
-        }
+        Some(Il2CppTypeEnum::TypedByRef) => opaque_named("System", "TypedReference", -1),
         Some(Il2CppTypeEnum::Class) | Some(Il2CppTypeEnum::ValueType) => {
             named_of_klass_index(t.klass_index(), metadata)
         }
@@ -309,6 +512,16 @@ pub fn managed_type_of_gn(
         Some(Il2CppTypeEnum::Var) => ManagedType::Opaque("T".into()),
         Some(Il2CppTypeEnum::MVar) => ManagedType::Opaque("M".into()),
         _ => ManagedType::Unknown,
+    };
+    // A `ref`/`out` parameter carries the BYREF BIT on its element type
+    // (`ref float` has type_enum R4 with bit 29 set), not a separate
+    // BYREF type_enum. Ignoring the bit classified such parameters as FP
+    // scalars, so they were slotted into vsN instead of xN and never received
+    // their parameter name (`*(nint*)(in_x2)` for `ref float inTotalProb`).
+    if t.byref != 0 && !matches!(base, ManagedType::ByRef(_)) {
+        ManagedType::ByRef(Box::new(base))
+    } else {
+        base
     }
 }
 
@@ -318,8 +531,12 @@ fn named_of_klass_index(idx: u64, metadata: &Metadata) -> ManagedType {
         return ManagedType::Object;
     }
     let td = &metadata.type_defs[i];
-    let namespace = metadata.get_string_from_index(td.namespace_index).unwrap_or_default();
-    let name = metadata.get_string_from_index(td.name_index).unwrap_or_default();
+    let namespace = metadata
+        .get_string_from_index(td.namespace_index)
+        .unwrap_or_default();
+    let name = metadata
+        .get_string_from_index(td.name_index)
+        .unwrap_or_default();
     ManagedType::Class(Arc::new(NamedType {
         namespace,
         name,
@@ -342,11 +559,7 @@ fn opaque_named(ns: &str, name: &str, _tdi: i32) -> ManagedType {
 /// names also let the renderer print `rootPosition.x` instead of `v26`.
 /// Returns empty when the type is not a pure float aggregate — the caller
 /// then treats the parameter as a GPR/memory argument.
-pub fn hfa_float_components(
-    tdi: i32,
-    metadata: &Metadata,
-    il2cpp: &Il2Cpp,
-) -> Vec<String> {
+pub fn hfa_float_components(tdi: i32, metadata: &Metadata, il2cpp: &Il2Cpp) -> Vec<String> {
     if tdi < 0 {
         return Vec::new();
     }
@@ -384,11 +597,7 @@ pub fn hfa_float_components(
             _ => return Vec::new(), // mixed layout → not an HFA
         }
     }
-    if out.is_empty() {
-        Vec::new()
-    } else {
-        out
-    }
+    if out.is_empty() { Vec::new() } else { out }
 }
 
 /// Does an ARM32 method returning `ret` deliver its result through a
@@ -437,11 +646,7 @@ pub fn arm32_ret_uses_hidden_buffer(
 /// in `AimShootProperties` occupy 8 bytes, while the metadata instance size is
 /// 16). Unknown layouts return `None` rather than shifting later arguments on
 /// a guessed size.
-pub fn arm32_value_type_size(
-    tdi: i32,
-    metadata: &Metadata,
-    il2cpp: &Il2Cpp,
-) -> Option<usize> {
+pub fn arm32_value_type_size(tdi: i32, metadata: &Metadata, il2cpp: &Il2Cpp) -> Option<usize> {
     if tdi < 0 {
         return None;
     }
@@ -449,7 +654,10 @@ pub fn arm32_value_type_size(
     if !td.is_value_type() || td.is_enum() {
         return None;
     }
-    let instance_size = il2cpp.type_definition_sizes.get(tdi as usize)?.instance_size as usize;
+    let instance_size = il2cpp
+        .type_definition_sizes
+        .get(tdi as usize)?
+        .instance_size as usize;
     instance_size.checked_sub(8).filter(|&size| size > 0)
 }
 
@@ -515,7 +723,9 @@ impl<'a> locals::TypeOracle for BridgeOracle<'a> {
                 );
             }
         }
-        self.cache.borrow_mut().insert((tdi, offset), result.clone());
+        self.cache
+            .borrow_mut()
+            .insert((tdi, offset), result.clone());
         result
     }
 
@@ -590,7 +800,9 @@ impl<'a> BridgeOracle<'a> {
         let field_count = td.field_count as usize;
         for fi in 0..field_count {
             let global_fi = field_start + fi;
-            let Some(field_def) = self.metadata.field_defs.get(global_fi) else { continue };
+            let Some(field_def) = self.metadata.field_defs.get(global_fi) else {
+                continue;
+            };
             let is_static = (self
                 .il2cpp
                 .types
@@ -738,9 +950,115 @@ fn spec_indices_to_name(spec_count: usize) -> impl Iterator<Item = usize> {
     0..spec_count
 }
 
+/// Retire the unreachable `b <pad>` the compiler leaves after a raise call.
+///
+/// A raise helper never returns, so the branch that follows it is dead code —
+/// but the CFG has no way to know that, and the branch hands the landing pad a
+/// SYNCHRONOUS predecessor from the raising block. SSA then renames the pad's
+/// reads along that edge, and the handler renders the body's values as the
+/// exception (the `IL2CPP_IsInst((&enumerator).MoveNext(), …)` class).
+///
+/// A `throw` of the exception argument (index 2 in the lifters' raw
+/// `[target, ret, x0, x1…]` call layout) is INSERTED after the call. The
+/// trampoline branch itself is left untouched: it stays a pad an EH row can
+/// name and `pad_root` can still follow to the real handler, while the
+/// inserted terminator removes it from the call's fall-through path. The
+/// call's result slot is retired at the same time — the call does not produce
+/// a value, and leaving it would bind the throw operand to the never-returning
+/// call's result version.
+///
+/// Returns the addresses the throw was inserted at (for the verifier ledger).
+fn neutralise_raise_trampolines(
+    insns: &mut Vec<Insn>,
+    addresses: &mut Vec<u64>,
+    landing_pads: &[u64],
+    raise_helpers: &[u64],
+) -> Vec<u64> {
+    let mut branch_targets: HashSet<u64> = HashSet::new();
+    for insn in insns.iter() {
+        match &insn.op {
+            Op::Jump(t) | Op::CondJump(t) => {
+                branch_targets.insert(*t as u64);
+            }
+            Op::Switch(ts) => {
+                for t in ts {
+                    branch_targets.insert(*t as u64);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut insert_after: Vec<usize> = Vec::new();
+    for i in 0..insns.len().saturating_sub(1) {
+        if !matches!(insns[i].op, Op::Call) {
+            continue;
+        }
+        let Some(Operand::Immediate(target)) = insns[i].operands.first().cloned() else {
+            continue;
+        };
+        // Two independent proofs of "never returns":
+        //  - the explicit il2cpp_raise_exception family, and
+        //  - a helper the body classifier proved is a thin forwarder that
+        //    reaches a __cxa throw stub (the null-check raiser lives only
+        //    here; it is deliberately NOT in `raise_exception` because the
+        //    resolver must not turn its call sites into source `throw`s).
+        let is_raise = raise_helpers.contains(&(target as u64))
+            || matches!(
+                runtime_helpers::role_of(target as u64),
+                Some(runtime_helpers::RuntimeHelper::RaiseException)
+            );
+        if !is_raise {
+            continue;
+        }
+        if !matches!(
+            insns[i + 1].op,
+            Op::Jump(t) if landing_pads.contains(&(t as u64))
+        ) {
+            continue;
+        }
+        // Another path really branches to the trampoline: running it is not
+        // provably dead, so leave the shape alone.
+        if branch_targets.contains(&addresses[i + 1]) {
+            continue;
+        }
+        insert_after.push(i);
+    }
+    if insert_after.is_empty() {
+        return Vec::new();
+    }
+    let mut old_insns = std::mem::take(insns);
+    let old_addrs = std::mem::take(addresses);
+    let mut out_insns = Vec::with_capacity(old_insns.len() + insert_after.len());
+    let mut out_addrs = Vec::with_capacity(old_addrs.len() + insert_after.len());
+    let mut rewritten = Vec::with_capacity(insert_after.len());
+    let mut next_insert = 0usize;
+    for (i, mut insn) in old_insns.drain(..).enumerate() {
+        let addr = old_addrs[i];
+        if next_insert < insert_after.len() && insert_after[next_insert] == i {
+            let arg = insn.operands.get(2).cloned().unwrap_or(Operand::Unknown);
+            if insn.operands.len() > 1 {
+                insn.operands[1] = Operand::Unknown;
+            }
+            out_insns.push(insn);
+            out_addrs.push(addr);
+            out_insns.push(Insn::new(Op::Throw, vec![arg], addr));
+            out_addrs.push(addr);
+            rewritten.push(addr);
+            next_insert += 1;
+            continue;
+        }
+        out_insns.push(insn);
+        out_addrs.push(addr);
+    }
+    *insns = out_insns;
+    *addresses = out_addrs;
+    rewritten
+}
+
 impl RecoveryContext {
     /// Build all resolution maps (parallel over images like decompiler.rs).
     pub fn build(executor: &mut Il2CppExecutor, metadata: &Metadata, il2cpp: &Il2Cpp) -> Self {
+        crate::dbg_eprintln!("[debug] RecoveryContext::build: got_relative_relocations has {} entries", il2cpp.got_relative_relocations.len());
         // Resolve every GenericInst type through the executor's full naming
         // logic (nested args, namespaces) once; keyed by datapoint.
         let mut generic_names: HashMap<u64, String> = HashMap::new();
@@ -780,70 +1098,122 @@ impl RecoveryContext {
                         let image_name = image_name.clone();
                         let assembly = assembly.clone();
                         (td.method_start as usize..method_end).map(move |mi| {
-                            (mi, td.method_start, method_end, type_ns.clone(), type_name.clone(), image_name.clone(), assembly.clone(), tdi)
+                            (
+                                mi,
+                                td.method_start,
+                                method_end,
+                                type_ns.clone(),
+                                type_name.clone(),
+                                image_name.clone(),
+                                assembly.clone(),
+                                tdi,
+                            )
                         })
                     })
-                    .filter_map(move |(mi, _, _, type_ns, type_name, image_name, assembly, tdi)| {
-                        let method_def = metadata.method_defs.get(mi)?;
-                        let ptr = il2cpp.get_method_pointer(&image_name, method_def);
-                        if ptr == 0 {
-                            return None;
-                        }
-                        let rva = il2cpp.get_rva(ptr);
-                        if rva == 0 {
-                            return None;
-                        }
-                        let name = metadata
-                            .get_string_from_index(method_def.name_index as i32)
-                            .unwrap_or_default();
-                        let is_static = (method_def.flags & 0x0010) != 0;
-                        let ret = il2cpp
-                            .types
-                            .get(method_def.return_type as usize)
-                            .map(|t| managed_type_of(t, metadata, il2cpp, 0))
-                            .unwrap_or(ManagedType::Unknown);
-                        let params = (0..method_def.parameter_count as usize)
-                            .filter_map(|j| {
-                                let pidx = method_def.parameter_start as usize + j;
-                                let pd = metadata.parameter_defs.get(pidx)?;
-                                il2cpp
-                                    .types
-                                    .get(pd.type_index as usize)
-                                    .map(|t| managed_type_of(t, metadata, il2cpp, 0))
-                            })
-                            .collect();
-                        let vslot = if method_def.slot != u16::MAX
-                            && method_def.generic_container_index == -1
-                        {
-                            Some((tdi as i32, method_def.slot as usize))
-                        } else {
-                            None
-                        };
-                        Some((
-                            rva,
-                            MethodRef {
-                                image_index: image_idx,
-                                type_def_index: tdi as i32,
-                                method_index: mi as u32,
-                                name,
-                                declaring_namespace: type_ns,
-                                declaring_type_name: type_name,
-                                assembly,
-                                sig: types::MethodSigInfo { ret, params, is_static },
-                            },
-                            vslot,
-                        ))
-                    })
+                    .filter_map(
+                        move |(mi, _, _, type_ns, type_name, image_name, assembly, tdi)| {
+                            let method_def = metadata.method_defs.get(mi)?;
+                            let ptr = il2cpp.get_method_pointer(&image_name, method_def);
+                            // A VIRTUAL method with NO native body (abstract /
+                            // interface declaration) still DECLARES its vtable
+                            // slot. `BaseListBank.GetListLength` is abstract, so
+                            // the slot was never entered and a call through the
+                            // base class's slot 5 stayed `fnptr_` even though
+                            // the callee's NAME is in metadata. Such entries are
+                            // collected with rva 0 and only feed `vtable_slots`;
+                            // a real body at the same (tdi, slot) wins below.
+                            // The abstract/virtual flag is REQUIRED: a bodyless
+                            // method whose slot field is not meaningful (generic
+                            // definitions leave it unset) would poison a real
+                            // virtual slot — `List<T>.Add` sites rendered as
+                            // `list...ctor` that way.
+                            let is_virtual = (method_def.flags & 0x0040) != 0;
+                            let rva = if ptr == 0 {
+                                if !is_virtual {
+                                    return None;
+                                }
+                                0
+                            } else {
+                                let r = il2cpp.get_rva(ptr);
+                                if r == 0 {
+                                    return None;
+                                }
+                                r
+                            };
+                            let name = metadata
+                                .get_string_from_index(method_def.name_index as i32)
+                                .unwrap_or_default();
+                            let is_static = (method_def.flags & 0x0010) != 0;
+                            let ret = il2cpp
+                                .types
+                                .get(method_def.return_type as usize)
+                                .map(|t| managed_type_of(t, metadata, il2cpp, 0))
+                                .unwrap_or(ManagedType::Unknown);
+                            let params = (0..method_def.parameter_count as usize)
+                                .filter_map(|j| {
+                                    let pidx = method_def.parameter_start as usize + j;
+                                    let pd = metadata.parameter_defs.get(pidx)?;
+                                    il2cpp
+                                        .types
+                                        .get(pd.type_index as usize)
+                                        .map(|t| managed_type_of(t, metadata, il2cpp, 0))
+                                })
+                                .collect();
+                            let vslot = if method_def.slot != u16::MAX
+                                && method_def.generic_container_index == -1
+                            {
+                                Some((tdi as i32, method_def.slot as usize))
+                            } else {
+                                None
+                            };
+                            Some((
+                                rva,
+                                MethodRef {
+                                    image_index: image_idx,
+                                    type_def_index: tdi as i32,
+                                    method_index: mi as u32,
+                                    name,
+                                    declaring_namespace: type_ns,
+                                    declaring_type_name: type_name,
+                                    assembly,
+                                    sig: types::MethodSigInfo {
+                                        ret,
+                                        params,
+                                        is_static,
+                                    },
+                                },
+                                vslot,
+                            ))
+                        },
+                    )
                     .collect::<Vec<_>>()
             })
             .collect();
         let mut methods_by_rva: HashMap<u64, MethodRef> =
             HashMap::with_capacity(method_entries.len());
         let mut vtable_slots: HashMap<(i32, usize), MethodRef> = HashMap::new();
+        // REAL BODIES first, with the original last-wins ordering: two
+        // definitions can declare the same (tdi, slot) in shared-generic
+        // metadata, and the later entry is the one that used to win. Then the
+        // bodyless declarations (abstract/interface) fill only slots no body
+        // claimed, so they can never displace a concrete override.
         for (rva, m, vslot) in &method_entries {
+            if *rva == 0 {
+                continue;
+            }
             methods_by_rva.insert(*rva, m.clone());
             if let Some(k) = vslot {
                 vtable_slots.insert(*k, m.clone());
+            }
+        }
+        if !crate::recovery::env_flags::flag("ILR_NOABSTRACT") {
+            for (rva, m, vslot) in &method_entries {
+                if *rva != 0 {
+                    continue;
+                }
+                if let Some(k) = vslot {
+                    vtable_slots.entry(*k).or_insert_with(|| m.clone());
+                }
             }
         }
         // TypeDef → (image index, assembly). An interface's MethodRef has to name
@@ -990,7 +1360,7 @@ impl RecoveryContext {
         // those two want opposite fixes. It matters most on the arm64 corpora,
         // where the table is small enough to look like the feature did nothing
         // (52 slots recovered against the 2,142 the metadata declares).
-        if std::env::var("ILR_IFACE").is_ok() {
+        if crate::recovery::env_flags::flag("ILR_IFACE") {
             if let Some(s) = resolve::interface_dispatch_summary() {
                 eprintln!("{s}");
             }
@@ -1036,7 +1406,7 @@ impl RecoveryContext {
             .flat_map(|(rva, ms)| ms.iter().map(move |m| (m.method_index, *rva)))
             .collect();
 
-        if std::env::var("ILR_RVACOLLIDE").is_ok() {
+        if crate::recovery::env_flags::flag("ILR_RVACOLLIDE") {
             use std::collections::HashSet as _HS;
             let by_rva: HashMap<u64, Vec<&MethodRef>> = shared_by_rva
                 .iter()
@@ -1058,7 +1428,8 @@ impl RecoveryContext {
                     colliding += 1;
                     max_fanout = max_fanout.max(ms.len());
                     owners += ms.len() as u64;
-                    let tys: _HS<&str> = ms.iter().map(|m| m.declaring_type_name.as_str()).collect();
+                    let tys: _HS<&str> =
+                        ms.iter().map(|m| m.declaring_type_name.as_str()).collect();
                     if tys.len() > 1 {
                         cross_type += 1;
                     }
@@ -1136,6 +1507,7 @@ impl RecoveryContext {
                 shared_cross_type,
                 shared_rva_of_method,
                 literal_index_by_addr: HashMap::new(),
+                literal_ptr_index_by_addr: HashMap::new(),
                 literals,
                 method_spec_index_by_addr: HashMap::new(),
                 specs_by_body_rva: HashMap::new(),
@@ -1147,9 +1519,29 @@ impl RecoveryContext {
                 metadata_init: Vec::new(),
                 vtable_slots,
                 klass_to_tdi: HashMap::new(),
+                usage_type_by_addr: HashMap::new(),
+                named_type_sizes: HashMap::new(),
                 tdi_names: HashMap::new(),
                 objc_selector_stubs: HashMap::new(),
                 native_wrappers: HashMap::new(),
+                field_layouts: HashMap::new(),
+                field_types: HashMap::new(),
+                field_widths: HashMap::new(),
+                static_field_layouts: HashMap::new(),
+                field_type_by_name: HashMap::new(),
+                field_generic_text: HashMap::new(),
+                interface_tdis: HashSet::new(),
+                type_parent_chains: HashMap::new(),
+                enum_members: HashMap::new(),
+                attribute_ctor_names: HashMap::new(),
+                got_addend_by_addr: il2cpp.got_relative_relocations.clone(),
+                method_name_by_va: HashMap::new(),
+                static_field_offsets: HashMap::new(),
+                static_field_types: HashMap::new(),
+                tdi_names_reverse: HashMap::new(),
+                method_return_tdi: HashMap::new(),
+                tdi_fields: HashMap::new(),
+                value_type_tdis: HashSet::new(),
             },
             max_method_bytes: 64 * 1024,
             parent_chains: HashMap::new(),
@@ -1173,6 +1565,14 @@ impl RecoveryContext {
             ),
             x86_abi: x86_abi_of(il2cpp),
         };
+        // Populate method_name_by_va: convert RVAs to VAs for quick lookup
+        for (&rva, method_ref) in &ctx.maps.methods_by_rva {
+            let va = il2cpp.map_rtva(rva);
+            if va != 0 {
+                ctx.maps.method_name_by_va.insert(va, (method_ref.name.clone(), method_ref.declaring_type_name.clone()));
+            }
+        }
+        
         // method/field index → owner type-def (single pass over types)
         for (ti, td) in metadata.type_defs.iter().enumerate() {
             let ms = td.method_start as usize;
@@ -1209,8 +1609,155 @@ impl RecoveryContext {
         // and `detect_helpers` stay arch-gated: those really are encoded-scan
         // passes for the 64-bit image formats. `build_parent_chains` is not.
         ctx.parent_chains = build_parent_chains(metadata, il2cpp);
-        if ctx.arch_is_arm64 || ctx.is_x64 {
+        // Pre-compute field layouts for the post-hoc field annotation pass.
+        // For every TypeDef, compute (tdi, byte_offset) → (field_name, declaring_type_name)
+        // for each instance field, and copy the parent chains into ResolveMaps so the
+        // field annotation pass can walk base-class chains without needing BridgeOracle.
+        ctx.maps.type_parent_chains = ctx.parent_chains.clone();
+        ctx.maps.interface_tdis = metadata
+            .type_defs
+            .iter()
+            .enumerate()
+            .filter(|(_, td)| td.is_interface())
+            .map(|(i, _)| i as i32)
+            .collect();
+        // Array element sizes for the late element-store sugar. Reference
+        // types are pointer-sized; value types take their metadata
+        // `instance_size`. Ambiguous short names are dropped rather than
+        // risk a wrong stride on one of the same-named types.
+        {
+            let ptr_size = if il2cpp.is_32bit { 4u64 } else { 8u64 };
+            let sizes = &mut ctx.maps.named_type_sizes;
+            sizes.insert("object".into(), ptr_size);
+            sizes.insert("string".into(), ptr_size);
+            sizes.insert("Type".into(), ptr_size);
+            // short name → size, with `None` meaning "seen with two sizes".
+            let mut short: HashMap<String, Option<u64>> = HashMap::new();
+            for (i, td) in metadata.type_defs.iter().enumerate() {
+                let name = metadata
+                    .get_string_from_index(td.name_index)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                let size = if td.is_value_type() {
+                    il2cpp
+                        .type_definition_sizes
+                        .get(i)
+                        .map(|s| s.instance_size as u64)
+                        .filter(|s| *s > 0)
+                } else {
+                    Some(ptr_size)
+                };
+                let Some(size) = size else { continue };
+                let ns = metadata
+                    .get_string_from_index(td.namespace_index)
+                    .unwrap_or_default();
+                if !ns.is_empty() {
+                    sizes.insert(format!("{ns}.{name}"), size);
+                }
+                short
+                    .entry(name)
+                    .and_modify(|slot| {
+                        if *slot != Some(size) {
+                            *slot = None;
+                        }
+                    })
+                    .or_insert(Some(size));
+            }
+            for (name, size) in short {
+                if let Some(size) = size {
+                    sizes.entry(name).or_insert(size);
+                }
+            }
+        }
+        Self::populate_field_layouts(
+            &mut ctx.maps,
+            metadata,
+            il2cpp,
+            &ctx.parent_chains,
+            &ctx.generic_names,
+        );
+
+        // CRITICAL: scan_metadata_usages MUST run before populate_static_field_layouts,
+        // because the latter reads from field_index_by_addr which is populated by the scan.
+        // The encoded metadata usage words live in data sections on all architectures,
+        // so this scan is not arch-gated (unlike detect_helpers which is arch-specific).
+        if il2cpp.version >= 27.0 {
             ctx.scan_metadata_usages(metadata, il2cpp);
+        }
+
+        // Follow the pointer that stands in front of a usage slot, so a site
+        // that loads the slot ADDRESS and then the word resolves like a site
+        // that loads the word directly (see
+        // `ResolveMaps::literal_ptr_index_by_addr`).
+        ctx.alias_usage_pointers(il2cpp);
+
+        // Pre-compute static field layouts from the metadata-usage scan.
+        // Maps absolute VA → (field_name, type_name) for every static field,
+        // so the field annotation pass can resolve `RawDeref(Int(base), offset, _)`
+        // to `StaticField(type, field)` when `base + offset` matches a known address.
+        Self::populate_static_field_layouts(&mut ctx.maps, metadata, &ctx.field_index_by_addr, &ctx.field_owner_tdi);
+        // Pre-compute static field offsets within the static_fields structure.
+        // Maps (tdi, byte_offset) → (field_name, type_name) for every static field,
+        // so the field annotation pass can resolve
+        // `RawDeref(Field(klass, "static_fields"), offset)` to `StaticField(type, field)`.
+        {
+            let t = std::time::Instant::now();
+            Self::populate_static_field_offsets(&mut ctx.maps, metadata, il2cpp);
+            eprintln!("[perf] populate_static_field_offsets: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+        // Pre-compute reverse maps used by infer_types_from_stmts (built once
+        // globally instead of per-method — eliminates thousands of redundant
+        // HashMap constructions).
+        {
+            let t = std::time::Instant::now();
+            ctx.maps.tdi_names_reverse = ctx.maps.tdi_names.iter().map(|(&tdi, (ns, name))| {
+                if ns.is_empty() {
+                    (name.clone(), tdi)
+                } else {
+                    (format!("{}.{}", ns, name), tdi)
+                }
+            }).collect();
+            {
+                let mut conflict: HashMap<String, bool> = HashMap::new();
+                for method_ref in ctx.maps.methods_by_rva.values() {
+                    if let ManagedType::Class(named) = &method_ref.sig.ret {
+                        if named.type_def_index >= 0 {
+                            let name = &method_ref.name;
+                            if let Some(&existing) = ctx.maps.method_return_tdi.get(name) {
+                                if existing != named.type_def_index {
+                                    conflict.insert(name.clone(), true);
+                                }
+                            } else {
+                                ctx.maps.method_return_tdi.insert(name.clone(), named.type_def_index);
+                            }
+                        }
+                    }
+                }
+                for name in conflict.keys() {
+                    ctx.maps.method_return_tdi.remove(name);
+                }
+            }
+            eprintln!("[perf] pre-compute tdi_names_reverse + method_return_tdi: {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+        // Pre-compute enum member names for the enum_names reconstruction pass.
+        Self::populate_enum_members(&mut ctx.maps, metadata, il2cpp);
+        // Pre-compute attribute constructor names for the attribute recovery pass.
+        Self::populate_attribute_ctor_names(&mut ctx.maps, executor, metadata, il2cpp);
+        // For Unity 2022+ (IL2CPP v29+), also try to populate static fields from data sections.
+        // This handles the case where static fields are NOT resolved through metadata usages
+        // but are stored directly in .bss/.data sections with direct address references.
+        // ALWAYS run this for v29+ since metadata usages give different addresses than the
+        // actual runtime static field storage locations.
+        if il2cpp.version >= 29.0 {
+            Self::populate_static_fields_from_data_sections(&mut ctx.maps, metadata, il2cpp);
+        }
+        // GOT relocation-based static field resolution. Uses R_AARCH64_RELATIVE /
+        // R_X86_64_RELATIVE relocations to map GOT addresses to static field storage
+        // addends, then matches addends to classes by static_fields_size.
+        // (Now called from within populate_static_fields_from_data_sections)
+        if ctx.arch_is_arm64 || ctx.is_x64 {
             ctx.detect_helpers(metadata, il2cpp);
             // Experimental (ILR_ICALL=1): wrapper→native-target catalog.
             // NOTE: on this binary every extern-wrapper route goes through
@@ -1218,7 +1765,7 @@ impl RecoveryContext {
             // tail-callers), so direct-branch correlation does NOT name
             // engine implementations — kept as a tool for binaries where
             // externs link directly.
-            if std::env::var("ILR_ICALL").is_ok() {
+            if crate::recovery::env_flags::flag("ILR_ICALL") {
                 ctx.build_native_wrappers(metadata, il2cpp);
             }
         }
@@ -1245,7 +1792,9 @@ impl RecoveryContext {
             // call site's own `MethodInfo` load is for, and it can only be done
             // from here, where the metadata is at hand.
             for spec_idx in spec_indices_to_name(il2cpp.method_specs.len()) {
-                let Some(spec) = il2cpp.method_specs.get(spec_idx) else { continue };
+                let Some(spec) = il2cpp.method_specs.get(spec_idx) else {
+                    continue;
+                };
                 let mdi = spec.method_definition_index;
                 if mdi < 0 {
                     continue;
@@ -1347,7 +1896,11 @@ impl RecoveryContext {
             declaring_namespace,
             declaring_type_name,
             assembly: String::new(),
-            sig: types::MethodSigInfo { ret, params, is_static },
+            sig: types::MethodSigInfo {
+                ret,
+                params,
+                is_static,
+            },
         })
     }
 
@@ -1364,64 +1917,121 @@ impl RecoveryContext {
             .data_sections
             .par_iter()
             .map(|sec| {
-            let sec_end = sec
-                .offset_end
-                .min(il2cpp.stream.len() as u64)
-                .saturating_sub(pointer_size);
-            let mut local: Vec<(u64, u8, u32)> = Vec::new();
-            let mut pos = sec.offset;
-            while pos < sec_end {
-                let metadata_value = if il2cpp.is_32bit {
-                    il2cpp.stream.peek_u32_at(pos).unwrap_or(0) as u64
-                } else {
-                    il2cpp.stream.peek_u64_at(pos).unwrap_or(0)
-                };
-                pos += pointer_size;
+                let sec_end = sec
+                    .offset_end
+                    .min(il2cpp.stream.len() as u64)
+                    .saturating_sub(pointer_size);
+                let mut local: Vec<(u64, u8, u32)> = Vec::new();
+                let mut pos = sec.offset;
+                while pos < sec_end {
+                    let metadata_value = if il2cpp.is_32bit {
+                        il2cpp.stream.peek_u32_at(pos).unwrap_or(0) as u64
+                    } else {
+                        il2cpp.stream.peek_u64_at(pos).unwrap_or(0)
+                    };
+                    pos += pointer_size;
 
-                if metadata_value >= u32::MAX as u64 || metadata_value == 0 {
-                    continue;
-                }
-                let encoded = metadata_value as u32;
-                let raw_usage = (encoded & 0xE000_0000) >> 29;
-                if raw_usage == 0 || raw_usage > 7 {
-                    continue;
-                }
-                let decoded_index = (encoded & 0x1FFF_FFFE) >> 1;
-                let expected = ((raw_usage << 29) | (decoded_index << 1)) + 1;
-                if metadata_value != expected as u64 {
-                    continue;
-                }
-                // Cpp2IL `MetadataUsage.DecodeMetadataUsage`: from 106.1 on,
-                // every kind ABOVE TypeInfo is written one number lower,
-                // because the code generator's enum no longer contains
-                // `kIl2CppMetadataUsageIl2CppType`. Measured against the
-                // tables — the StringLiteral slots are kind 4 on the 108
-                // build (10,475 of 10,483 literal-table indices in range),
-                // kind 5 on the 106, 31.1 and 29.1 builds (17,614 of 17,624
-                // on iOS) — so the shift is real and version-gated.
-                let usage = if il2cpp.version > 106.1 && raw_usage > 1 {
-                    raw_usage + 1
-                } else {
-                    raw_usage
-                };
+                    if metadata_value >= u32::MAX as u64 || metadata_value == 0 {
+                        continue;
+                    }
+                    let encoded = metadata_value as u32;
+                    let raw_usage = (encoded & 0xE000_0000) >> 29;
+                    if raw_usage == 0 || raw_usage > 7 {
+                        continue;
+                    }
+                    let decoded_index = (encoded & 0x1FFF_FFFE) >> 1;
+                    let expected = ((raw_usage << 29) | (decoded_index << 1)) + 1;
+                    if metadata_value != expected as u64 {
+                        continue;
+                    }
+                    // Cpp2IL `MetadataUsage.DecodeMetadataUsage`: from 106.1 on,
+                    // every kind ABOVE TypeInfo is written one number lower,
+                    // because the code generator's enum no longer contains
+                    // `kIl2CppMetadataUsageIl2CppType`. Measured against the
+                    // tables — the StringLiteral slots are kind 4 on the 108
+                    // build (10,475 of 10,483 literal-table indices in range),
+                    // kind 5 on the 106, 31.1 and 29.1 builds (17,614 of 17,624
+                    // on iOS) — so the shift is real and version-gated.
+                    let usage = if il2cpp.version > 106.1 && raw_usage > 1 {
+                        raw_usage + 1
+                    } else {
+                        raw_usage
+                    };
 
-                let addr = pos - pointer_size;
-                let va = il2cpp.map_rtva(addr);
-                if va == 0 {
-                    continue;
+                    let addr = pos - pointer_size;
+                    let va = il2cpp.map_rtva(addr);
+                    if va == 0 {
+                        continue;
+                    }
+                    let rva = il2cpp.get_rva(va);
+                    if rva == 0 {
+                        continue;
+                    }
+                    local.push((rva, usage as u8, decoded_index));
                 }
-                let rva = il2cpp.get_rva(va);
-                if rva == 0 {
-                    continue;
+                local
+            })
+            .collect();
+
+        if crate::recovery::env_flags::flag("ILR_USAGEDBG") {
+            let mut kinds: HashMap<u8, usize> = HashMap::new();
+            let mut arrays = 0usize;
+            let mut array_slots = HashSet::new();
+            let mut elems: HashMap<String, usize> = HashMap::new();
+            for &(_, usage, index) in section_results.iter().flatten() {
+                *kinds.entry(usage).or_default() += 1;
+                if usage == 1 || usage == 2 {
+                    if let Some(t) = il2cpp.types.get(index as usize) {
+                        if let Some(crate::il2cpp::enums::Il2CppTypeEnum::SzArray) =
+                            crate::il2cpp::enums::Il2CppTypeEnum::from_u8(t.type_enum)
+                        {
+                            arrays += 1;
+                            let mt = managed_type_of(t, metadata, il2cpp, 0);
+                            *elems.entry(mt.display_name()).or_default() += 1;
+                            array_slots.insert(index);
+                        }
+                    }
                 }
-                local.push((rva, usage as u8, decoded_index));
             }
-            local
-        })
-        .collect();
-
+            eprintln!(
+                "[usage] encoded kinds {kinds:?} szarray slots {arrays} distinct types {}",
+                array_slots.len()
+            );
+            let mut top: Vec<_> = elems.into_iter().collect();
+            top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            for (name, n) in top.into_iter().take(15) {
+                eprintln!("[usage]   array {name}: {n} slots");
+            }
+        }
         for (rva, usage, decoded_index) in section_results.into_iter().flatten() {
             self.apply_metadata_usage(rva, usage, decoded_index, metadata, il2cpp);
+        }
+    }
+
+    /// Record the slots that POINT AT a metadata-usage word.
+    ///
+    /// `scan_metadata_usages` keys each encoded word by its OWN address. Where the
+    /// toolchain reaches a word through a relocated pointer the code loads the
+    /// pointer first, so the address in the lifted expression is the pointer's
+    /// and every lookup missed. The relocation table already says which pointer
+    /// points at which word, so the alias is exact — no heuristic, and it costs
+    /// one pass over relocations the loader has already parsed.
+    fn alias_usage_pointers(&mut self, il2cpp: &Il2Cpp) {
+        if crate::recovery::env_flags::flag("ILR_NO_GOTALIAS") {
+            return;
+        }
+        let mut aliased = 0usize;
+        for (&slot, &target) in &il2cpp.got_relative_relocations {
+            let idx = self.maps.literal_index_by_addr.get(&il2cpp.get_rva(target)).copied();
+            if let Some(idx) = idx {
+                self.maps
+                    .literal_ptr_index_by_addr
+                    .insert(il2cpp.get_rva(slot), idx);
+                aliased += 1;
+            }
+        }
+        if crate::recovery::env_flags::flag("ILR_USAGEDBG") {
+            eprintln!("[usage] literal pointer aliases: {aliased}");
         }
     }
 
@@ -1484,7 +2094,9 @@ impl RecoveryContext {
             // which instantiation it means.
             6 => {
                 if (decoded_index as usize) < il2cpp.method_specs.len() {
-                    self.maps.method_spec_index_by_addr.insert(rva, decoded_index);
+                    self.maps
+                        .method_spec_index_by_addr
+                        .insert(rva, decoded_index);
                 }
             }
             1 | 2 => self.record_klass_usage(rva, decoded_index, metadata, il2cpp),
@@ -1523,21 +2135,45 @@ impl RecoveryContext {
                     il2cpp.peek_generic_class(gc_addr).ok().and_then(|gc| {
                         if il2cpp.version >= 27.0 {
                             let tp = gc.type_ptr;
-                            il2cpp.get_il2cpp_type(tp).map(|it| {
-                                (it.klass_index() as usize, it.clone())
-                            })
+                            il2cpp
+                                .get_il2cpp_type(tp)
+                                .map(|it| (it.klass_index() as usize, it.clone()))
                         } else {
                             let idx = gc.type_definition_index as usize;
                             Some((idx, t.clone()))
                         }
                         .and_then(|(kidx, _)| {
-                            (kidx < metadata.type_defs.len())
-                                .then_some(kidx as i32)
+                            (kidx < metadata.type_defs.len()).then_some(kidx as i32)
                         })
                     })
                 }
                 _ => None,
             };
+            if crate::recovery::env_flags::flag("ILR_USAGEDBG")
+                && std::env::var("ILR_USAGESLOT").is_ok_and(|s| {
+                    u64::from_str_radix(s.trim_start_matches("0x"), 16)
+                        .is_ok_and(|want| want == rva)
+                })
+            {
+                eprintln!(
+                    "[usage] slot {rva:#x} idx {decoded_index} enum {:?} tdi {tdi_opt:?} managed {:?}",
+                    te,
+                    managed_type_of(t, metadata, il2cpp, 0)
+                );
+            }
+            // Every type slot, not just those with a TypeDef. SzArray slots
+            // carry the ARRAY class that `il2cpp_array_new_specific` receives;
+            // rendering them as `typeof(T[])` is what gives the allocator its
+            // element type. Primitive/generic-inst slots get their correct
+            // typeof() spelling from the same conversion.
+            let mt = managed_type_of_gn(t, metadata, il2cpp, 0, Some(&self.generic_names));
+            let text = mt.display_name();
+            if !matches!(mt, ManagedType::Unknown)
+                && text != "generic"
+                && !text.contains("<unknown>")
+            {
+                self.maps.usage_type_by_addr.insert(rva, mt);
+            }
             if let Some(tdi) = tdi_opt {
                 self.maps.klass_to_tdi.insert(rva, tdi);
                 if !self.maps.tdi_names.contains_key(&tdi) {
@@ -1615,8 +2251,8 @@ impl RecoveryContext {
                 // apply — pre-27 metadata has no encoded words at all.
                 applied += 1;
                 if let Ok(want) = std::env::var("ILR_USAGEDBG") {
-                    let near: i64 = i64::from_str_radix(want.trim_start_matches("0x"), 16)
-                        .unwrap_or(0);
+                    let near: i64 =
+                        i64::from_str_radix(want.trim_start_matches("0x"), 16).unwrap_or(0);
                     if (rva as i64 - near).abs() <= 0x40 {
                         eprintln!(
                             "[usage] NEAR kind {kind} dest {dest} src {src} addr {address:#x} rva {rva:#x}"
@@ -1625,11 +2261,11 @@ impl RecoveryContext {
                 }
                 self.apply_metadata_usage(rva, kind as u8, src, metadata, il2cpp);
             }
-            if std::env::var("ILR_USAGEDBG").is_ok() {
+            if crate::recovery::env_flags::flag("ILR_USAGEDBG") {
                 eprintln!("[usage] kind {kind}: {} pairs", ordered_len);
             }
         }
-        if std::env::var("ILR_USAGEDBG").is_ok() {
+        if crate::recovery::env_flags::flag("ILR_USAGEDBG") {
             eprintln!(
                 "[usage] legacy slots applied {applied} | literals {} fields {} methods {} specs {} klass {}",
                 self.maps.literal_index_by_addr.len(),
@@ -1712,8 +2348,11 @@ impl RecoveryContext {
             for &rva in sorted.iter().step_by(stride).take(sample_count) {
                 let size = il2cpp.get_method_body_size(rva, &sorted);
                 let probe = size.min(256);
-                let Some(bytes) = il2cpp.read_bytes_at_rva(rva, probe) else { continue };
-                let Some(lifted) = lift_helper_body(il2cpp, rva, &bytes, 120, is_arm64, is_x64) else {
+                let Some(bytes) = il2cpp.read_bytes_at_rva(rva, probe) else {
+                    continue;
+                };
+                let Some(lifted) = lift_helper_body(il2cpp, rva, &bytes, 120, is_arm64, is_x64)
+                else {
                     continue;
                 };
 
@@ -1724,11 +2363,7 @@ impl RecoveryContext {
                     match insn.op {
                         ir::Op::Move => {
                             if let Some(Operand::Register(d)) = insn.dest() {
-                                let src = insn
-                                    .operands
-                                    .get(1)
-                                    .cloned()
-                                    .unwrap_or(Operand::Unknown);
+                                let src = insn.operands.get(1).cloned().unwrap_or(Operand::Unknown);
                                 consts.insert(d.clone(), eval_arg(&src, &consts, &data_ranges));
                             }
                             handled = true;
@@ -1755,8 +2390,7 @@ impl RecoveryContext {
                                 if !maps.methods_by_rva.contains_key(&t) {
                                     let c = counts.entry(t).or_default();
                                     c.total += 1;
-                                    let x0 =
-                                        consts.get("x0").copied().unwrap_or(ArgVal::Unknown);
+                                    let x0 = consts.get("x0").copied().unwrap_or(ArgVal::Unknown);
                                     match x0 {
                                         ArgVal::Const(v) if v >= 0 && v < total_lits => {
                                             c.string_arg += 1;
@@ -1806,7 +2440,18 @@ impl RecoveryContext {
             let mut object_new: Vec<u64> = Vec::new();
             if let Some(a) = obj_anchor {
                 object_new.push(a);
-                let root = chase_thunk_root(il2cpp, &maps.methods_by_rva, a, is_arm64, is_x64);
+                // Compare against the IMPLEMENTATION root, not the export's own
+                // RVA: the export is a wrapper that CALLS the allocator, and
+                // every codegen variant branches to that same allocator (see
+                // `runtime_helpers::export_roots`). Using the export's RVA
+                // matched nothing, so no allocator thunk was ever classified.
+                let roots = runtime_helpers::export_roots(
+                    il2cpp,
+                    &maps.methods_by_rva,
+                    "il2cpp_object_new",
+                    is_arm64,
+                    is_x64,
+                );
                 let mut budget = 512u32;
                 for t in freq_targets_desc(&counts, &excluded_str, 128) {
                     if object_new.contains(&t) {
@@ -1836,8 +2481,13 @@ impl RecoveryContext {
                     // generic helper, which the doc comment above this function
                     // already warns against admitting ("real functions like
                     // `il2cpp_runtime_class_init`").
-                    if chase_thunk_root(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64) == root
-                        || reaches_call(
+                    if roots.contains(&chase_thunk_root(
+                        il2cpp,
+                        &maps.methods_by_rva,
+                        t,
+                        is_arm64,
+                        is_x64,
+                    )) || reaches_call(
                             il2cpp,
                             t,
                             a,
@@ -1852,28 +2502,39 @@ impl RecoveryContext {
                     }
                 }
             } else {
-                object_new = select_object_new_fallback(
-                    &counts,
-                    &excluded_str,
-                    &|t| {
-                        is_thunk_body(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64)
-                    },
-                );
+                object_new = select_object_new_fallback(&counts, &excluded_str, &|t| {
+                    is_thunk_body(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64)
+                });
             }
-            let excluded_obj: HashSet<u64> =
-                excluded_str.union(&object_new.iter().copied().collect()).copied().collect();
+            let excluded_obj: HashSet<u64> = excluded_str
+                .union(&object_new.iter().copied().collect())
+                .copied()
+                .collect();
 
             // box: value_box + variants; fallback requires a defined 2nd arg
             let mut box_fn: Vec<u64> = Vec::new();
             if let Some(a) = box_anchor {
                 box_fn.push(a);
-                let root = chase_thunk_root(il2cpp, &maps.methods_by_rva, a, is_arm64, is_x64);
+                // Same wrapper-vs-implementation defect as object_new above.
+                let roots = runtime_helpers::export_roots(
+                    il2cpp,
+                    &maps.methods_by_rva,
+                    "il2cpp_value_box",
+                    is_arm64,
+                    is_x64,
+                );
                 let mut budget = 512u32;
                 for t in freq_targets_desc(&counts, &excluded_obj, 128) {
                     if box_fn.contains(&t) {
                         continue;
                     }
-                    if chase_thunk_root(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64) == root
+                    if roots.contains(&chase_thunk_root(
+                        il2cpp,
+                        &maps.methods_by_rva,
+                        t,
+                        is_arm64,
+                        is_x64,
+                    ))
                         || reaches_call(
                             il2cpp,
                             t,
@@ -1889,16 +2550,14 @@ impl RecoveryContext {
                     }
                 }
             } else {
-                box_fn = select_box_fallback(
-                    &counts,
-                    &excluded_obj,
-                    &|t| {
-                        is_thunk_body(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64)
-                    },
-                );
+                box_fn = select_box_fallback(&counts, &excluded_obj, &|t| {
+                    is_thunk_body(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64)
+                });
             }
-            let excluded_box: HashSet<u64> =
-                excluded_obj.union(&box_fn.iter().copied().collect()).copied().collect();
+            let excluded_box: HashSet<u64> = excluded_obj
+                .union(&box_fn.iter().copied().collect())
+                .copied()
+                .collect();
 
             // raise: anchored helpers (arg-taking) only; per-type throw
             // helpers (zero-arg, constructed internally) are NOT added here —
@@ -1906,13 +2565,30 @@ impl RecoveryContext {
             let mut raise_exception: Vec<u64> = Vec::new();
             if let Some(a) = raise_anchor {
                 raise_exception.push(a);
-                let root = chase_thunk_root(il2cpp, &maps.methods_by_rva, a, is_arm64, is_x64);
+                // Same wrapper-vs-implementation defect. This one is the most
+                // dangerous of the three: a raise role turns the call into a CFG
+                // terminator, so a false member deletes live code. It stays exact
+                // (root equality against the export's own implementation), not a
+                // reachability test — see the warning in classify_bodies.
+                let roots = runtime_helpers::export_roots(
+                    il2cpp,
+                    &maps.methods_by_rva,
+                    "il2cpp_raise_exception",
+                    is_arm64,
+                    is_x64,
+                );
                 let mut budget = 512u32;
                 for t in freq_targets_desc(&counts, &excluded_box, 128) {
                     if raise_exception.contains(&t) {
                         continue;
                     }
-                    if chase_thunk_root(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64) == root
+                    if roots.contains(&chase_thunk_root(
+                        il2cpp,
+                        &maps.methods_by_rva,
+                        t,
+                        is_arm64,
+                        is_x64,
+                    ))
                         || reaches_call(
                             il2cpp,
                             t,
@@ -1939,47 +2615,53 @@ impl RecoveryContext {
             // matches either shape.
             let mut metadata_init: Vec<u64> = Vec::new();
             {
-                let matches_init_shape = |il2cpp: &Il2Cpp,
-                                          root: u64,
-                                          is_arm64: bool,
-                                          is_x64: bool|
-                 -> bool {
-                    // The shape can live at ANY hop of the thunk chain:
-                    // 0x4a58b98 → 0x4a8c6b0 passes THROUGH 0x4a8c398 (the
-                    // `LDRB w?, [x?, #0x132]` carrier) before settling. Walk
-                    // each hop and test it; stop at managed methods.
-                    let mut cur = root;
-                    for _ in 0..8 {
-                        if il2cpp
-                            .read_bytes_at_rva(cur, 64)
-                            .and_then(|bytes| lift_helper_body(il2cpp, cur, &bytes, 12, is_arm64, is_x64))
-                            .map(|insns| {
-                                // ARM64 shape A: LDRB w?, [x?, #0x132] (cctor/init byte)
-                                // ARM64 shape B: LDR w?, [x?, #0xe0]! (method slots)
-                                insns.iter().any(|i| {
-                                    i.operands.iter().any(|o| {
-                                        matches!(o, Operand::Memory { addend: 0x132 | 0xe0, .. })
+                let matches_init_shape =
+                    |il2cpp: &Il2Cpp, root: u64, is_arm64: bool, is_x64: bool| -> bool {
+                        // The shape can live at ANY hop of the thunk chain:
+                        // 0x4a58b98 → 0x4a8c6b0 passes THROUGH 0x4a8c398 (the
+                        // `LDRB w?, [x?, #0x132]` carrier) before settling. Walk
+                        // each hop and test it; stop at managed methods.
+                        let mut cur = root;
+                        for _ in 0..8 {
+                            if il2cpp
+                                .read_bytes_at_rva(cur, 64)
+                                .and_then(|bytes| {
+                                    lift_helper_body(il2cpp, cur, &bytes, 12, is_arm64, is_x64)
+                                })
+                                .map(|insns| {
+                                    // ARM64 shape A: LDRB w?, [x?, #0x132] (cctor/init byte)
+                                    // ARM64 shape B: LDR w?, [x?, #0xe0]! (method slots)
+                                    insns.iter().any(|i| {
+                                        i.operands.iter().any(|o| {
+                                            matches!(
+                                                o,
+                                                Operand::Memory {
+                                                    addend: 0x132 | 0xe0,
+                                                    ..
+                                                }
+                                            )
+                                        })
                                     })
                                 })
-                            })
-                            .unwrap_or(false)
-                        {
-                            return true;
+                                .unwrap_or(false)
+                            {
+                                return true;
+                            }
+                            let Some(bytes) = il2cpp.read_bytes_at_rva(cur, 64) else {
+                                return false;
+                            };
+                            let Some(insns) =
+                                lift_helper_body(il2cpp, cur, &bytes, 8, is_arm64, is_x64)
+                            else {
+                                return false;
+                            };
+                            match insns.first().map(|i| &i.op) {
+                                Some(ir::Op::Jump(t)) if (*t as u64) != cur => cur = *t as u64,
+                                _ => return false,
+                            }
                         }
-                        let Some(bytes) = il2cpp.read_bytes_at_rva(cur, 64) else {
-                            return false;
-                        };
-                        let Some(insns) = lift_helper_body(il2cpp, cur, &bytes, 8, is_arm64, is_x64)
-                        else {
-                            return false;
-                        };
-                        match insns.first().map(|i| &i.op) {
-                            Some(ir::Op::Jump(t)) if (*t as u64) != cur => cur = *t as u64,
-                            _ => return false,
-                        }
-                    }
-                    false
-                };
+                        false
+                    };
                 for &t in freq_targets_desc(&counts, &HashSet::new(), 256).iter() {
                     if maps.methods_by_rva.contains_key(&t)
                         || string_new.contains(&t)
@@ -2003,7 +2685,7 @@ impl RecoveryContext {
                         metadata_init.push(t);
                     }
                 }
-                if std::env::var("ILR_ALIASES").is_ok() {
+                if crate::recovery::env_flags::flag("ILR_ALIASES") {
                     for &probe in &[0x4a58b98u64, 0x4a58bac, 0x4a58a74, 0x4a58a60] {
                         let root =
                             chase_thunk_root(il2cpp, &maps.methods_by_rva, probe, is_arm64, is_x64);
@@ -2013,6 +2695,69 @@ impl RecoveryContext {
                             matches_init_shape(il2cpp, probe, is_arm64, is_x64),
                             matches_init_shape(il2cpp, root, is_arm64, is_x64),
                         );
+                    }
+                }
+            }
+
+            // ---- secondary RuntimeHelper classification --------------------
+            // The HelperMaps system (object_new, box_fn, etc.) rewrites calls
+            // to IR ops (NewObj, Box, etc.) which can have dangerous side
+            // effects (dead code deletion). The RuntimeHelper system only
+            // renames calls for display — safer for uncertain classifications.
+            //
+            // Scan the top unclassified targets and add RuntimeHelper notes
+            // for ones that match known patterns based on call-site statistics.
+            {
+                let all_classified: HashSet<u64> = string_new
+                    .iter()
+                    .chain(object_new.iter())
+                    .chain(box_fn.iter())
+                    .chain(raise_exception.iter())
+                    .chain(metadata_init.iter())
+                    .copied()
+                    .collect();
+
+                // Collect unclassified targets sorted by frequency
+                let mut unclassified: Vec<(u64, u32)> = counts
+                    .iter()
+                    .filter(|(t, c)| {
+                        !maps.methods_by_rva.contains_key(*t)
+                            && !all_classified.contains(*t)
+                            && c.total >= 10
+                    })
+                    .map(|(&t, c)| (t, c.total))
+                    .collect();
+                unclassified.sort_by(|a, b| b.1.cmp(&a.1));
+
+                // ObjectNew: high klass_arg ratio + significant x1 usage
+                // (real allocators pass extra register args from the caller's
+                // frame; metadata_init and similar bookkeeping helpers typically
+                // only use x0). Require x1 ratio >= 0.1 to filter out helpers
+                // that only take a klass pointer.
+                let mut obj_new_count = 0;
+                for &(t, total) in unclassified.iter().take(10) {
+                    if obj_new_count >= 2 {
+                        break;
+                    }
+                    let c = &counts[&t];
+                    let klass_ratio = if total > 0 { c.klass_arg as f32 / total as f32 } else { 0.0 };
+                    let x1_ratio = if total > 0 { c.x1_arg as f32 / total as f32 } else { 0.0 };
+                    if c.klass_arg > 0 && klass_ratio >= 0.6 && x1_ratio >= 0.1 {
+                        runtime_helpers::note(t, runtime_helpers::RuntimeHelper::ObjectNew);
+                        obj_new_count += 1;
+                    }
+                }
+
+                // Box: high klass_arg AND high x1_arg (value pointer)
+                for &(t, total) in unclassified.iter().take(15) {
+                    let c = &counts[&t];
+                    if c.klass_arg > 0 && c.x1_arg > 0 {
+                        let klass_ratio = c.klass_arg as f32 / total as f32;
+                        let x1_ratio = c.x1_arg as f32 / total as f32;
+                        if klass_ratio >= 0.4 && x1_ratio >= 0.4 {
+                            runtime_helpers::note(t, runtime_helpers::RuntimeHelper::Box);
+                            break; // Just the top one
+                        }
                     }
                 }
             }
@@ -2073,15 +2818,25 @@ impl RecoveryContext {
                             _ => return None,
                         };
                         let off = match insns[1].operands.get(1).as_deref() {
-                            Some(Operand::Memory { base: rb, addend, .. })
-                                if matches!(rb.as_ref(), Operand::Register(r) if r == "x16") =>
-                            {
+                            Some(Operand::Memory {
+                                base: rb, addend, ..
+                            }) if matches!(rb.as_ref(), Operand::Register(r) if r == "x16") => {
                                 *addend as u64
                             }
                             _ => return None,
                         };
-                        return matches!(insns[2].op, ir::Op::IndirectCall | ir::Op::Jump(_))
-                            .then_some(base + off);
+                        // Two Android/ELF PLT forms load the slot through
+                        // x16: the 3-insn `adrp; ldr x16,[x16]; br x16`, and
+                        // the 4-insn `adrp x16; ldr x17,[x16,#lo];
+                        // add x16,x16,#lo; br x17` the NDK linker emits —
+                        // the branch is the LAST lifted instruction, not
+                        // necessarily insns[2]. (Verified on this binary:
+                        // 0x2dff7f0/0x2dff800 are `__cxa_allocate_exception`
+                        // / `__cxa_throw` entries of the 4-insn form.)
+                        let br = insns[2..]
+                            .iter()
+                            .any(|i| matches!(i.op, ir::Op::IndirectCall | ir::Op::Jump(_)));
+                        return br.then_some(base + off);
                     }
                     if is_x64 {
                         // optional endbr64 prefix (F3 0F 1E FA)
@@ -2154,45 +2909,113 @@ impl RecoveryContext {
                     resolve_stub(slot)
                         .is_some_and(|name| name.starts_with("__cxa") || name.starts_with("___cxa"))
                 };
+                // With libc++ statically linked (Android .so), `__cxa_throw` is
+                // a DEFINED export of this image — helpers BL it directly and no
+                // bind table names the target. The symbol table supplies the
+                // name; only the terminating routines count, so a helper that
+                // merely calls `__cxa_begin_catch`/`__cxa_demangle` is not
+                // evidence of a raise.
+                let is_cxa = |cur: u64| -> bool {
+                    cxa_stub_at(cur)
+                        || il2cpp
+                            .cxa_func_rvas
+                            .get(&cur)
+                            .is_some_and(|n| {
+                                n.contains("cxa_throw")
+                                    || n.contains("cxa_rethrow")
+                                    || n.contains("cxa_allocate_exception")
+                            })
+                };
                 let chain_hits_throw = |start: u64| -> bool {
-                    if cxa_stub_at(start) {
+                    if is_cxa(start) {
                         return true;
                     }
-                    callees_first_n(
-                        il2cpp,
-                        &maps.methods_by_rva,
-                        start,
-                        8,
-                        is_arm64,
-                        is_x64,
-                    )
-                    .into_iter()
-                    .any(cxa_stub_at)
+                    callees_first_n(il2cpp, &maps.methods_by_rva, start, 8, is_arm64, is_x64)
+                        .into_iter()
+                        .any(is_cxa)
+                };
+                // ARRAY ALLOCATION beats "raise" when both are reachable.
+                // `il2cpp_array_new` allocates (array_element_size * length,
+                // header + memset) and can REACH a throw path for the negative-
+                // length/overflow case without being noreturn. A thin wrapper
+                // around it therefore satisfied the raise test and every call
+                // was rewritten to `throw`, deleting a live array definition
+                // (0x1302484 in 0x151F34C: 86 reads of the lost array). The
+                // import name is authoritative. NOTE: `callees_first_n` uses
+                // symbol-boundary heuristics that mis-attribute this packed
+                // thunk table, so scan the actual instruction window and follow
+                // a leading tail jump instead.
+                let call_import_name = |c: u64| -> Option<String> {
+                    stub_slot(c).and_then(resolve_stub)
+                };
+                let window_calls = |start: u64| -> Vec<u64> {
+                    let mut calls = Vec::new();
+                    let mut a = start;
+                    for _ in 0..6 {
+                        let Some(bytes) = il2cpp.read_bytes_at_rva(a, 128) else {
+                            break;
+                        };
+                        let Some(insns) =
+                            lift_helper_body(il2cpp, a, &bytes, 32, is_arm64, is_x64)
+                        else {
+                            break;
+                        };
+                        for i in &insns {
+                            if matches!(
+                                i.op,
+                                ir::Op::Call | ir::Op::CallVoid | ir::Op::IndirectCall
+                            ) {
+                                if let Some(Operand::Immediate(c)) = i.operands.first() {
+                                    calls.push(*c as u64);
+                                }
+                            }
+                        }
+                        let tail = insns.iter().take(3).find_map(|i| match i.op {
+                            ir::Op::Jump(t) if t as u64 != a => Some(t as u64),
+                            _ => None,
+                        });
+                        match tail {
+                            Some(j) => a = j,
+                            None => break,
+                        }
+                    }
+                    calls
+                };
+                let chain_hits_array_new = |start: u64| -> bool {
+                    window_calls(start).into_iter().any(|c| {
+                        call_import_name(c).is_some_and(|n| {
+                            n.contains("array_new")
+                                || n.contains("array_element_size")
+                                || n.contains("array_object_header")
+                        })
+                    })
                 };
                 // NOTE: throw classification runs AFTER the alias pass below
                 // (allocation/string variants must be claimed by their real
                 // family first — raise is checked first in the resolver, so
                 // anything wrongly put here turns `new X()` into `throw`).
 
-            // ---- export ALIASING: name codegen variants of the helpers ---
-            // IL2CPP emits per-callsite wrapper variants (stp x29/x30; bl VM
-            // fn) for object_new/box/string_new. Each variant's FIRST callee
-            // is the same VM function the export reaches, so variants alias
-            // to the export. This kills the 50k+ `fn_4a58xxx` renders that
-            // are really `new List<object>()` style allocations.
-            let alias_targets: Vec<u64> = freq_targets_desc(&counts, &HashSet::new(), 256);
-            let mut alias_object_new: Vec<u64> = Vec::new();
-            let mut alias_box: Vec<u64> = Vec::new();
-            let mut alias_string_new: Vec<u64> = Vec::new();
-            // (same scope as resolve_stub/stub_slot/chain_hits_throw above —
-            // the throw pass at the end reuses those closures)
-                if std::env::var("ILR_ALIASES").is_ok() {
+                // ---- export ALIASING: name codegen variants of the helpers ---
+                // IL2CPP emits per-callsite wrapper variants (stp x29/x30; bl VM
+                // fn) for object_new/box/string_new. Each variant's FIRST callee
+                // is the same VM function the export reaches, so variants alias
+                // to the export. This kills the 50k+ `fn_4a58xxx` renders that
+                // are really `new List<object>()` style allocations.
+                let alias_targets: Vec<u64> = freq_targets_desc(&counts, &HashSet::new(), 256);
+                let mut alias_object_new: Vec<u64> = Vec::new();
+                let mut alias_box: Vec<u64> = Vec::new();
+                let mut alias_string_new: Vec<u64> = Vec::new();
+                // (same scope as resolve_stub/stub_slot/chain_hits_throw above —
+                // the throw pass at the end reuses those closures)
+                if crate::recovery::env_flags::flag("ILR_ALIASES") {
                     // call-site stats for the biggest unresolved targets:
                     // klass_arg ratio ≈ object alloc family; string_arg ≈
                     // literal family. Drives behavioral (not structural)
                     // aliasing.
-                    let mut top: Vec<(&u64, &HelperCounts)> =
-                        counts.iter().filter(|(t, _)| !maps.methods_by_rva.contains_key(*t)).collect();
+                    let mut top: Vec<(&u64, &HelperCounts)> = counts
+                        .iter()
+                        .filter(|(t, _)| !maps.methods_by_rva.contains_key(*t))
+                        .collect();
                     top.sort_by(|a, b| b.1.total.cmp(&a.1.total));
                     eprintln!("[counts] top unresolved targets:");
                     for (t, c) in top.iter().take(15) {
@@ -2220,16 +3043,24 @@ impl RecoveryContext {
                     }
                     Some(cur)
                 };
-                let obj_root = obj_anchor.and_then(|a| first_callee(il2cpp, &maps.methods_by_rva, a, is_arm64, is_x64)).and_then(callee_root);
-                let box_root = box_anchor.and_then(|a| first_callee(il2cpp, &maps.methods_by_rva, a, is_arm64, is_x64)).and_then(callee_root);
-                let str_root = string_anchors.iter().find_map(|a| first_callee(il2cpp, &maps.methods_by_rva, *a, is_arm64, is_x64)).and_then(callee_root);
+                let obj_root = obj_anchor
+                    .and_then(|a| first_callee(il2cpp, &maps.methods_by_rva, a, is_arm64, is_x64))
+                    .and_then(callee_root);
+                let box_root = box_anchor
+                    .and_then(|a| first_callee(il2cpp, &maps.methods_by_rva, a, is_arm64, is_x64))
+                    .and_then(callee_root);
+                let str_root = string_anchors
+                    .iter()
+                    .find_map(|a| first_callee(il2cpp, &maps.methods_by_rva, *a, is_arm64, is_x64))
+                    .and_then(callee_root);
                 for &t in &alias_targets {
-                    if maps.methods_by_rva.contains_key(&t)
-                        || metadata_init.contains(&t)
-                    {
+                    if maps.methods_by_rva.contains_key(&t) || metadata_init.contains(&t) {
                         continue;
                     }
-                    let Some(tc) = first_callee(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64) else { continue };
+                    let Some(tc) = first_callee(il2cpp, &maps.methods_by_rva, t, is_arm64, is_x64)
+                    else {
+                        continue;
+                    };
                     let Some(tc) = callee_root(tc) else { continue };
                     if Some(tc) == obj_root {
                         alias_object_new.push(t);
@@ -2239,49 +3070,255 @@ impl RecoveryContext {
                         alias_string_new.push(t);
                     }
                 }
-                if std::env::var("ILR_ALIASES").is_ok() {
-                let fmt = |v: &[u64]| v.iter().take(8).map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(",");
-                eprintln!(
-                    "[aliases] object_new+={}\n  box+={}\n  string_new+={}",
-                    fmt(&alias_object_new),
-                    fmt(&alias_box),
-                    fmt(&alias_string_new)
-                );
+                if crate::recovery::env_flags::flag("ILR_ALIASES") {
+                    let fmt = |v: &[u64]| {
+                        v.iter()
+                            .take(8)
+                            .map(|a| format!("{a:#x}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    eprintln!(
+                        "[aliases] object_new+={}\n  box+={}\n  string_new+={}",
+                        fmt(&alias_object_new),
+                        fmt(&alias_box),
+                        fmt(&alias_string_new)
+                    );
                 }
-            object_new.extend(alias_object_new);
-            box_fn.extend(alias_box);
-            string_new.extend(alias_string_new);
+                object_new.extend(alias_object_new);
+                box_fn.extend(alias_box);
+                string_new.extend(alias_string_new);
 
-            // ---- throw-helper classification (AFTER aliasing) ----------
-            // Order matters: raise is checked FIRST in the resolver, so an
-            // allocation variant wrongly classified as raise would turn every
-            // `new X()` into `throw`. Aliasing above claims alloc/string/
-            // box variants first; only leftovers can be raise helpers.
-            //
-            // Two raise shapes in codegen:
-            //  - explicit: `il2cpp_raise_exception(obj)` — arg-taking
-            //  - implicit checks: construct the exception internally. In C#
-            //    those are NOT `throw` statements (null checks etc.), so
-            //    they must stay unclassified — classify ONLY arg-taking
-            //    sites to avoid flooding output with fake `throw`s.
-            for t in freq_targets_desc(&counts, &HashSet::new(), 256) {
-                if maps.methods_by_rva.contains_key(&t)
-                    || metadata_init.contains(&t)
-                    || string_new.contains(&t)
-                    || object_new.contains(&t)
-                    || box_fn.contains(&t)
-                    || raise_exception.contains(&t)
+                // ---- throw-helper classification (AFTER aliasing) ----------
+                // Order matters: raise is checked FIRST in the resolver, so an
+                // allocation variant wrongly classified as raise would turn every
+                // `new X()` into `throw`. Aliasing above claims alloc/string/
+                // box variants first; only leftovers can be raise helpers.
+                //
+                // Two raise shapes in codegen:
+                //  - explicit: `il2cpp_raise_exception(obj)` — arg-taking
+                //  - implicit checks: construct the exception internally. In C#
+                //    those are NOT `throw` statements (null checks etc.), so
+                //    they must stay unclassified — classify ONLY arg-taking
+                //    sites to avoid flooding output with fake `throw`s.
+                for t in freq_targets_desc(&counts, &HashSet::new(), 256) {
+                    if maps.methods_by_rva.contains_key(&t)
+                        || metadata_init.contains(&t)
+                        || string_new.contains(&t)
+                        || object_new.contains(&t)
+                        || box_fn.contains(&t)
+                        || raise_exception.contains(&t)
+                    {
+                        continue;
+                    }
+                    let Some(c) = counts.get(&t) else { continue };
+                    let arg_taking = c.total >= 5 && (c.x1_arg as f32 / c.total as f32) >= 0.3;
+                    let hit = arg_taking && chain_hits_throw(t);
+                    if hit {
+                        raise_exception.push(t);
+                    }
+                }
+
+                // ---- noreturn panic wrappers: RENAME ONLY (no `Op::Throw`) --
+                // The null-check raise the codegen emits (`if (x == 0) { fn(x);
+                // return; }`) is a THIN WRAPPER that never returns and reaches a
+                // `__cxa_throw` import through a few internal hops — deeper than
+                // the depth-≤1 `chain_hits_throw` above will follow. That cap
+                // stays, because a wrong entry there rewrites the call to
+                // `Op::Throw`, a CFG terminator that DELETES every statement
+                // after it. Here a wrong entry only renames the call, so the
+                // reach may go deeper — the cost of a false positive is a wrong
+                // label, never lost code. Two gates keep it honest: the target
+                // must be NORETURN (`is_noreturn`, no `Return` in its own body)
+                // and must reach a `__cxa` stub (`reaches_cxa`), and anything the
+                // alloc/string/box/init families already claim is skipped so a
+                // shared allocator never gets mislabelled as a raise.
                 {
-                    continue;
+                    // A codegen raise wrapper is THIN: it saves the link
+                    // register and delegates within the first couple of
+                    // instructions (`stp x29,x30,[..]; bl <throw-core>`, or a
+                    // bare `b <throw-core>`), with no `ret` on the way out.
+                    // Ordinary helpers do work before their first call, so the
+                    // immediate-delegation shape plus `reaches_cxa` below is
+                    // what separates a raise wrapper from a function that
+                    // merely happens to (transitively) reach `__cxa_throw`.
+                    // Both predicates lift bytes per call; the BFS and the
+                    // 256-target scan revisit the same engine nodes over and
+                    // over, so memoize by address (classification is single
+                    // threaded here).
+                    let thin_memo: std::cell::RefCell<HashMap<u64, bool>> =
+                        std::cell::RefCell::new(HashMap::new());
+                    let callee_memo: std::cell::RefCell<HashMap<u64, Vec<u64>>> =
+                        std::cell::RefCell::new(HashMap::new());
+                    let callees_of = |n: u64| -> Vec<u64> {
+                        if let Some(v) = callee_memo.borrow().get(&n) {
+                            return v.clone();
+                        }
+                        let v = callees_first_n(il2cpp, &maps.methods_by_rva, n, 8, is_arm64, is_x64);
+                        callee_memo.borrow_mut().insert(n, v.clone());
+                        v
+                    };
+                    let is_thin_forwarder = |a: u64| -> bool {
+                        if let Some(&v) = thin_memo.borrow().get(&a) {
+                            return v;
+                        }
+                        let v = (|| -> bool {
+                            if maps.methods_by_rva.contains_key(&a) {
+                                return false;
+                            }
+                            let Some(bytes) = il2cpp.read_bytes_at_rva(a, 32) else {
+                                return false;
+                            };
+                            let Some(insns) =
+                                lift_helper_body(il2cpp, a, &bytes, 8, is_arm64, is_x64)
+                            else {
+                                return false;
+                            };
+                            // first instruction that leaves the function body.
+                            let leave = insns.iter().position(|i| {
+                                matches!(i.op, ir::Op::Call | ir::Op::CallVoid)
+                                    || matches!(i.op, ir::Op::Jump(t) if (t as u64) != a)
+                            });
+                            match leave {
+                                Some(k) => {
+                                    // delegate within the first three instructions
+                                    // and return to us in none of them.
+                                    k <= 2
+                                        && !insns[..k]
+                                            .iter()
+                                            .any(|i| matches!(i.op, ir::Op::Return))
+                                }
+                                None => false,
+                            }
+                        })();
+                        thin_memo.borrow_mut().insert(a, v);
+                        v
+                    };
+                    let reaches_cxa = |start: u64| -> bool {
+                        let dbg = crate::recovery::env_flags::flag("ILR_RAISEDDBG") && start == 0x1302634;
+                        let mut frontier = vec![start];
+                        let mut seen: HashSet<u64> = HashSet::new();
+                        seen.insert(start);
+                        // The entry gate (`is_thin_forwarder` on `start`) is
+                        // what separates a wrapper from ordinary code; inside,
+                        // the chain runs thin forwarders AND fat IL2CPP panic
+                        // helpers (verified: 0x1302634 → 0x133e628[fat] →
+                        // 0x133e674 → 0x133e590[fat] → … → `__cxa_throw`), so
+                        // every node expands. The cap keeps that honest: a
+                        // genuine exception chain is small and deep-ish, while
+                        // a helper that only reaches `__cxa_throw` through the
+                        // whole program floods the frontier and gets cut off.
+                        // (64 was too tight — real chains flooded on the fat
+                        // helpers' callees; 1024 is the program-reachability
+                        // trip wire.) This path is RENAME-ONLY: a wrong verdict
+                        // costs a label, never deleted statements.
+                        for depth in 0..7 {
+                            let mut next = Vec::new();
+                            for &n in &frontier {
+                                let hit = is_cxa(n);
+                                if dbg {
+                                    let sl = stub_slot(n);
+                                    eprintln!(
+                                        "[raisedbg] depth={depth} node={n:#x} cxa={hit} thin={} slot={:?} name={:?}",
+                                        is_thin_forwarder(n),
+                                        sl,
+                                        sl.and_then(|s| resolve_stub(s))
+                                    );
+                                }
+                                if hit {
+                                    return true;
+                                }
+                                for c in callees_of(n) {
+                                    if seen.insert(c) {
+                                        next.push(c);
+                                        if seen.len() > 1024 {
+                                            if dbg {
+                                                eprintln!("[raisedbg] depth={depth} cap hit at node={n:#x}");
+                                            }
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
+                            if next.is_empty() {
+                                if dbg {
+                                    eprintln!("[raisedbg] depth={depth} frontier exhausted");
+                                }
+                                return false;
+                            }
+                            frontier = next;
+                        }
+                        false
+                    };
+                    for t in freq_targets_desc(&counts, &HashSet::new(), 256) {
+                        let dbg = crate::recovery::env_flags::flag("ILR_RAISEDDBG") && t == 0x1302634;
+                        if maps.methods_by_rva.contains_key(&t)
+                            || raise_exception.contains(&t)
+                            || metadata_init.contains(&t)
+                            || string_new.contains(&t)
+                            || object_new.contains(&t)
+                            || box_fn.contains(&t)
+                        {
+                            if dbg {
+                                eprintln!("[raisedbg] {t:#x} EXCLUDED managed={} raise={} meta={} str={} obj={} box={}",
+                                    maps.methods_by_rva.contains_key(&t), raise_exception.contains(&t),
+                                    metadata_init.contains(&t), string_new.contains(&t), object_new.contains(&t), box_fn.contains(&t));
+                            }
+                            continue;
+                        }
+                        let thin = is_thin_forwarder(t);
+                        if crate::recovery::env_flags::flag("ILR_ALIASES") && t == 0x1302484 {
+                            let names: Vec<String> = window_calls(t)
+                                .into_iter()
+                                .map(|c| format!("{c:#x}:{:?}", call_import_name(c)))
+                                .collect();
+                            eprintln!(
+                                "[arraydbg] t={t:#x} thin={thin} chain={} calls={}",
+                                chain_hits_array_new(t),
+                                names.join(",")
+                            );
+                        }
+                        if thin && chain_hits_array_new(t) {
+                            runtime_helpers::note(
+                                t,
+                                runtime_helpers::RuntimeHelper::ArrayNew,
+                            );
+                            if dbg {
+                                eprintln!("[raisedbg] {t:#x} ARRAY_NEW (wins over raise)");
+                            }
+                            continue;
+                        }
+                        // short-circuit: only pay for the reach when thin.
+                        let reach = thin && (dbg || reaches_cxa(t));
+                        let reach = if dbg { reaches_cxa(t) } else { reach };
+                        if dbg {
+                            eprintln!("[raisedbg] {t:#x} thin={thin} reach={reach}");
+                        }
+                        if thin && reach {
+                            runtime_helpers::note(
+                                t,
+                                runtime_helpers::RuntimeHelper::RaiseException,
+                            );
+                        }
+                    }
                 }
-                let Some(c) = counts.get(&t) else { continue };
-                let arg_taking = c.total >= 5
-                    && (c.x1_arg as f32 / c.total as f32) >= 0.3;
-                let hit = arg_taking && chain_hits_throw(t);
-                if hit {
-                    raise_exception.push(t);
+
+                // ---- authoritative BODY / IMPORT re-classification ---------
+                // The statistical/alias passes above are deliberately broad;
+                // read each frequent helper's own body and the exported IL2CPP
+                // API (or PLT import) it calls. This overwrites the provisional
+                // role, so a box helper claimed by object_new aliasing becomes
+                // Box, and a class-init/metadata-init wrapper stops rendering
+                // as an allocation. Keys on symbols, never on addresses.
+                if !crate::recovery::env_flags::flag("ILR_NOBODYCLASS") {
+                    runtime_helpers::classify_bodies(
+                        il2cpp,
+                        &maps.methods_by_rva,
+                        &freq_targets_desc(&counts, &HashSet::new(), 256),
+                        is_arm64,
+                        is_x64,
+                    );
                 }
-            }
             } // end bind-symbol / stub-classification scope
 
             // ---- Objective-C selector-stub family (Apple builds) ----------
@@ -2359,15 +3396,16 @@ impl RecoveryContext {
                             if !matches!((&w[0].op, &w[1].op), (ir::Op::Move, ir::Op::Move)) {
                                 continue;
                             }
-                            let d_is_x1 = matches!(w[0].dest(), Some(Operand::Register(r)) if r == "x1");
+                            let d_is_x1 =
+                                matches!(w[0].dest(), Some(Operand::Register(r)) if r == "x1");
                             let page = match w[0].operands.get(1) {
                                 Some(Operand::Immediate(v)) => *v as u64,
                                 _ => 0,
                             };
                             let off = match w[1].operands.get(1) {
-                                Some(Operand::Memory { base, addend, .. })
-                                    if matches!(base.as_ref(), Operand::Register(r) if r == "x1") =>
-                                    *addend as u64,
+                                Some(Operand::Memory { base, addend, .. }) if matches!(base.as_ref(), Operand::Register(r) if r == "x1") => {
+                                    *addend as u64
+                                }
                                 _ => 0,
                             };
                             if d_is_x1 && page != 0 {
@@ -2413,7 +3451,7 @@ impl RecoveryContext {
                         objc_stubs.insert(t, s);
                     }
                 }
-                if std::env::var("ILR_ALIASES").is_ok() {
+                if crate::recovery::env_flags::flag("ILR_ALIASES") {
                     eprintln!("[objc] {} selector stubs recovered", objc_stubs.len());
                     for (rva, s) in objc_stubs.iter().take(10) {
                         eprintln!("[objc]   {rva:#x} → {s}");
@@ -2421,12 +3459,18 @@ impl RecoveryContext {
                 }
             }
 
-            (string_new, object_new, box_fn, raise_exception, metadata_init, objc_stubs)
+            (
+                string_new,
+                object_new,
+                box_fn,
+                raise_exception,
+                metadata_init,
+                objc_stubs,
+            )
         };
 
-
         // ---- phase 2: publish -------------------------------------------
-        if std::env::var("ILR_HELPERS").is_ok() {
+        if crate::recovery::env_flags::flag("ILR_HELPERS") {
             eprintln!(
                 "[helpers] string_new={} object_new={} box={} raise={}",
                 fmt_rvas(&string_new),
@@ -2485,9 +3529,9 @@ impl RecoveryContext {
         let timed_out = |d: &Option<std::time::Instant>| -> bool {
             d.is_some_and(|d| std::time::Instant::now() > d)
         };
-        let dbg_fail = std::env::var("ILR_FAIL").is_ok();
-        let timing_on = std::env::var("ILR_TIMING").is_ok();
-        let stage_trace = std::env::var("ILR_STAGES").is_ok();
+        let dbg_fail = crate::recovery::env_flags::flag("ILR_FAIL");
+        let timing_on = crate::recovery::env_flags::flag("ILR_TIMING");
+        let stage_trace = crate::recovery::env_flags::flag("ILR_STAGES");
         // `ILR_CONFORM` runs the structural conformance checker, which needs
         // the same per-method hook as the verify oracle but not its verbose
         // per-method log — a class census over the whole binary should print
@@ -2495,9 +3539,9 @@ impl RecoveryContext {
         // `ILR_ANNOTATE` is the default-on mode: grade every method so the
         // emitted `dump.cs` is self-labelling, but keep the verbose per-method
         // log off (that stays ILR_VERIFY's job).
-        let verify_on = std::env::var("ILR_VERIFY").is_ok()
-            || std::env::var("ILR_CONFORM").is_ok()
-            || std::env::var("ILR_ANNOTATE").is_ok();
+        let verify_on = crate::recovery::env_flags::flag("ILR_VERIFY")
+            || crate::recovery::env_flags::flag("ILR_CONFORM")
+            || crate::recovery::env_flags::flag("ILR_ANNOTATE");
         macro_rules! stage_begin {
             ($name:expr) => {{
                 if stage_trace {
@@ -2578,18 +3622,29 @@ impl RecoveryContext {
             lift_arm32::lift_arm32(bytes, rva, MAX_IR_INSNS.min(16_384))
                 .map(|l| (l.insns, l.addresses, "arm32 lift failed"))
         } else {
-            lift_x86::lift_x86_64(
-                bytes,
-                rva,
-                MAX_IR_INSNS.min(16_384),
-                self.x86_abi,
-            )
-            .map(|l| (l.insns, l.addresses, "x64 lift failed"))
+            lift_x86::lift_x86_64(bytes, rva, MAX_IR_INSNS.min(16_384), self.x86_abi)
+                .map(|l| (l.insns, l.addresses, "x64 lift failed"))
         };
         let Some((mut insns, mut addresses)) = lifted_any.map(|(i, a, _)| (i, a)) else {
             st[0] += t.elapsed().as_micros() as u64;
             fail!("lift failed");
         };
+        // Out-of-line ARM64 load veneers (`b 0x2dff…` → shared GOT load →
+        // back into the body). Resolve before the CFG and before the verifier
+        // baseline: the veneer is a faithful part of the native body, and an
+        // unresolved target would leave the whole body unreachable.
+        if self.arch_is_arm64 {
+            let n = resolve_load_veneers(
+                &mut insns,
+                &mut addresses,
+                rva,
+                rva + bytes.len() as u64,
+                |a, n| il2cpp.read_bytes_at_rva(a, n),
+            );
+            if n > 0 && crate::recovery::env_flags::flag("ILR_COV") {
+                eprintln!("[veneer] {rva:#x}: resolved {n} out-of-line load veneer(s)");
+            }
+        }
         // Verifier A/A baseline: fingerprint the RAW lift before any pass
         // touches the listing (cloned — passes mutate insns in place).
         let pre_pass_insns = if verify_on { insns.clone() } else { Vec::new() };
@@ -2598,8 +3653,7 @@ impl RecoveryContext {
         // `rewrite_pinned_copies`, so a register-identity bug cannot be
         // attributed to the lifter or to the pass from that output alone.
         if let Ok(want) = std::env::var("ILR_AFTERLIFT") {
-            let want = u64::from_str_radix(want.trim_start_matches("0x"), 16)
-                .unwrap_or(u64::MAX);
+            let want = u64::from_str_radix(want.trim_start_matches("0x"), 16).unwrap_or(u64::MAX);
             if want == rva {
                 let mut d = String::new();
                 for (i, insn) in insns.iter().enumerate() {
@@ -2620,18 +3674,21 @@ impl RecoveryContext {
         // association is live. Loads become `[x0 + 192]`, which the local
         // seeding + field oracle resolves as `this.<field>`.
         locals::rewrite_pinned_copies(&mut insns, seed);
-        if std::env::var("ILR_RAWLIFT").is_ok() {
+        if crate::recovery::env_flags::flag("ILR_RAWLIFT") {
             let raw_ok = std::env::var("ILR_RAWLIFT")
                 .ok()
                 .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
                 .map(|f| f == rva)
                 .unwrap_or(true);
             if raw_ok {
-            let mut d = String::new();
-            for (i, insn) in insns.iter().enumerate() {
-                d.push_str(&format!("  r{i} @{:#x}: op={:?} operands={:?}\n", insn.address, insn.op, insn.operands));
-            }
-            let _ = std::fs::write(probe_dir().join(format!("rawlift.{:#x}.txt", rva)), d);
+                let mut d = String::new();
+                for (i, insn) in insns.iter().enumerate() {
+                    d.push_str(&format!(
+                        "  r{i} @{:#x}: op={:?} operands={:?}\n",
+                        insn.address, insn.op, insn.operands
+                    ));
+                }
+                let _ = std::fs::write(probe_dir().join(format!("rawlift.{:#x}.txt", rva)), d);
             }
         }
         // `ILR_DISASM=<rva>`: native disassembly of this method beside the IR
@@ -2639,8 +3696,7 @@ impl RecoveryContext {
         // the per-method answer to "does the output match the disassembly?" —
         // see `lift::disasm_align_report`.
         if let Ok(want) = std::env::var("ILR_DISASM") {
-            let want = u64::from_str_radix(want.trim_start_matches("0x"), 16)
-                .unwrap_or(u64::MAX);
+            let want = u64::from_str_radix(want.trim_start_matches("0x"), 16).unwrap_or(u64::MAX);
             if want == rva {
                 let arch = if self.arch_is_arm64 {
                     lift::TargetArch::Arm64
@@ -2749,16 +3805,12 @@ impl RecoveryContext {
         if insns.is_empty() {
             fail!("no IR insns");
         }
+        // Superlinear passes ahead — bound input size. This is the same cap
+        // the lifter was given; the old separate 3,000 "text cap" rejected
+        // three real methods (3.0–3.5k IR insns) as recovery failures even
+        // though the pipeline handles them.
         if insns.len() > MAX_IR_INSNS {
             fail!("too many IR insns");
-        }
-
-        // superlinear passes ahead — bound input size (methods beyond this
-        // get an explicit recovery-failed marker instead of stalling dumps).
-        // Raised from 800: the lifter no longer inflates the listing (fixed
-        // address/insn parallelism) and the expensive passes are bounded.
-        if insns.len() > 3000 {
-            fail!("too many IR insns (text cap)");
         }
 
         // X64 unmanaged tail calls (see `recover_x64_unmanaged_tail`): a trailing
@@ -2769,7 +3821,7 @@ impl RecoveryContext {
         // `ILR_NOTAIL=1` disables the recovery, so the effect of this pass can
         // be measured against an otherwise identical build (like the managed
         // tail-call pass it mirrors).
-        if self.is_x64 && std::env::var("ILR_NOTAIL").is_err() {
+        if self.is_x64 && !crate::recovery::env_flags::flag("ILR_NOTAIL") {
             let body_lo = rva;
             let body_hi = rva + bytes.len() as u64;
             let arab = self.x86_abi;
@@ -2792,9 +3844,7 @@ impl RecoveryContext {
                         return true;
                     };
                     let win = tbytes.len().min(64);
-                    let Some(tlift) =
-                        lift_x86::lift_x86_64(&tbytes[..win], t, 32, arab)
-                    else {
+                    let Some(tlift) = lift_x86::lift_x86_64(&tbytes[..win], t, 32, arab) else {
                         return true;
                     };
                     passes::tail_branches_back_into(&tlift.insns, body_lo, body_hi)
@@ -2846,8 +3896,15 @@ impl RecoveryContext {
                         return None;
                     }
                     match insn.op {
-                        Op::Jump(t) if addresses.get(t).is_none() || t >= addresses.len() => {
-                            // t is an unresolved RVA (>= table len) or stale
+                        Op::Jump(t)
+                            if addresses.get(t).is_none()
+                                && ((t as u64) < rva
+                                    || (t as u64) >= rva + bytes.len() as u64) =>
+                        {
+                            // A raw RVA outside the body. In-body raw RVAs are
+                            // ordinary branches the CFG resolves; indices are
+                            // already-resolved branches. Testing `addresses.get`
+                            // alone treated an early in-body `b` as a tail exit.
                             Some((i, t as u64))
                         }
                         _ => None,
@@ -2868,7 +3925,9 @@ impl RecoveryContext {
                 // target from `addresses`: impossible too. Simplest correct
                 // route: re-lift the jump's own address to get its RVA.
                 let jump_addr = insns[jidx].address;
-                let Some(jbytes) = il2cpp.read_bytes_at_rva(jump_addr, 4) else { break };
+                let Some(jbytes) = il2cpp.read_bytes_at_rva(jump_addr, 4) else {
+                    break;
+                };
                 let word = u32::from_le_bytes([jbytes[0], jbytes[1], jbytes[2], jbytes[3]]);
                 if word >> 26 != 0b000101 {
                     break; // not `B`
@@ -2880,6 +3939,15 @@ impl RecoveryContext {
                 if target_rva >= rva && target_rva < rva + bytes.len() as u64 {
                     break;
                 }
+                // A metadata method's entry is a real callee, never a shared
+                // tail-merge epilogue. Splicing its first window cuts the rest
+                // of the callee (including its return) and leaves a fragment
+                // whose backward branch becomes a self-loop. The tail-call
+                // path below keeps the call and the return.
+                if self.maps.methods_by_rva.contains_key(&target_rva) {
+                    out_of_body_tail_calls.push(jidx);
+                    continue;
+                }
                 // Another jump already spliced this exact target. Re-splicing
                 // would append a duplicate (dead, address-colliding) copy; just
                 // point this jump at the copy that is already there.
@@ -2887,14 +3955,18 @@ impl RecoveryContext {
                     tail_fixups.push((jidx, target_rva));
                     continue;
                 }
-                let Some(tbytes) = il2cpp.read_bytes_at_rva(target_rva, 256) else { break };
+                let Some(tbytes) = il2cpp.read_bytes_at_rva(target_rva, 256) else {
+                    break;
+                };
                 // The tail lives OUTSIDE the method's metadata body; data
                 // (literal pools, padding) can follow the real RET and one
                 // undecodable word would fail the whole lift. Lift the first
                 // 64B window; on failure shorten progressively.
                 let mut lifted_tail = None;
                 for win in [64usize, 32, 16] {
-                    if let Some(t) = lift::lift_arm64(&tbytes[..win.min(tbytes.len())], target_rva, 512, None) {
+                    if let Some(t) =
+                        lift::lift_arm64(&tbytes[..win.min(tbytes.len())], target_rva, 512, None)
+                    {
                         lifted_tail = Some(t);
                         break;
                     }
@@ -2904,12 +3976,17 @@ impl RecoveryContext {
                 // past the tail's RET into unrelated code — splicing that
                 // would glue another function's body into this method's IR.
                 let mut tail_len = tail.insns.len();
-                if let Some(term) = tail
-                    .insns
-                    .iter()
-                    .position(|i| i.is_terminator())
-                {
+                if let Some(term) = tail.insns.iter().position(|i| i.is_terminator()) {
                     tail_len = tail_len.min(term + 1);
+                }
+                // CoreLib targets are not in `methods_by_rva`, but a real
+                // method entry is still recognisable by its frame allocation
+                // (`str x30,[sp,#-N]!` / `stp x30,…`). A shared epilogue
+                // restore never grows the frame. Refuse the splice and keep
+                // the call + return instead.
+                if tail_starts_with_frame_allocation(&tail.insns[..tail_len]) {
+                    out_of_body_tail_calls.push(jidx);
+                    continue;
                 }
                 // Dispatch-stub redirect (NOT a tail-merge epilogue): some
                 // out-of-body targets are generic-method dispatch stubs that
@@ -2951,6 +4028,9 @@ impl RecoveryContext {
                         passes::tail_branches_back_into(&tail.insns[..tail_len], body_lo, body_hi);
                     if !branches_back {
                         out_of_body_tail_calls.push(jidx);
+                        // Keep scanning: a method can tail-branch on more
+                        // than one path (Serializer.AddLine has two).
+                        continue;
                     }
                     break;
                 }
@@ -2979,7 +4059,9 @@ impl RecoveryContext {
         let ret_reg = if self.is_x64 { ir::RET_REG } else { "x0" };
         out_of_body_tail_calls.sort_unstable();
         for &jidx in out_of_body_tail_calls.iter().rev() {
-            let Some(insn) = insns.get(jidx) else { continue };
+            let Some(insn) = insns.get(jidx) else {
+                continue;
+            };
             let target = match insn.op {
                 Op::Jump(t) => t as u64,
                 _ => continue,
@@ -2996,12 +4078,16 @@ impl RecoveryContext {
             // s0..s7 and a bare `b` records nothing about it, so a float
             // parameter would otherwise become `MissingAbiArg` and be dropped
             // from the rendered call.
-            for r in ["vs0", "vs1", "vs2", "vs3", "vs4", "vs5", "vs6", "vs7"] {
+            // Flattened lane-0 names for s0..s7 (see lift::scalar_s_name):
+            for r in ["vs0", "vs4", "vs8", "vs12", "vs16", "vs20", "vs24", "vs28"] {
                 ops.push(Operand::reg(r));
             }
             insns[jidx] = Insn::new(Op::Call, ops, a);
             if jidx + 1 <= insns.len() {
-                insns.insert(jidx + 1, Insn::new(Op::Return, vec![Operand::reg(ret_reg)], a));
+                insns.insert(
+                    jidx + 1,
+                    Insn::new(Op::Return, vec![Operand::reg(ret_reg)], a),
+                );
                 addresses.insert(jidx + 1, a);
             }
             // ONE native `b <other body>` became a CALL **and** a RETURN, so the
@@ -3018,7 +4104,11 @@ impl RecoveryContext {
             }
         }
 
-        if timed_out(&deadline) { flush!(); tm::DEADLINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return None; }
+        if timed_out(&deadline) {
+            flush!();
+            tm::DEADLINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
         // 1.4 tail calls: `b <code outside this method>`. Must run BEFORE the
         // CFG builds edges, because a tail call has no successor inside the
         // method and the CFG would otherwise record the branch as a dead exit
@@ -3030,7 +4120,7 @@ impl RecoveryContext {
             // left alone — the splicer further down recovers that one.
             // `ILR_NOTAIL=1` disables the recovery, so the effect of this one
             // pass can be measured against an otherwise identical build.
-            let n = if std::env::var("ILR_NOTAIL").is_ok() {
+            let n = if crate::recovery::env_flags::flag("ILR_NOTAIL") {
                 0
             } else {
                 passes::recover_tail_calls(
@@ -3041,7 +4131,7 @@ impl RecoveryContext {
                 )
             };
             st[0] += t.elapsed().as_micros() as u64;
-            if n > 0 && std::env::var("ILR_TAILDBG").is_ok() {
+            if n > 0 && crate::recovery::env_flags::flag("ILR_TAILDBG") {
                 eprintln!("[tail] {n} tail call(s) at {rva:#x}");
             }
         }
@@ -3079,9 +4169,66 @@ impl RecoveryContext {
             }
         }
 
+        // 1.6 EH landing pads, decoded BEFORE the CFG. The unwinder edge is
+        // not in the CFG; the only synchronous path into a pad is the
+        // unreachable `b <pad>` the compiler leaves after a noreturn raise.
+        // Knowing the pad RVAs here lets the CFG keep each pad a block even
+        // when that trampoline is gone, and lets SSA treat the pad as a kill
+        // point (see `ssa::build_with_handler_entries`).
+        let eh_pad_addrs: Vec<u64> = if il2cpp.eh_tables.is_empty() {
+            Vec::new()
+        } else {
+            il2cpp
+                .eh_tables
+                .regions_for(rva, bytes.len() as u64, &|_| None)
+                .into_iter()
+                .map(|r| r.landing_pad)
+                .filter(|&a| a != 0)
+                .collect()
+        };
+
+        // 1.7 The compiler leaves `bl <raise>; b <pad>` after a raise that
+        // never returns. The `b` is unreachable, but the CFG reads it as an
+        // ordinary successor of the call, so the landing pad gets a
+        // SYNCHRONOUS predecessor from the loop body — the edge that made
+        // handlers render body code as the exception. A raise helper is
+        // noreturn by proof, so terminate the block at the call instead: the
+        // trampoline becomes the first handler instruction (a `throw` of the
+        // exception the call was given), which keeps the pad a block without
+        // inventing an edge into it.
+        let noreturn_trampolines = {
+            let rewritten = if crate::recovery::env_flags::flag("ILR_NO_EHTRAMP") {
+                Vec::new()
+            } else {
+                neutralise_raise_trampolines(
+                    &mut insns,
+                    &mut addresses,
+                    &eh_pad_addrs,
+                    &self.maps.raise_exception,
+                )
+            };
+            if verify_on {
+                // Ledger the rewritten trampolines so the differential
+                // verifier excuses the branch the compiler never executes.
+                for &addr in &rewritten {
+                    verify::ledger_note(addr, verify::LedgerKind::FoldedBranch);
+                }
+            }
+            rewritten.len()
+        };
+        if noreturn_trampolines > 0 && crate::recovery::env_flags::flag("ILR_EHSSA") {
+            eprintln!(
+                "[ehssa] {rva:#x} neutralised {noreturn_trampolines} raise trampoline(s)"
+            );
+        }
+
         // 2. CFG (rewrites RVA branch targets to indices)
         let t = stage_begin!("cfg");
-        let Some(mut graph) = cfg::Cfg::build(&mut insns, &addresses) else {
+        let Some(mut graph) = cfg::Cfg::build_with_landing_pads(
+            &mut insns,
+            &addresses,
+            &eh_pad_addrs,
+        ) else {
             fail!("cfg build");
         };
         st[1] += t.elapsed().as_micros() as u64;
@@ -3109,7 +4256,7 @@ impl RecoveryContext {
         // reaches.
         {
             let n = passes::resolve_cross_block_conditions(&mut insns, &graph);
-            if n > 0 && std::env::var("ILR_FLAGDBG").is_ok() {
+            if n > 0 && crate::recovery::env_flags::flag("ILR_FLAGDBG") {
                 eprintln!("[flags] {n} cross-block condition(s) recovered at {rva:#x}");
             }
         }
@@ -3128,13 +4275,20 @@ impl RecoveryContext {
             if ok {
                 let mut d = String::new();
                 for (i, insn) in insns.iter().enumerate() {
-                    d.push_str(&format!("  s{i} @{:#x}: op={:?} operands={:?}\n", insn.address, insn.op, insn.operands));
+                    d.push_str(&format!(
+                        "  s{i} @{:#x}: op={:?} operands={:?}\n",
+                        insn.address, insn.op, insn.operands
+                    ));
                 }
                 let _ = std::fs::write(probe_dir().join("poststack.txt"), d);
             }
         }
 
-        if timed_out(&deadline) { flush!(); tm::DEADLINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return None; }
+        if timed_out(&deadline) {
+            flush!();
+            tm::DEADLINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
 
         // 4. dominance + SSA
         let t = stage_begin!("ssa");
@@ -3145,13 +4299,65 @@ impl RecoveryContext {
                 for (bi, b) in graph.blocks.iter().enumerate() {
                     d.push_str(&format!(
                         "B{}: insns {}..{} succ={:?} idom={:?} df={:?} children={:?}\n",
-                        bi, b.start, b.end, graph.successors[bi], dom.idom[bi], dom.frontiers[bi], dom.dom_children[bi]
+                        bi,
+                        b.start,
+                        b.end,
+                        graph.successors[bi],
+                        dom.idom[bi],
+                        dom.frontiers[bi],
+                        dom.dom_children[bi]
                     ));
                 }
                 let _ = std::fs::write(probe_dir().join("ssagraph.txt"), d);
             }
         }
-        let mut ssa_out = ssa::build(&insns, &graph, &dom);
+        // Caller-saved HFA return registers: s0,s1,s2,s3 are v0,v1,v2,v3
+        // lane0, i.e. `vs0,vs4,vs8,vs12` under the lifter's lane indexing
+        // (ARM32 uses consecutive `vs0..vs3`).
+        let fp_clobbers: Vec<String> = if self.arch_is_arm64 {
+            ["vs0", "vs4", "vs8", "vs12"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else if self.is_arm32 {
+            ["vs0", "vs1", "vs2", "vs3"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Handler-entry blocks: the pad's block is a kill point for SSA.
+        // Map each pad RVA through the same at-or-after slide the CFG used.
+        let handler_blocks: std::collections::HashSet<usize> = if crate::recovery::env_flags::flag("ILR_NO_EHKILL") {
+            std::collections::HashSet::new()
+        } else {
+            let mut set = std::collections::HashSet::new();
+            for &pad in &eh_pad_addrs {
+                let mut best: Option<usize> = None;
+                let mut best_addr = u64::MAX;
+                for (i, &a) in addresses.iter().enumerate() {
+                    if a >= pad && a < best_addr {
+                        best_addr = a;
+                        best = Some(i);
+                    }
+                }
+                if let Some(i) = best {
+                    if let Some(b) = graph.blocks.iter().position(|blk| blk.start == i) {
+                        set.insert(b);
+                    }
+                }
+            }
+            set
+        };
+        if crate::recovery::env_flags::flag("ILR_EHSSA") && !eh_pad_addrs.is_empty() {
+            eprintln!(
+                "[ehssa] {rva:#x} pads={:?} kill_blocks={:?}",
+                eh_pad_addrs, handler_blocks
+            );
+        }
+        let mut ssa_out =
+            ssa::build_with_handler_entries(&insns, &graph, &dom, &fp_clobbers, &handler_blocks);
         ssa::materialize(&mut ssa_out, &mut graph);
         // FP-returning methods leave their result in v0 (s0/d0/xmm0), but
         // the lifter models every RET as returning x0 — rebind the Return to
@@ -3160,28 +4366,41 @@ impl RecoveryContext {
         // `return v3;` with its FMUL chain Nop'd away).
         passes::bind_fp_returns(&mut ssa_out.insns, &ssa_out.version_slot, &seed.ret_type);
         st[3] += t.elapsed().as_micros() as u64;
-        if std::env::var("ILR_POSTSSA").is_ok() {
+        if crate::recovery::env_flags::flag("ILR_POSTSSA") {
             // optional RVA filter: ILR_POSTSSA=0x2db38 dumps only that method
             let rva_ok = std::env::var("ILR_POSTSSA")
                 .ok()
-                .and_then(|v| {                        u64::from_str_radix(v.trim_start_matches("0x"), 16)
-                            .or_else(|_| v.parse::<u64>())
-                            .ok()
+                .and_then(|v| {
+                    u64::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .or_else(|_| v.parse::<u64>())
+                        .ok()
                 })
                 .map(|f| f == rva)
                 .unwrap_or(true);
             if rva_ok {
-            let mut d = String::new();
-            for (i, insn) in ssa_out.insns.iter().enumerate() {
-                d.push_str(&format!("  p{i} @{:#x}: op={:?} operands={:?}\n", insn.address, insn.op, insn.operands));
-            }
-            let _ = std::fs::write(probe_dir().join(format!("postssa.{:#x}.txt", rva)), d);
+                let mut d = String::new();
+                for (i, insn) in ssa_out.insns.iter().enumerate() {
+                    d.push_str(&format!(
+                        "  p{i} @{:#x}: op={:?} operands={:?}\n",
+                        insn.address, insn.op, insn.operands
+                    ));
+                }
+                let _ = std::fs::write(probe_dir().join(format!("postssa.{:#x}.txt", rva)), d);
             }
         }
 
         // 5. typed locals + propagation (metadata-backed field resolution)
         let t = stage_begin!("propagate");
         let mut table = locals::create(&ssa_out.version_slot, seed);
+        // A call-clobber version has no listing definition; its value is
+        // whatever the CALL delivered to that ABI register. That is an
+        // incoming ABI value (the same category as an undeclared argument
+        // register), so the undefined-local oracle must not report it.
+        for &v in &ssa_out.call_defined {
+            if let Some(&li) = table.index_of.get(&v) {
+                table.infos[li].is_call_clobber = true;
+            }
+        }
         // `this` cannot be assigned: an entry version the body writes is a
         // plain local that starts out holding the this pointer (the
         // loop-carried register of a rotated loop).
@@ -3240,15 +4459,32 @@ impl RecoveryContext {
         dump_ir_stage(&ssa_out.insns, rva, "postscrub");
         // ILR_LOCALS=1 → all methods; ILR_LOCALS=0xRVA → just that method
         let locals_dump = match std::env::var("ILR_LOCALS") {
-            Ok(v) if v != "1" => u64::from_str_radix(v.trim_start_matches("0x"), 16).ok() == Some(rva),
+            Ok(v) if v != "1" => {
+                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok() == Some(rva)
+            }
             Ok(_) => true,
             Err(_) => false,
         };
         if locals_dump {
             for (v, slot) in &ssa_out.version_slot {
                 let li = table.index_of.get(v).copied().unwrap_or(usize::MAX);
-                eprintln!("[locals] v{} slot={} idx={} this={} param={:?}", v, slot, li,
-                    li != usize::MAX && table.infos[li].is_this, if li != usize::MAX { table.infos[li].is_param } else { None });
+                eprintln!(
+                    "[locals] v{} slot={} idx={} this={} param={:?} origin={}",
+                    v,
+                    slot,
+                    li,
+                    li != usize::MAX && table.infos[li].is_this,
+                    if li != usize::MAX {
+                        table.infos[li].is_param
+                    } else {
+                        None
+                    },
+                    if li != usize::MAX {
+                        table.infos[li].slot_origin.as_str()
+                    } else {
+                        "?"
+                    }
+                );
             }
         }
         let oracle = BridgeOracle {
@@ -3263,7 +4499,11 @@ impl RecoveryContext {
         dump_ir_stage(&ssa_out.insns, rva, "posttypes");
         st[4] += t.elapsed().as_micros() as u64;
 
-        if timed_out(&deadline) { flush!(); tm::DEADLINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return None; }
+        if timed_out(&deadline) {
+            flush!();
+            tm::DEADLINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
         // 6. metadata resolution (+ FieldInfo usage → named static fields)
         let mut field_owner = |fi: u32| -> Option<(String, String, ManagedType)> {
             self.field_info(metadata, il2cpp, fi)
@@ -3296,18 +4536,64 @@ impl RecoveryContext {
             &mut |mi| self.method_info_ref(metadata, il2cpp, mi),
             &mut stats,
         );
+        // GENERIC RETURN SPECIALIZATION: a shared generic body's MethodRef
+        // returns `T`, but the call site's declaring type carries the concrete
+        // instantiation (`List<Vector3>`). Without this, `get_Item` did not
+        // even look like a struct return, so its HFA components were never
+        // bound and later reads reused stale s-register versions — measured
+        // as `(z - z)` collapsing real distance math to zero.
+        let specialized =
+            resolve::specialize_generic_return_sigs(&mut ssa_out.insns, &self.maps);
+        if specialized > 0 {
+            static GSPEC: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            GSPEC.fetch_add(specialized as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         dump_ir_stage(&ssa_out.insns, rva, "postresolve");
         // A float/double-returning call leaves its result in v0, but every
         // call only defines the integer return slot — bind the FP slot to the
         // call result now that `resolve` has filled each call's `dest_type`.
         // Before DCE: an unbound read makes the call look partially dead.
-        passes::bind_fp_call_returns(&mut ssa_out.insns, &ssa_out.version_slot, |ty| match ty {
-            ManagedType::Class(nt) if nt.type_def_index >= 0 => {
-                hfa_float_components(nt.type_def_index, metadata, il2cpp).len()
-            }
-            _ => 0,
-        });
+        // HFA components are bound as `result.<field>` (one DISTINCT value per
+        // register): binding them all to the same local made every Vector3
+        // component equal.
+        let hfa_stride = if self.arch_is_arm64 { 4 } else { 1 };
+        passes::bind_fp_call_returns(
+            &mut ssa_out.insns,
+            &ssa_out.version_slot,
+            hfa_stride,
+            |ty| match ty {
+                ManagedType::Class(nt) if nt.type_def_index >= 0 => {
+                    hfa_field_refs(nt, metadata, il2cpp)
+                }
+                _ => Vec::new(),
+            },
+        );
         st[5] += t.elapsed().as_micros() as u64;
+
+        // 6b. Post-resolve type propagation.
+        //
+        // `propagate_types` (step 5) ran BEFORE `resolve`, so most call targets
+        // were still `Immediate(addr)` rather than `Method(m)`. After resolve
+        // converts them (including shared generic bodies, native wrappers, and
+        // virtual dispatch), re-run a targeted type propagation that picks up
+        // resolved calls and propagates their return types to destination locals.
+        // This is more surgical than re-running the full `propagate_types` — it
+        // only processes calls, moves, and memory loads, without re-doing the
+        // arith field-address seeding that could interfere with existing resolutions.
+        {
+            let t = stage_begin!("post-resolve types");
+            let oracle2 = BridgeOracle {
+                metadata,
+                il2cpp,
+                chains: &self.parent_chains,
+                cache: std::cell::RefCell::new(HashMap::new()),
+                field_index_by_addr: &self.field_index_by_addr,
+                field_owner_tdi: &self.field_owner_tdi,
+            };
+            interprocedural::propagate_post_resolve(&mut ssa_out.insns, &mut table, &oracle2);
+            st[5] += t.elapsed().as_micros() as u64;
+        }
 
         // 7. class-init guard excision (before folding so constants settle)
         let t = stage_begin!("guards");
@@ -3316,7 +4602,11 @@ impl RecoveryContext {
 
         st[6] += t.elapsed().as_micros() as u64;
 
-        if timed_out(&deadline) { flush!(); tm::DEADLINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return None; }
+        if timed_out(&deadline) {
+            flush!();
+            tm::DEADLINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
         // 8. optimization loop (ConstantFolder ⇄ SsaSimplifier ≤8, then DCE)
         let t = stage_begin!("opt");
         for _ in 0..8 {
@@ -3333,15 +4623,14 @@ impl RecoveryContext {
         // 9. structural cleanup
         passes::simplify_boolean_flags(&mut ssa_out.insns);
         passes::trim_call_arguments(&mut ssa_out.insns);
-        let removed_guards =
-            passes::remove_null_check_guards(&mut ssa_out.insns, &graph);
+        let removed_guards = passes::remove_null_check_guards(&mut ssa_out.insns, &graph);
         // NOTE: do NOT rebuild the cfg here. `ssa::build` recorded each phi's
         // predecessor BLOCK INDICES; a rebuild after Nop'ing guard branches
         // merges blocks, shifts those indices, and `eliminate` would index
         // out of range (the guard-removal Nops don't affect the phi edge
         // moves — each pred block's Nop'd terminator just reads as a non-
-        // terminator and the move is placed after it). `eliminate` rebuilds
-        // the cfg itself at the end.
+        // terminator and the move is placed after it). Nothing reads the CFG
+        // after `eliminate`, so it stays stale rather than paying a rebuild.
         let _ = removed_guards;
         passes::dead_code_elimination(&mut ssa_out.insns);
         st[7] += t.elapsed().as_micros() as u64;
@@ -3445,15 +4734,152 @@ pub fn probe_dir() -> std::path::PathBuf {
 
 /// Debug: dump a pipeline stage's IR for one method (ILR_DUMP_STAGE=0xRVA).
 fn dump_ir_stage(insns: &[Insn], rva: u64, stage: &str) {
-    let Ok(f) = std::env::var("ILR_DUMP_STAGE") else { return };
+    let Ok(f) = std::env::var("ILR_DUMP_STAGE") else {
+        return;
+    };
     let t = f.trim_start_matches("0x");
-    let Some(want) = u64::from_str_radix(t, 16).or_else(|_| t.parse::<u64>()).ok() else { return };
-    if want != rva { return; }
+    let Some(want) = u64::from_str_radix(t, 16)
+        .or_else(|_| t.parse::<u64>())
+        .ok()
+    else {
+        return;
+    };
+    if want != rva {
+        return;
+    }
     let mut d = String::new();
     for (i, insn) in insns.iter().enumerate() {
-        d.push_str(&format!("  {stage} {i} @{:#x}: op={:?} operands={:?}\n", insn.address, insn.op, insn.operands));
+        d.push_str(&format!(
+            "  {stage} {i} @{:#x}: op={:?} operands={:?}\n",
+            insn.address, insn.op, insn.operands
+        ));
     }
     let _ = std::fs::write(probe_dir().join(format!("stage.{stage}.{:#x}.txt", rva)), d);
+}
+
+/// Resolve out-of-line ARM64 load veneers before the CFG.
+///
+/// The linker shares the GOT load for a static/class pointer: a body ends in
+/// `b 0x2dff1a8`, and that address is a 2-instruction stub
+/// `ldr x19,[x19,#off]; b <continuation inside the method>`. The CFG cannot
+/// follow an out-of-body target, so the entry edge was lost and the entire
+/// real body became unreachable (`[covloss]` 49/50, 43/44, 35/36).
+///
+/// Splice the veneer's pure loads at the branch site (keeping the branch's
+/// native address) and retarget to the in-body continuation. Anything that
+/// allocates a frame, stores memory, calls, or branches anywhere but forward
+/// into this body is refused and left as an exit edge.
+fn resolve_load_veneers(
+    insns: &mut Vec<Insn>,
+    addresses: &mut Vec<u64>,
+    body_lo: u64,
+    body_hi: u64,
+    read: impl Fn(u64, usize) -> Option<Vec<u8>>,
+) -> usize {
+    if insns.len() != addresses.len() {
+        return 0;
+    }
+    let mut resolved = 0usize;
+    let mut i = 0usize;
+    while i < insns.len() {
+        let Op::Jump(t) = insns[i].op else {
+            i += 1;
+            continue;
+        };
+        let target = t as u64;
+        if target >= body_lo && target < body_hi {
+            i += 1;
+            continue;
+        }
+        let Some(vbytes) = read(target, 16) else {
+            i += 1;
+            continue;
+        };
+        let Some(lifted) = lift::lift_arm64(&vbytes, target, 16, None) else {
+            i += 1;
+            continue;
+        };
+        let mut end = lifted.insns.len();
+        if let Some(term) = lifted.insns.iter().position(|x| x.is_terminator()) {
+            end = end.min(term + 1);
+        }
+        let Some((last, init)) = lifted.insns[..end].split_last() else {
+            i += 1;
+            continue;
+        };
+        let Op::Jump(cont) = last.op else {
+            i += 1;
+            continue;
+        };
+        let cont = cont as u64;
+        // The continuation must prove ownership: a forward in-body address.
+        if cont < body_lo || cont >= body_hi || cont <= insns[i].address {
+            i += 1;
+            continue;
+        }
+        // A veneer is 1..=3 pure loads; a frame setup, store, call, compare or
+        // in-stub branch is a real function body, not a linker stub.
+        let mut ok = init.len() <= 3;
+        for x in init {
+            if !matches!(x.op, Op::Move | Op::Nop) {
+                ok = false;
+                break;
+            }
+            if let Some(pos) = Insn::dest_position(&x.op) {
+                match x.operands.get(pos) {
+                    Some(Operand::Register(r))
+                        if !matches!(r.as_str(), "sp" | "x29" | "x30") => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !ok {
+            i += 1;
+            continue;
+        }
+        let addr = insns[i].address;
+        if init.is_empty() {
+            insns[i] = Insn::new(Op::Jump(cont as usize), vec![], addr);
+            resolved += 1;
+            i += 1;
+            continue;
+        }
+        let mut new_insns: Vec<Insn> = init
+            .iter()
+            .cloned()
+            .map(|mut x| {
+                x.address = addr;
+                x
+            })
+            .collect();
+        let mut new_addrs = vec![addr; new_insns.len()];
+        let mut tail_jump = last.clone();
+        tail_jump.address = addr;
+        new_insns.push(tail_jump);
+        new_addrs.push(addr);
+        let n = new_insns.len();
+        insns.splice(i..=i, new_insns);
+        addresses.splice(i..=i, new_addrs);
+        resolved += 1;
+        i += n;
+    }
+    resolved
+}
+
+/// Whether a lifted out-of-body window begins like a real method: a frame
+/// allocation before the first terminator. A shared tail-merge continuation
+/// never allocates a frame, so splicing a window that does glues another
+/// function's prologue and body into this method's IR — the CFG then turns
+/// the fragment's backward branch into a self-loop (`while (true)`).
+pub(crate) fn tail_starts_with_frame_allocation(insns: &[Insn]) -> bool {
+    insns
+        .iter()
+        .take_while(|i| !i.is_terminator())
+        .take(8)
+        .any(|i| matches!(i.op, Op::ShiftStack(d) if d < 0))
 }
 
 /// Result of [`RecoveryContext::recover_ir`].
@@ -3551,6 +4977,1323 @@ impl RecoveryContext {
         Some((tname, name, ty))
     }
 
+    /// Pre-compute instance field layouts for every TypeDef.
+    ///
+    /// For each type, iterates its instance fields and records
+    /// `(tdi, byte_offset) → (field_name, declaring_type_name)` in `maps.field_layouts`,
+    /// and `(tdi, byte_offset) → field_type_tdi` in `maps.field_types`.
+    /// Walks parent chains so inherited fields are reachable from the child's tdi.
+    pub fn populate_field_layouts(
+        maps: &mut resolve::ResolveMaps,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
+        parent_chains: &HashMap<i32, Vec<i32>>,
+        generic_names: &HashMap<u64, String>,
+    ) {
+        // Pre-compute well-known type def indices for String and Object.
+        // These are needed because fields of type `string` have type_enum 0x0E
+        // and fields of type `object` have type_enum 0x1C, neither of which
+        // carries a klass_index directly.
+        let mut string_tdi: Option<i32> = None;
+        let mut object_tdi: Option<i32> = None;
+        for (ti, td) in metadata.type_defs.iter().enumerate() {
+            let ns = metadata.get_string_from_index(td.namespace_index).unwrap_or_default();
+            let name = metadata.get_string_from_index(td.name_index).unwrap_or_default();
+            if ns == "System" && name == "String" {
+                string_tdi = Some(ti as i32);
+            } else if ns == "System" && name == "Object" {
+                object_tdi = Some(ti as i32);
+            }
+            if string_tdi.is_some() && object_tdi.is_some() {
+                break;
+            }
+        }
+
+        let empty = Vec::new();
+        for tdi in 0..metadata.type_defs.len() {
+            let tdi = tdi as i32;
+            let chain = parent_chains.get(&tdi).unwrap_or(&empty);
+            for &tdi_walk in chain {
+                if tdi_walk < 0 || tdi_walk as usize >= metadata.type_defs.len() {
+                    continue;
+                }
+                let td_walk = &metadata.type_defs[tdi_walk as usize];
+                let field_start = td_walk.field_start as usize;
+                let field_count = td_walk.field_count as usize;
+                let declaring_name = metadata
+                    .get_string_from_index(td_walk.name_index)
+                    .unwrap_or_default();
+                for fi in 0..field_count {
+                    let global_fi = field_start + fi;
+                    let Some(field_def) = metadata.field_defs.get(global_fi) else {
+                        continue;
+                    };
+                    let Some(field_il2cpp_type) = il2cpp.types.get(field_def.type_index as usize) else {
+                        continue;
+                    };
+                    let is_static = (field_il2cpp_type.attrs & 0x0010) != 0;
+                    if is_static {
+                        continue;
+                    }
+                    let raw_offset = il2cpp.get_field_offset_from_index(
+                        tdi_walk as usize,
+                        fi,
+                        global_fi,
+                        td_walk.is_value_type(),
+                        is_static,
+                    );
+                    let name = metadata
+                        .get_string_from_index(field_def.name_index)
+                        .unwrap_or_else(|_| format!("field_{global_fi}"));
+                    // The declared generic INSTANTIATION (`Dictionary<int,
+                    // Token>`) is authoritative for a `new` stored into this
+                    // field; shared-generic metadata only names the definition
+                    // with `object` arguments.
+                    if field_il2cpp_type.type_enum == 0x15 {
+                        if let Some(text) = generic_names.get(&field_il2cpp_type.datapoint) {
+                            maps.field_generic_text
+                                .entry((tdi, name.clone()))
+                                .or_insert_with(|| text.clone());
+                        }
+                    }
+                    // Insert under the ORIGINAL tdi (the child), so a query
+                    // for the child's tdi + this offset finds the inherited field.
+                    // Do not overwrite a field already found on the child itself
+                    // (child fields take priority over inherited ones).
+                    let key = (tdi, raw_offset as i64);
+                    maps.field_layouts
+                        .entry(key)
+                        .or_insert((name.clone(), declaring_name.clone()));
+                    // Declared access width, where it is unambiguous.
+                    let fw = match field_il2cpp_type.type_enum {
+                        0x02 | 0x04 | 0x05 => Some(1u8),
+                        0x03 | 0x06 | 0x07 => Some(2),
+                        0x08 | 0x09 | 0x0C => Some(4),
+                        0x0A | 0x0B | 0x0D | 0x18 | 0x19 => Some(8),
+                        0x0E | 0x12 | 0x14 | 0x15 | 0x1C => Some(8),
+                        0x11 => {
+                            // Enum → its underlying integer width. A struct is
+                            // refused: a 4-byte store at its offset is a
+                            // sub-field, not the struct field itself.
+                            let etdi = field_il2cpp_type.klass_index() as usize;
+                            metadata
+                                .type_defs
+                                .get(etdi)
+                                .filter(|td| td.is_enum())
+                                .and_then(|td| {
+                                    metadata
+                                        .field_defs
+                                        .get(td.field_start as usize)
+                                        .and_then(|f| il2cpp.types.get(f.type_index as usize))
+                                        .and_then(|t| match t.type_enum {
+                                            0x04 | 0x05 => Some(1),
+                                            0x06 | 0x07 => Some(2),
+                                            0x08 | 0x09 => Some(4),
+                                            0x0A | 0x0B => Some(8),
+                                            _ => Some(4),
+                                        })
+                                })
+                        }
+                        _ => None,
+                    };
+                    if let Some(w) = fw {
+                        maps.field_widths.entry(key).or_insert(w);
+                    }
+                    // Record the field's type tdi for pointer chain resolution.
+                    // This enables resolving `*(nint*)(base.field + offset)` to
+                    // the named field at `offset` within the field's type.
+                    let type_enum = field_il2cpp_type.type_enum;
+                    let field_type_tdi = match type_enum {
+                        // Class or ValueType: datapoint is the klass_index (tdi).
+                        0x12 | 0x11 => Some(field_il2cpp_type.klass_index() as i32),
+                        // GenericInst (List<T>, Dictionary<K,V>, etc.):
+                        // datapoint is a pointer to Il2CppGenericClass; resolve
+                        // the generic type definition's tdi from it.
+                        0x15 => {
+                            let gc_ptr = field_il2cpp_type.generic_class();
+                            if gc_ptr != 0 {
+                                il2cpp.read_generic_class(gc_ptr).ok().and_then(|gc| {
+                                    if il2cpp.version >= 27.0 {
+                                        // v27+: type_ptr → Il2CppType whose klass_index is the tdi
+                                        let type_ptr = gc.type_ptr;
+                                        if type_ptr != 0 {
+                                            il2cpp.get_il2cpp_type(type_ptr).map(|t| t.klass_index() as i32)
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        // pre-v27: type_definition_index is the tdi directly
+                                        let idx = gc.type_definition_index;
+                                        if idx == u32::MAX as u64 || idx == u64::MAX || idx == 0 {
+                                            None
+                                        } else {
+                                            Some(idx as i32)
+                                        }
+                                    }
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        // String: well-known type System.String
+                        0x0E => string_tdi,
+                        // Object: well-known type System.Object
+                        0x1C => object_tdi,
+                        _ => None,
+                    };
+                    if let Some(ftdi) = field_type_tdi {
+                        maps.field_types.entry(key).or_insert(ftdi);
+                    }
+                    // Direct fields of the type itself (the chain loop would
+                    // duplicate inherited ones under the child's key). The
+                    // embedded-layout descent walks its own parent chain and
+                    // needs each type's OWN fields with their declared types.
+                    if tdi_walk == tdi {
+                        maps.tdi_fields.entry(tdi).or_default().push((
+                            key.1,
+                            name.clone(),
+                            field_type_tdi.unwrap_or(-1),
+                        ));
+                    }
+                }
+            }
+        }
+        for (ti, td) in metadata.type_defs.iter().enumerate() {
+            if td.is_value_type() {
+                maps.value_type_tdis.insert(ti as i32);
+            }
+        }
+        // Build the reverse map: (tdi, field_name) → field_type_tdi
+        // This is used by pointer chain resolution to look up field types by name.
+        for ((tdi, offset), field_type_tdi) in &maps.field_types {
+            if let Some((field_name, _decl_type)) = maps.field_layouts.get(&(*tdi, *offset)) {
+                maps.field_type_by_name
+                    .entry((*tdi, field_name.clone()))
+                    .or_insert(*field_type_tdi);
+            }
+        }
+    }
+
+    /// Pre-compute static field layouts from the metadata-usage scan.
+    ///
+    /// For each entry in `field_index_by_addr` (which maps metadata-usage slot
+    /// addresses to global field indices), resolve the field name and declaring
+    /// type, then insert `address → (field_name, type_name)` into
+    /// `maps.static_field_layouts`. The field annotation pass uses this to
+    /// resolve `RawDeref(Int(base), offset, _)` to `StaticField(type, field)`
+    /// when `base + offset` matches a known metadata-usage slot address.
+    pub fn populate_static_field_layouts(
+        maps: &mut resolve::ResolveMaps,
+        metadata: &Metadata,
+        field_index_by_addr: &HashMap<u64, u32>,
+        field_owner_tdi: &HashMap<u32, i32>,
+    ) {
+        crate::dbg_eprintln!("[debug] populate_static_field_layouts: field_index_by_addr has {} entries", field_index_by_addr.len());
+        // A slot address can carry several field candidates. `or_insert` keeps
+        // the FIRST, and a HashMap iteration has no stable first: two runs of
+        // the same binary rendered the same store as `StreamReader.Null` and
+        // `X501.countryName`. Sort by (address, field index) so the winner is
+        // the lowest field index every run.
+        let mut addrs: Vec<(&u64, &u32)> = field_index_by_addr.iter().collect();
+        addrs.sort_by_key(|(addr, fi)| (**addr, **fi));
+        for (&addr, &fi) in addrs {
+            let Some(&tdi) = field_owner_tdi.get(&fi) else {
+                continue;
+            };
+            let Some(td) = metadata.type_defs.get(tdi as usize) else {
+                continue;
+            };
+            let Some(fdef) = metadata.field_defs.get(fi as usize) else {
+                continue;
+            };
+            let type_name = metadata
+                .get_string_from_index(td.name_index)
+                .unwrap_or_default();
+            let field_name = metadata
+                .get_string_from_index(fdef.name_index)
+                .unwrap_or_else(|_| format!("field_{fi}"));
+            maps.static_field_layouts
+                .entry(addr)
+                .or_insert((field_name, type_name));
+        }
+        crate::dbg_eprintln!("[debug] populate_static_field_layouts: static_field_layouts has {} entries", maps.static_field_layouts.len());
+        // Debug: print first 10 static field addresses
+        for (i, (addr, (field_name, type_name))) in maps.static_field_layouts.iter().enumerate().take(10) {
+            crate::dbg_eprintln!("[debug]   static_field[{}]: 0x{:x} = {}.{}", i, addr, type_name, field_name);
+        }
+    }
+
+    /// Pre-compute static field offsets within the static_fields structure.
+    ///
+    /// For each type, iterate its static fields and use `get_field_offset_from_index`
+    /// to determine each field's byte offset within the static_fields block.
+    /// Store `(type_name, byte_offset) → (field_name, type_name)` in `maps.static_field_offsets`.
+    ///
+    /// This enables resolving `RawDeref(Field(base, "static_fields"), offset)` to
+    /// `StaticField(type_name, field_name)` when the type is known from the
+    /// klass pointer or a variable.
+    pub fn populate_static_field_offsets(
+        maps: &mut resolve::ResolveMaps,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
+    ) {
+        // Parallelize across type_defs: each produces a local Vec of entries,
+        // then we merge once at the end. Avoids contending on the shared HashMap.
+        let entries: Vec<(
+            ((String, i64), (String, String)),
+            Option<((String, String), i32)>,
+        )> = metadata.type_defs.par_iter().enumerate().flat_map(|(tdi, td)| {
+            let tdi = tdi as i32;
+            let field_start = td.field_start as usize;
+            let field_count = td.field_count as usize;
+            let type_name = metadata
+                .get_string_from_index(td.name_index)
+                .unwrap_or_default();
+            let ns = metadata
+                .get_string_from_index(td.namespace_index)
+                .unwrap_or_default();
+            let full_type_name = if ns.is_empty() {
+                type_name.clone()
+            } else {
+                format!("{}.{}", ns, type_name)
+            };
+            let mut local = Vec::new();
+            use crate::il2cpp::enums::field_attributes;
+            for fi in 0..field_count {
+                let global_fi = field_start + fi;
+                let Some(field_def) = metadata.field_defs.get(global_fi) else {
+                    continue;
+                };
+                let Some(field_il2cpp_type) = il2cpp.types.get(field_def.type_index as usize) else {
+                    continue;
+                };
+                let is_static = (field_il2cpp_type.attrs & 0x0010) != 0;
+                // CONSTANTS and FieldRVA data are NOT in the static block:
+                // giving them a storage offset collides with the real static
+                // field at that offset. Camera's const `kMaxAperture` stole
+                // the delegate field's slot and named `onPreCull` after it.
+                let is_literal =
+                    (field_il2cpp_type.attrs & field_attributes::LITERAL) != 0;
+                let has_field_rva =
+                    (field_il2cpp_type.attrs & field_attributes::HAS_FIELD_RVA) != 0;
+                if !is_static || is_literal || has_field_rva {
+                    continue;
+                }
+                let raw_offset = il2cpp.get_field_offset_from_index(
+                    tdi as usize,
+                    fi,
+                    global_fi,
+                    td.is_value_type(),
+                    is_static,
+                );
+                if raw_offset < 0 {
+                    continue;
+                }
+                let name = metadata
+                    .get_string_from_index(field_def.name_index)
+                    .unwrap_or_else(|_| format!("field_{global_fi}"));
+                // The static field's DECLARED class type, so the field
+                // annotator can continue a pointer chain through
+                // `Type.StaticField +off`. Class/ValueType carry the tdi in
+                // `klass_index` (same convention as instance field types).
+                let field_type_tdi = match field_il2cpp_type.type_enum {
+                    0x11 | 0x12 => Some(field_il2cpp_type.klass_index() as i32),
+                    // GenericInst (List<T>, Dictionary<K,V>, …): same
+                    // resolution as instance field types — the generic type
+                    // DEFINITION's tdi is enough to recognise the layout.
+                    0x15 => {
+                        let gc_ptr = field_il2cpp_type.generic_class();
+                        if gc_ptr != 0 {
+                            il2cpp.read_generic_class(gc_ptr).ok().and_then(|gc| {
+                                if il2cpp.version >= 27.0 {
+                                    let type_ptr = gc.type_ptr;
+                                    if type_ptr != 0 {
+                                        il2cpp.get_il2cpp_type(type_ptr).map(|t| t.klass_index() as i32)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    let idx = gc.type_definition_index;
+                                    if idx == u32::MAX as u64 || idx == u64::MAX || idx == 0 {
+                                        None
+                                    } else {
+                                        Some(idx as i32)
+                                    }
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let key = (full_type_name.clone(), raw_offset as i64);
+                let ty = field_type_tdi
+                    .map(|ftdi| ((full_type_name.clone(), name.clone()), ftdi));
+                local.push(((key, (name, full_type_name.clone())), ty));
+            }
+            local
+        }).collect();
+        // The flat_map above runs in parallel; its Vec order (and therefore
+        // which duplicate key wins `or_insert`) changed run to run. Sort by
+        // (type, offset) and then by the candidate name so the winner is fixed.
+        let mut entries = entries;
+        entries.sort_by(|a, b| {
+            (a.0).0.cmp(&(b.0).0).then_with(|| (a.0).1.cmp(&(b.0).1))
+        });
+        for ((key, val), ty) in entries {
+            maps.static_field_offsets.entry(key).or_insert(val);
+            if let Some((ty_key, ty_tdi)) = ty {
+                maps.static_field_types.entry(ty_key).or_insert(ty_tdi);
+            }
+        }
+    }
+
+    /// Pre-compute enum member names: for every enum type in the metadata, build
+    /// a map from constant value to member name. Stored in `maps.enum_members`
+    /// as `tdi → (i64 → member_name)`.
+    ///
+    /// Enum types are identified by `Il2CppTypeDefinition::is_enum()`. Their
+    /// fields (excluding the compiler-generated `value__` instance field) are
+    /// static literal fields whose default values are stored in the metadata's
+    /// `fieldAndParameterDefaultValueData` section.
+    pub fn populate_enum_members(
+        maps: &mut resolve::ResolveMaps,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
+    ) {
+        use crate::il2cpp::field_layout::read_metadata_bytes;
+
+        for (tdi, td) in metadata.type_defs.iter().enumerate() {
+            let tdi = tdi as i32;
+            if !td.is_enum() {
+                continue;
+            }
+            let field_start = td.field_start as usize;
+            let field_count = td.field_count as usize;
+            let mut members: HashMap<i64, String> = HashMap::new();
+
+            // Determine the underlying type size from element_type_index.
+            // Default is Int32 (4 bytes) when element_type_index is -1.
+            let underlying_size: usize = if td.element_type_index >= 0 {
+                // Look up the element type to determine its size.
+                if let Some(elem_type) = il2cpp.types.get(td.element_type_index as usize) {
+                    use crate::il2cpp::enums::Il2CppTypeEnum;
+                    match Il2CppTypeEnum::from_u8(elem_type.type_enum) {
+                        Some(Il2CppTypeEnum::Boolean) | Some(Il2CppTypeEnum::I1) | Some(Il2CppTypeEnum::U1) => 1,
+                        Some(Il2CppTypeEnum::Char) | Some(Il2CppTypeEnum::I2) | Some(Il2CppTypeEnum::U2) => 2,
+                        Some(Il2CppTypeEnum::I4) | Some(Il2CppTypeEnum::U4) => 4,
+                        Some(Il2CppTypeEnum::I8) | Some(Il2CppTypeEnum::U8) => 8,
+                        Some(Il2CppTypeEnum::I) | Some(Il2CppTypeEnum::U) => if il2cpp.is_32bit { 4 } else { 8 },
+                        _ => 4, // default to i32
+                    }
+                } else {
+                    4
+                }
+            } else {
+                4 // default underlying type is Int32
+            };
+
+            for fi in 0..field_count {
+                let global_fi = field_start + fi;
+                let Some(field_def) = metadata.field_defs.get(global_fi) else {
+                    continue;
+                };
+                // Get the field name.
+                let field_name = metadata
+                    .get_string_from_index(field_def.name_index)
+                    .unwrap_or_default();
+                // Skip the compiler-generated `value__` instance field.
+                if field_name == "value__" {
+                    continue;
+                }
+                // Look up the default value for this field.
+                let Some(default_val) = metadata.get_field_default_value(global_fi as i32) else {
+                    continue;
+                };
+                let data_index = default_val.data_index;
+                if data_index < 0 {
+                    continue;
+                }
+                // Read the constant value bytes from metadata.
+                let offset = metadata.get_default_value_offset(data_index);
+                let Some(bytes) = read_metadata_bytes(metadata, offset, underlying_size) else {
+                    continue;
+                };
+                // Interpret the bytes as a signed integer.
+                let value: i64 = match underlying_size {
+                    1 => {
+                        if bytes.len() >= 1 {
+                            bytes[0] as i8 as i64
+                        } else {
+                            continue;
+                        }
+                    }
+                    2 => {
+                        if bytes.len() >= 2 {
+                            i16::from_le_bytes([bytes[0], bytes[1]]) as i64
+                        } else {
+                            continue;
+                        }
+                    }
+                    4 => {
+                        if bytes.len() >= 4 {
+                            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64
+                        } else {
+                            continue;
+                        }
+                    }
+                    8 => {
+                        if bytes.len() >= 8 {
+                            i64::from_le_bytes([
+                                bytes[0], bytes[1], bytes[2], bytes[3],
+                                bytes[4], bytes[5], bytes[6], bytes[7],
+                            ])
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                };
+                members.insert(value, field_name);
+            }
+            if !members.is_empty() {
+                maps.enum_members.insert(tdi, members);
+            }
+        }
+    }
+
+    /// Pre-compute attribute constructor names: for every custom attribute
+    /// generator in the binary, map its RVA to the short attribute type name.
+    ///
+    /// This enables the attribute recovery pass to recognise calls to attribute
+    /// constructors in static initialisers and emit `[AttributeName(args)]`
+    /// comments. Only attributes from metadata version >= 21 are processed
+    /// (custom attributes were introduced in that version).
+    ///
+    /// For metadata < 29, the generator function pointers are in
+    /// `executor.custom_attribute_generators`. For >= 29, the attribute data
+    /// is stored differently and we use `attribute_type_ranges` + `attribute_types`.
+    pub fn populate_attribute_ctor_names(
+        maps: &mut resolve::ResolveMaps,
+        executor: &mut Il2CppExecutor,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
+    ) {
+        if il2cpp.version < 21.0 {
+            return;
+        }
+
+        if il2cpp.version < 29.0 {
+            // Pre-v29: custom_attribute_generators is a flat array of function
+            // pointers, indexed by attribute index. attribute_type_ranges gives
+            // the type indices for each attribute index.
+            // Collect (rva, type_idx) pairs first to avoid borrowing executor
+            // immutably (for the generators vec) and mutably (for get_type_name)
+            // in the same loop.
+            let mut work: Vec<(u64, usize)> = Vec::new();
+            for (attr_idx, &gen_ptr) in executor.custom_attribute_generators.iter().enumerate() {
+                if gen_ptr == 0 {
+                    continue;
+                }
+                let rva = il2cpp.get_rva(gen_ptr);
+                if rva == 0 {
+                    continue;
+                }
+                if attr_idx >= metadata.attribute_type_ranges.len() {
+                    continue;
+                }
+                let attr_range = &metadata.attribute_type_ranges[attr_idx];
+                if attr_range.count == 0 {
+                    continue;
+                }
+                let type_index = attr_range.start as usize;
+                if type_index >= metadata.attribute_types.len() {
+                    continue;
+                }
+                work.push((rva, metadata.attribute_types[type_index] as usize));
+            }
+            for (rva, type_idx) in work {
+                if let Some(attr_type) = il2cpp.types.get(type_idx) {
+                    let full_name = executor.get_type_name(attr_type, metadata, il2cpp, false, false);
+                    // Extract the short name (last component after '.').
+                    let short_name = full_name.rsplit('.').next().unwrap_or(&full_name);
+                    // Strip "Attribute" suffix for display if present.
+                    let display_name = short_name.strip_suffix("Attribute").unwrap_or(short_name);
+                    maps.attribute_ctor_names.insert(rva, display_name.to_string());
+                }
+            }
+        }
+        // For v29+, attribute data is in attribute_data_ranges with a different
+        // encoding. The attribute type info is still in attribute_type_ranges
+        // but the generator pointers are not directly available. We skip this
+        // for now as the binary encoding is more complex.
+    }
+
+    /// Populate static field layouts from Il2CppClass structures in the binary (Unity 2022+ / IL2CPP v29+).
+    ///
+    /// In Unity 2022+, static fields are NOT resolved through metadata usages (kind 4).
+    /// Instead, the static field data is stored in .bss/.data sections, and the
+    /// code references these addresses directly with patterns like `*(nint*)(0x2f6a000 + 792)`.
+    ///
+    /// The Il2CppClass structure (see `assets/UnityHeaders/31-2022.3.33-.h`) contains a
+    /// `void* static_fields;` member that points to the static field storage for that class.
+    /// This function finds Il2CppClass instances in the binary and reads that pointer.
+    ///
+    /// Two discovery strategies are used:
+    ///
+    /// 1. **Metadata-usage slot dereference** (memory dumps): In a memory dump, the metadata
+    ///    usage slots (kind 1 = TypeInfo) contain runtime pointers to Il2CppClass structures.
+    ///    We dereference these to find the class and read `static_fields`.
+    ///
+    /// 2. **Data-section structure scan** (all binaries): We scan the binary's data sections
+    ///    for Il2CppClass structures, identified by matching (field_count, method_count,
+    ///    static_fields_size) at known offsets within the structure against the metadata's
+    ///    TypeDef information. This works for both memory dumps (where `static_fields` is
+    ///    populated) and static binaries (where `static_fields` may be null or pre-initialized).
+    pub fn populate_static_fields_from_data_sections(
+        maps: &mut resolve::ResolveMaps,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
+    ) {
+        use crate::il2cpp::enums::field_attributes;
+        use crate::il2cpp::field_layout::decode_field_offset;
+
+        crate::dbg_eprintln!("[debug] populate_static_fields_from_data_sections: starting");
+
+        let ptr_size = if il2cpp.is_32bit { 4u64 } else { 8u64 };
+
+        // Compute the offset of `static_fields` within Il2CppClass.
+        // Layout from `assets/UnityHeaders/31-2022.3.33-.h`:
+        //
+        // Il2CppClass {
+        //   image (ptr), gc_desc (ptr), name (ptr), namespaze (ptr),
+        //   byval_arg (Il2CppType), this_arg (Il2CppType),
+        //   element_class (ptr), castClass (ptr), declaringType (ptr), parent (ptr),
+        //   generic_class (ptr), typeMetadataHandle (ptr), interopData (ptr), klass (ptr),
+        //   fields (ptr), events (ptr), properties (ptr), methods (ptr),
+        //   nestedTypes (ptr), implementedInterfaces (ptr),
+        //   interfaceOffsets (ptr), static_fields (ptr), ...
+        // }
+        //
+        // Il2CppType on 64-bit: data(8) + attrs:16 + type:8 + num_mods:5 + byref:1 + pinned:1 = 4 bytes
+        //   packed into one unsigned int, total 12 bytes, padded to 16 for 8-byte alignment.
+        // Il2CppType on 32-bit: data(4) + 4 = 8 bytes, 4-byte aligned.
+        let static_fields_offset: u64 = if !il2cpp.is_32bit {
+            // 64-bit: 4 pointers (32) + 2 * Il2CppType (32) + 10 pointers (80) + 2 pointers (16) + 1 pointer (8) = 200
+            200
+        } else {
+            // 32-bit: 4 pointers (16) + 2 * Il2CppType (16) + 10 pointers (40) + 2 pointers (8) + 1 pointer (4) = 108
+            108
+        };
+
+        // Offsets of identifying fields within Il2CppClass (for structure matching):
+        // From the struct definition:
+        //   ... static_fields (ptr), rgctx_data (ptr), typeHierarchy (ptr),
+        //   unity_user_data (ptr), initializationExceptionGCHandle (u32),
+        //   cctor_started (u32), cctor_finished_or_no_cctor (u32),
+        //   [padding to pointer alignment], cctor_thread (ptr-sized),
+        //   genericContainerHandle (ptr), instance_size (u32), actualSize (u32),
+        //   element_size (u32), native_size (i32), static_fields_size (u32),
+        //   thread_static_fields_size (u32), thread_static_fields_offset (i32),
+        //   flags (u32), token (u32), method_count (u16), property_count (u16),
+        //   field_count (u16), event_count (u16), ...
+        //
+        // 64-bit: static_fields at 200, then +8+8+8+4+4+4+4(pad)+8+8+4+4+4+4+4+4+4+4+4+4 = 240
+        //   method_count at 240, field_count at 244, instance_size at 216, static_fields_size at 228
+        // 32-bit: static_fields at 108, then +4+4+4+4+4+4+4+4+4+4+4+4+4+4+4+4+4+4 = 132
+        //   method_count at 132, field_count at 136, instance_size at 120, static_fields_size at 128
+        let (field_count_offset, method_count_offset, instance_size_offset, static_fields_size_offset): (u64, u64, u64, u64) = if !il2cpp.is_32bit {
+            (244, 240, 216, 228)
+        } else {
+            (136, 132, 120, 128)
+        };
+
+        // Collect all TypeDefs with static fields
+        let mut classes_with_static: Vec<(i32, u32)> = Vec::new();
+        for (tdi, _td) in metadata.type_defs.iter().enumerate() {
+            let tdi = tdi as i32;
+            if let Some(sizes) = il2cpp.type_definition_sizes.get(tdi as usize) {
+                if sizes.static_fields_size > 0 {
+                    classes_with_static.push((tdi, sizes.static_fields_size));
+                }
+            }
+        }
+
+        crate::dbg_eprintln!("[debug] found {} classes with static fields", classes_with_static.len());
+
+        if classes_with_static.is_empty() {
+            return;
+        }
+
+        // Build a signature map for ALL TypeDefs (field_count, method_count) → Vec<tdi>,
+        // so we can identify Il2CppClass structures by matching these fields against metadata.
+        let mut all_sig_to_tdis: HashMap<(u16, u16), Vec<i32>> = HashMap::new();
+        for (tdi, td) in metadata.type_defs.iter().enumerate() {
+            let key = (td.field_count, td.method_count);
+            all_sig_to_tdis.entry(key).or_default().push(tdi as i32);
+        }
+
+        // Map: class address (VA) → tdi
+        let mut class_addr_to_tdi: HashMap<u64, i32> = HashMap::new();
+
+        // --- Strategy 1: Metadata-usage slot dereference (memory dumps) ---
+        // In a memory dump, the metadata usage slots (kind 1 = TypeInfo) contain runtime
+        // pointers to Il2CppClass structures. The `klass_to_tdi` map keys are the RVAs of
+        // these slots. We read the pointer at each slot and validate it.
+        if !maps.klass_to_tdi.is_empty() {
+            let mut deref_count = 0;
+            for (&slot_rva, &tdi) in &maps.klass_to_tdi {
+                // Convert RVA to file offset
+                let slot_va = if il2cpp.image_base > 0 {
+                    slot_rva.wrapping_add(il2cpp.image_base)
+                } else {
+                    slot_rva
+                };
+                let slot_file_off = match il2cpp.map_vatr(slot_va) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                };
+
+                // Read the pointer at the metadata usage slot
+                let class_ptr = match il2cpp.stream.peek_ptr_at(slot_file_off) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                // Skip if it looks like an encoded metadata usage value rather than a pointer.
+                // Encoded values have the form (kind << 29) | (index << 1) | 1, which is < u32::MAX.
+                if class_ptr == 0 || class_ptr >= u32::MAX as u64 {
+                    continue;
+                }
+
+                // The class_ptr should point to an Il2CppClass structure.
+                // Validate by reading static_fields offset and checking it's plausible.
+                let class_va = class_ptr;
+                let sf_va = class_va.wrapping_add(static_fields_offset);
+                let sf_file_off = match il2cpp.map_vatr(sf_va) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                };
+
+                // Read the static_fields pointer
+                let _sf_ptr = match il2cpp.stream.peek_ptr_at(sf_file_off) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                class_addr_to_tdi.insert(class_va, tdi);
+                deref_count += 1;
+            }
+            crate::dbg_eprintln!("[debug] strategy 1 (metadata-usage deref): found {} Il2CppClass pointers", deref_count);
+        }
+
+        // --- Strategy 2: Data-section structure scan ---
+        // Scan data sections for Il2CppClass structures identified by their
+        // (field_count, method_count) at known offsets. For each match, read the
+        // static_fields pointer.
+        {
+            let mut scan_matches = 0usize;
+            let mut scan_sf_nonzero = 0usize;
+
+            for section in &il2cpp.data_sections {
+                let sec_end = section.offset_end.min(il2cpp.stream.len() as u64);
+                // The Il2CppClass structure is large (hundreds of bytes). We need at least
+                // enough room for the fields we read (up to ~250 bytes on 64-bit).
+                let min_struct_size = if !il2cpp.is_32bit { 260u64 } else { 140u64 };
+                if sec_end.saturating_sub(section.offset) < min_struct_size {
+                    continue;
+                }
+                let scan_end = sec_end.saturating_sub(min_struct_size);
+
+                let mut pos = section.offset;
+                while pos < scan_end {
+                    // Read field_count and method_count at their known offsets (u16 each)
+                    let fc_raw = match il2cpp.stream.peek_bytes_at(pos + field_count_offset, 2) {
+                        Ok(b) => u16::from_le_bytes([b[0], b[1]]),
+                        Err(_) => { pos += ptr_size; continue; },
+                    };
+                    let mc_raw = match il2cpp.stream.peek_bytes_at(pos + method_count_offset, 2) {
+                        Ok(b) => u16::from_le_bytes([b[0], b[1]]),
+                        Err(_) => { pos += ptr_size; continue; },
+                    };
+
+                    // Quick reject: both zero is almost certainly not a valid class
+                    if fc_raw == 0 && mc_raw == 0 {
+                        pos += ptr_size;
+                        continue;
+                    }
+
+                    // Check if (field_count, method_count) matches any known TypeDef
+                    let sig_key = (fc_raw, mc_raw);
+                    let matching_tdis = match all_sig_to_tdis.get(&sig_key) {
+                        Some(v) => v,
+                        None => { pos += ptr_size; continue; },
+                    };
+
+                    // Additional validation: read instance_size and static_fields_size
+                    // and check they're plausible (non-negative, within reasonable range).
+                    let inst_size = match il2cpp.stream.peek_u32_at(pos + instance_size_offset) {
+                        Ok(v) => v,
+                        Err(_) => { pos += ptr_size; continue; },
+                    };
+                    let sf_size_in_struct = match il2cpp.stream.peek_u32_at(pos + static_fields_size_offset) {
+                        Ok(v) => v,
+                        Err(_) => { pos += ptr_size; continue; },
+                    };
+
+                    // instance_size should be > 0 for any real class (at minimum the object header)
+                    if inst_size == 0 {
+                        pos += ptr_size;
+                        continue;
+                    }
+
+                    // Compute the virtual address of this candidate Il2CppClass
+                    let class_addr = pos - section.offset + section.address;
+
+                    // Find the best matching TypeDef
+                    let mut best_tdi: Option<i32> = None;
+
+                    // First, try to match with static_fields_size for disambiguation
+                    for &tdi in matching_tdis {
+                        if let Some(sizes) = il2cpp.type_definition_sizes.get(tdi as usize) {
+                            if sizes.static_fields_size == sf_size_in_struct && sizes.instance_size == inst_size {
+                                best_tdi = Some(tdi);
+                                break;
+                            }
+                        }
+                    }
+
+                    // If no exact match, try matching just instance_size
+                    if best_tdi.is_none() {
+                        for &tdi in matching_tdis {
+                            if let Some(sizes) = il2cpp.type_definition_sizes.get(tdi as usize) {
+                                if sizes.instance_size == inst_size {
+                                    best_tdi = Some(tdi);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // If still no match and there's only one candidate, use it
+                    if best_tdi.is_none() && matching_tdis.len() == 1 {
+                        best_tdi = Some(matching_tdis[0]);
+                    }
+
+                    if let Some(tdi) = best_tdi {
+                        // Don't overwrite a mapping found by strategy 1
+                        if !class_addr_to_tdi.contains_key(&class_addr) {
+                            class_addr_to_tdi.insert(class_addr, tdi);
+                            scan_matches += 1;
+
+                            // Check if static_fields is non-zero
+                            let sf_va = class_addr.wrapping_add(static_fields_offset);
+                            if let Ok(sf_file_off) = il2cpp.map_vatr(sf_va) {
+                                if let Ok(sf_ptr) = il2cpp.stream.peek_ptr_at(sf_file_off) {
+                                    if sf_ptr != 0 {
+                                        scan_sf_nonzero += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    pos += ptr_size;
+                }
+            }
+
+            crate::dbg_eprintln!(
+                "[debug] strategy 2 (structure scan): {} matches, {} with non-null static_fields",
+                scan_matches, scan_sf_nonzero
+            );
+        }
+
+        crate::dbg_eprintln!("[debug] total Il2CppClass mappings: {}", class_addr_to_tdi.len());
+
+        // --- Map static fields using the discovered Il2CppClass addresses ---
+        let mut fields_mapped = 0;
+        let mut classes_with_sf = 0usize;
+
+        for (&class_addr, &tdi) in &class_addr_to_tdi {
+            // Read the static_fields pointer from the Il2CppClass structure
+            let sf_va = class_addr.wrapping_add(static_fields_offset);
+            let sf_file_off = match il2cpp.map_vatr(sf_va) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            let sf_ptr = match il2cpp.stream.peek_ptr_at(sf_file_off) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if sf_ptr == 0 {
+                continue; // No static fields allocated (class not yet initialized)
+            }
+
+            classes_with_sf += 1;
+            let td = &metadata.type_defs[tdi as usize];
+            let type_name = metadata.get_string_from_index(td.name_index).unwrap_or_default();
+
+            let field_start = td.field_start as usize;
+            let field_count = td.field_count as usize;
+
+            let computed_offsets = crate::il2cpp::field_layout::compute_static_field_offsets(td, metadata, il2cpp);
+
+            for fi in 0..field_count {
+                let global_fi = field_start + fi;
+                let Some(field_def) = metadata.field_defs.get(global_fi) else {
+                    continue;
+                };
+                let Some(field_type) = il2cpp.types.get(field_def.type_index as usize) else {
+                    continue;
+                };
+
+                let is_static = (field_type.attrs & field_attributes::STATIC) != 0;
+                let is_literal = (field_type.attrs & field_attributes::LITERAL) != 0;
+                let has_field_rva = (field_type.attrs & field_attributes::HAS_FIELD_RVA) != 0;
+
+                if !is_static || is_literal || has_field_rva {
+                    continue;
+                }
+
+                let raw_offset = il2cpp.get_raw_field_offset(tdi as usize, fi, global_fi);
+                let decoded = decode_field_offset(raw_offset);
+
+                let effective = if decoded.effective <= 0 {
+                    computed_offsets.as_ref()
+                        .and_then(|v| v.get(fi).copied())
+                        .unwrap_or(0) as i32
+                } else {
+                    decoded.effective
+                };
+
+                let abs_addr = sf_ptr.wrapping_add(effective as u64);
+
+                let field_name = metadata
+                    .get_string_from_index(field_def.name_index)
+                    .unwrap_or_else(|_| format!("field_{global_fi}"));
+
+                maps.static_field_layouts
+                    .entry(abs_addr)
+                    .or_insert((field_name, type_name.to_string()));
+
+                fields_mapped += 1;
+            }
+        }
+
+        crate::dbg_eprintln!(
+            "[debug] populate_static_fields_from_data_sections: {} classes with non-null static_fields, {} fields mapped",
+            classes_with_sf, fields_mapped
+        );
+        crate::dbg_eprintln!("[debug] populate_static_fields_from_data_sections: static_field_layouts now has {} entries", maps.static_field_layouts.len());
+
+        // --- NEW: GOT relocation-based resolution ---
+        // Parse ELF relocations to find what each GOT entry should point to at runtime.
+        // The relocation addends are the actual static field storage addresses.
+        let got_reloc_fields = Self::populate_static_fields_from_got_relocations(maps, metadata, il2cpp, &class_addr_to_tdi);
+
+        // --- Fallback: if no static_fields pointers were found (static binary), ---
+        // use sequential page assignment as a best-effort heuristic.
+        if classes_with_sf == 0 && got_reloc_fields == 0 && !classes_with_static.is_empty() {
+            crate::dbg_eprintln!("[debug] no non-null static_fields found, falling back to sequential page assignment");
+            Self::populate_static_fields_sequential(maps, metadata, il2cpp, &classes_with_static);
+        }
+    }
+
+    /// Parse ELF relocations to resolve static fields via GOT entries.
+    ///
+    /// In Unity 2022+, code accesses static fields through GOT entries like
+    /// `*(nint*)(0x2f6a000 + 792)`. The GOT entry at 0x2f6a000 has a relocation
+    /// that tells us what it should point to at runtime (the addend). The addend
+    /// is the static field storage address. We map (GOT_address + field_offset)
+    /// to (class_name, field_name).
+    fn populate_static_fields_from_got_relocations(
+        maps: &mut resolve::ResolveMaps,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
+        class_addr_to_tdi: &HashMap<u64, i32>,
+    ) -> usize {
+        // Use the pre-parsed GOT relocations from the ELF parser
+        if il2cpp.got_relative_relocations.is_empty() {
+            return 0;
+        }
+
+        crate::dbg_eprintln!("[debug] GOT relocations: {} entries", il2cpp.got_relative_relocations.len());
+
+        // Collect unique addends (target addresses) from GOT relocations
+        let mut unique_addends: Vec<u64> = il2cpp.got_relative_relocations.values().copied().collect();
+        unique_addends.sort_unstable();
+        unique_addends.dedup();
+
+        crate::dbg_eprintln!("[debug] Unique addends: {}", unique_addends.len());
+
+        // Collect classes with multi-constraint fingerprints
+        #[allow(dead_code)] // class_addr and type_signature_hash are part of the fingerprint schema for future matching
+        struct ClassFingerprint {
+            class_addr: u64,
+            tdi: i32,
+            static_fields_size: u32,
+            static_field_count: u32,
+            type_signature_hash: u64,
+        }
+
+        let mut class_fingerprints: Vec<ClassFingerprint> = Vec::new();
+        if !il2cpp.is_32bit {
+            let static_fields_size_offset: u64 = 228;
+            for (&class_addr, &tdi) in class_addr_to_tdi {
+                let sfs_file_off = match il2cpp.map_vatr(class_addr.wrapping_add(static_fields_size_offset)) {
+                    Ok(off) => off,
+                    Err(_) => continue,
+                };
+                let static_fields_size = il2cpp.stream.peek_u32_at(sfs_file_off).unwrap_or(0);
+                if static_fields_size == 0 {
+                    continue;
+                }
+
+                // Compute static field count and type signature hash
+                let Some(td) = metadata.type_defs.get(tdi as usize) else {
+                    continue;
+                };
+                let field_start = td.field_start as usize;
+                let field_count = td.field_count as usize;
+                let is_value_type = td.is_value_type();
+
+                let mut static_field_count = 0u32;
+                let mut type_sig_hash: u64 = 0;
+
+                for fi in 0..field_count {
+                    let global_fi = field_start + fi;
+                    let Some(field_def) = metadata.field_defs.get(global_fi) else {
+                        continue;
+                    };
+                    let Some(field_il2cpp_type) = il2cpp.types.get(field_def.type_index as usize) else {
+                        continue;
+                    };
+                    let is_static = (field_il2cpp_type.attrs & 0x0010) != 0;
+                    if !is_static {
+                        continue;
+                    }
+
+                    static_field_count += 1;
+
+                    // Get field offset and type for signature
+                    let raw_offset = il2cpp.get_field_offset_from_index(
+                        tdi as usize, fi, global_fi, is_value_type, is_static,
+                    );
+                    let type_idx = field_def.type_index as u64;
+
+                    // Simple hash: combine offset and type_index
+                    type_sig_hash = type_sig_hash.wrapping_add(
+                        (raw_offset as u64).wrapping_mul(31).wrapping_add(type_idx)
+                    );
+                }
+
+                if static_field_count > 0 {
+                    class_fingerprints.push(ClassFingerprint {
+                        class_addr,
+                        tdi,
+                        static_fields_size,
+                        static_field_count,
+                        type_signature_hash: type_sig_hash,
+                    });
+                }
+            }
+        }
+
+        crate::dbg_eprintln!("[debug] Classes with static fields: {}", class_fingerprints.len());
+
+        // Partition addends into blocks using gap threshold
+        let gap_threshold = 0x1000u64;
+        let mut blocks: Vec<(u64, u64)> = Vec::new();
+        if !unique_addends.is_empty() {
+            let mut block_start = unique_addends[0];
+            let mut block_end = unique_addends[0];
+            for &addr in &unique_addends[1..] {
+                if addr - block_end > gap_threshold {
+                    blocks.push((block_start, block_end - block_start + 8));
+                    block_start = addr;
+                }
+                block_end = addr;
+            }
+            blocks.push((block_start, block_end - block_start + 8));
+        }
+
+        crate::dbg_eprintln!("[debug] Blocks partitioned: {}", blocks.len());
+
+        // Compute block fingerprints (size + entry count)
+        #[allow(dead_code)] // block_idx retained for future block-indexed lookups
+        struct BlockFingerprint {
+            block_idx: usize,
+            block_start: u64,
+            block_size: u64,
+            entry_count: u32,
+        }
+
+        let mut block_fingerprints: Vec<BlockFingerprint> = Vec::new();
+        for (block_idx, &(block_start, block_size)) in blocks.iter().enumerate() {
+            let entry_count = unique_addends.iter()
+                .filter(|&&addr| addr >= block_start && addr < block_start + block_size)
+                .count() as u32;
+
+            block_fingerprints.push(BlockFingerprint {
+                block_idx,
+                block_start,
+                block_size,
+                entry_count,
+            });
+        }
+
+        // Sort by size for efficient matching
+        block_fingerprints.sort_by_key(|b| b.block_size);
+
+        // Multi-constraint matching with confidence scoring
+        let mut got_to_tdi: HashMap<u64, i32> = HashMap::new();
+        let mut used_classes = std::collections::HashSet::new();
+        let mut high_confidence_matches = 0;
+        let mut low_confidence_rejected = 0;
+
+        for block_fp in &block_fingerprints {
+            let mut best_match: Option<(usize, f64)> = None; // (class_idx, score)
+            let mut best_score = 0.0f64;
+
+            for (class_idx, class_fp) in class_fingerprints.iter().enumerate() {
+                if used_classes.contains(&class_idx) {
+                    continue;
+                }
+
+                // Constraint 1: Size match (weight: 0.6)
+                if block_fp.block_size > class_fp.static_fields_size as u64 {
+                    continue; // Block can't be larger than class
+                }
+                let size_diff = class_fp.static_fields_size as u64 - block_fp.block_size;
+                // Lenient size scoring: allow up to 512-byte difference with reasonable scores
+                let size_score = if size_diff == 0 {
+                    1.0
+                } else {
+                    1.0 / (1.0 + size_diff as f64 / 512.0)
+                };
+
+                // Constraint 2: Field count match (weight: 0.3)
+                let count_diff = (class_fp.static_field_count as i32 - block_fp.entry_count as i32).abs();
+                // More lenient: up to 8 fields difference still scores 0.5
+                let count_score = if count_diff == 0 {
+                    1.0
+                } else {
+                    1.0 / (1.0 + count_diff as f64 / 8.0)
+                };
+
+                // Constraint 3: Type signature similarity (weight: 0.1)
+                // We can't directly compare signatures, but we can penalize large mismatches
+                let sig_score = 0.5; // Neutral score since we can't easily compare
+
+                // Weighted total score
+                let total_score = 0.6 * size_score + 0.3 * count_score + 0.1 * sig_score;
+
+                if total_score > best_score {
+                    best_score = total_score;
+                    best_match = Some((class_idx, total_score));
+                }
+            }
+
+            // Confidence threshold: only accept matches with score >= 0.50
+            // Lowered from 0.60 to improve coverage. Size matching is reliable,
+            // so we trust it even with moderate size differences.
+            if let Some((class_idx, score)) = best_match {
+                if score >= 0.50 {
+                    let class_fp = &class_fingerprints[class_idx];
+                    used_classes.insert(class_idx);
+                    high_confidence_matches += 1;
+
+                    // Map GOT slots to this class
+                    for &addr in &unique_addends {
+                        if addr >= block_fp.block_start && addr < block_fp.block_start + block_fp.block_size {
+                            for (&got_addr, &addend) in &il2cpp.got_relative_relocations {
+                                if addend == addr {
+                                    got_to_tdi.insert(got_addr, class_fp.tdi);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    low_confidence_rejected += 1;
+                }
+            }
+        }
+
+        crate::dbg_eprintln!("[debug] Multi-constraint matching: {} high-confidence matches, {} low-confidence rejected",
+            high_confidence_matches, low_confidence_rejected);
+        crate::dbg_eprintln!("[debug] GOT→class mapping: {} entries", got_to_tdi.len());
+
+        // Build the final field map: (GOT_address + field_offset) → (field_name, type_name)
+        let mut fields_mapped = 0;
+        for (&got_addr, &tdi) in &got_to_tdi {
+            let Some(td) = metadata.type_defs.get(tdi as usize) else {
+                continue;
+            };
+            let type_name = metadata.get_string_from_index(td.name_index).unwrap_or_default();
+
+            let field_start = td.field_start as usize;
+            let field_count = td.field_count as usize;
+
+            let computed_offsets = crate::il2cpp::field_layout::compute_static_field_offsets(td, metadata, il2cpp);
+
+            for fi in 0..field_count {
+                let global_fi = field_start + fi;
+                let Some(field_def) = metadata.field_defs.get(global_fi) else {
+                    continue;
+                };
+                let Some(field_il2cpp_type) = il2cpp.types.get(field_def.type_index as usize) else {
+                    continue;
+                };
+                let is_static = (field_il2cpp_type.attrs & 0x0010) != 0;
+                if !is_static {
+                    continue;
+                }
+
+                let raw_offset_val = il2cpp.get_raw_field_offset(tdi as usize, fi, global_fi);
+                let decoded = crate::il2cpp::field_layout::decode_field_offset(raw_offset_val);
+                let raw_offset = if decoded.effective <= 0 {
+                    computed_offsets.as_ref()
+                        .and_then(|v| v.get(fi).copied())
+                        .unwrap_or(0)
+                } else {
+                    decoded.effective as u32
+                };
+                let got_field_addr = got_addr.wrapping_add(raw_offset as u64);
+
+                let field_name = metadata
+                    .get_string_from_index(field_def.name_index)
+                    .unwrap_or_else(|_| format!("field_{global_fi}"));
+
+                if fields_mapped < 10 {
+                    crate::dbg_eprintln!("[debug] GOT: got_addr=0x{:x}, fi={}, raw_offset={}, got_field_addr=0x{:x}, field={}",
+                        got_addr, fi, raw_offset, got_field_addr, field_name);
+                }
+
+                maps.static_field_layouts
+                    .entry(got_field_addr)
+                    .or_insert((field_name.clone(), type_name.to_string()));
+                fields_mapped += 1;
+            }
+        }
+
+        crate::dbg_eprintln!("[debug] GOT-based mapping: {} fields mapped", fields_mapped);
+        crate::dbg_eprintln!("[debug] After GOT: static_field_layouts has {} entries", maps.static_field_layouts.len());
+        fields_mapped
+    }
+
+    /// Fallback: assign static field base addresses sequentially, one page per class.
+    /// This is a best-effort heuristic for static binaries where Il2CppClass.static_fields
+    /// is null (not yet initialized at dump time).
+    fn populate_static_fields_sequential(
+        maps: &mut resolve::ResolveMaps,
+        metadata: &Metadata,
+        il2cpp: &Il2Cpp,
+        classes_with_static: &[(i32, u32)],
+    ) {
+        use crate::il2cpp::enums::field_attributes;
+        use crate::il2cpp::field_layout::decode_field_offset;
+
+        let page_size = 0x1000u64;
+
+        let total_static_size: u64 = classes_with_static.iter().map(|(_, s)| *s as u64).sum();
+
+        // Find the data section that could contain static fields
+        let mut target_section: Option<&crate::search::SearchSection> = None;
+        for section in &il2cpp.data_sections {
+            let memsz = section.address_end - section.address;
+            let filesz = section.offset_end - section.offset;
+            if memsz >= total_static_size {
+                let is_bss = filesz < memsz / 2;
+                let is_better = match target_section {
+                    None => true,
+                    Some(prev) => {
+                        let prev_memsz = prev.address_end - prev.address;
+                        let prev_filesz = prev.offset_end - prev.offset;
+                        let prev_is_bss = prev_filesz < prev_memsz / 2;
+                        if prev_is_bss && !is_bss {
+                            true
+                        } else if !prev_is_bss && is_bss {
+                            false
+                        } else {
+                            section.address > prev.address
+                        }
+                    }
+                };
+                if is_better {
+                    target_section = Some(section);
+                }
+            }
+        }
+
+        let Some(section) = target_section else {
+            crate::dbg_eprintln!("[debug] sequential fallback: no suitable data section found");
+            return;
+        };
+
+        crate::dbg_eprintln!("[debug] sequential fallback: using data section {:#x} - {:#x}", section.address, section.address_end);
+
+        let raw_start = section.address_end.saturating_sub(total_static_size);
+        let first_page = raw_start & !(page_size - 1);
+        let first_page = first_page.max((section.address + page_size - 1) & !(page_size - 1));
+
+        let mut current_base = first_page;
+        let mut fields_mapped = 0;
+
+        for &(tdi, size) in classes_with_static {
+            if current_base + size as u64 > section.address_end {
+                break;
+            }
+
+            let td = &metadata.type_defs[tdi as usize];
+            let type_name = metadata.get_string_from_index(td.name_index).unwrap_or_default();
+            let field_start = td.field_start as usize;
+            let field_count = td.field_count as usize;
+
+            let computed_offsets = crate::il2cpp::field_layout::compute_static_field_offsets(td, metadata, il2cpp);
+
+            for fi in 0..field_count {
+                let global_fi = field_start + fi;
+                let Some(field_def) = metadata.field_defs.get(global_fi) else { continue; };
+                let Some(field_type) = il2cpp.types.get(field_def.type_index as usize) else { continue; };
+
+                let is_static = (field_type.attrs & field_attributes::STATIC) != 0;
+                let is_literal = (field_type.attrs & field_attributes::LITERAL) != 0;
+                let has_field_rva = (field_type.attrs & field_attributes::HAS_FIELD_RVA) != 0;
+
+                if !is_static || is_literal || has_field_rva {
+                    continue;
+                }
+
+                let raw_offset = il2cpp.get_raw_field_offset(tdi as usize, fi, global_fi);
+                let decoded = decode_field_offset(raw_offset);
+                let effective = if decoded.effective <= 0 {
+                    computed_offsets.as_ref()
+                        .and_then(|v| v.get(fi).copied())
+                        .unwrap_or(0) as i32
+                } else {
+                    decoded.effective
+                };
+
+                let abs_addr = current_base.wrapping_add(effective as u64);
+                let field_name = metadata
+                    .get_string_from_index(field_def.name_index)
+                    .unwrap_or_else(|_| format!("field_{global_fi}"));
+
+                maps.static_field_layouts
+                    .entry(abs_addr)
+                    .or_insert((field_name, type_name.to_string()));
+                fields_mapped += 1;
+            }
+
+            current_base += page_size;
+        }
+
+        crate::dbg_eprintln!("[debug] sequential fallback: mapped {} static fields", fields_mapped);
+    }
+
+
     /// Does an image/assembly name pass the configured include filters?
     pub fn assembly_allowed(&self, image_name: &str) -> bool {
         crate::output::pseudo_c::assembly_matches(image_name, &self.include_assemblies)
@@ -3587,11 +6330,7 @@ struct HelperCounts {
     x1_arg: u32,
 }
 
-fn eval_arg(
-    op: &Operand,
-    consts: &HashMap<String, ArgVal>,
-    data_ranges: &[(u64, u64)],
-) -> ArgVal {
+fn eval_arg(op: &Operand, consts: &HashMap<String, ArgVal>, data_ranges: &[(u64, u64)]) -> ArgVal {
     let is_data = |a: u64| a >= 0x10000 && data_ranges.iter().any(|&(lo, hi)| a >= lo && a < hi);
     match op {
         Operand::Immediate(v) => {
@@ -3679,7 +6418,9 @@ fn chase_thunk_root(
         if managed.contains_key(&cur) {
             return cur;
         }
-        let Some(bytes) = il2cpp.read_bytes_at_rva(cur, 64) else { return cur };
+        let Some(bytes) = il2cpp.read_bytes_at_rva(cur, 64) else {
+            return cur;
+        };
         let Some(insns) = lift_helper_body(il2cpp, cur, &bytes, 8, is_arm64, is_x64) else {
             return cur;
         };
@@ -3713,11 +6454,15 @@ fn is_thunk_body(
     if managed.contains_key(&rva) {
         return false;
     }
-    let Some(bytes) = il2cpp.read_bytes_at_rva(rva, 64) else { return false };
+    let Some(bytes) = il2cpp.read_bytes_at_rva(rva, 64) else {
+        return false;
+    };
     let Some(insns) = lift_helper_body(il2cpp, rva, &bytes, 8, is_arm64, is_x64) else {
         return false;
     };
-    insns.first().is_some_and(|i| matches!(i.op, ir::Op::Jump(_)))
+    insns
+        .first()
+        .is_some_and(|i| matches!(i.op, ir::Op::Jump(_)))
 }
 
 /// Recover an x64 trailing tail call to a NON-managed helper as `Call + Return`.
@@ -3823,7 +6568,9 @@ fn reaches_call(
     if !visited.insert(from) {
         return false;
     }
-    let Some(bytes) = il2cpp.read_bytes_at_rva(from, 256) else { return false };
+    let Some(bytes) = il2cpp.read_bytes_at_rva(from, 256) else {
+        return false;
+    };
     let Some(insns) = lift_helper_body(il2cpp, from, &bytes, 96, is_arm64, is_x64) else {
         return false;
     };
@@ -3935,7 +6682,9 @@ fn first_callee(
         if managed.contains_key(&cur) {
             return None; // reached a managed method — not a helper
         }
-        let Some(bytes) = il2cpp.read_bytes_at_rva(cur, 128) else { return None };
+        let Some(bytes) = il2cpp.read_bytes_at_rva(cur, 128) else {
+            return None;
+        };
         let Some(insns) = lift_helper_body(il2cpp, cur, &bytes, 32, is_arm64, is_x64) else {
             return None;
         };
@@ -3991,9 +6740,7 @@ fn select_object_new_fallback(
     let mut cands: Vec<(u64, u32)> = counts
         .iter()
         .filter(|(t, c)| {
-            !excluded.contains(*t)
-                && c.total >= 6
-                && (c.klass_arg as f32 / c.total as f32) >= 0.7
+            !excluded.contains(*t) && c.total >= 6 && (c.klass_arg as f32 / c.total as f32) >= 0.7
         })
         .map(|(&t, c)| (t, c.total))
         .collect();
@@ -4035,7 +6782,11 @@ fn select_box_fallback(
 fn fmt_rvas(rvas: &[u64]) -> String {
     match rvas.len() {
         0 => "none".to_string(),
-        _ => rvas.iter().map(|r| format!("0x{r:X}")).collect::<Vec<_>>().join(", "),
+        _ => rvas
+            .iter()
+            .map(|r| format!("0x{r:X}"))
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 
@@ -4075,13 +6826,20 @@ impl RecoveryContext {
                     continue;
                 }
             }
-            let n = if size == 0 { 64 } else { size.min(128) as usize };
-            let Some(bytes) = il2cpp.read_bytes_at_rva(*rva, n) else { continue };
+            let n = if size == 0 {
+                64
+            } else {
+                size.min(128) as usize
+            };
+            let Some(bytes) = il2cpp.read_bytes_at_rva(*rva, n) else {
+                continue;
+            };
             if is_arm64 {
                 // walk words; record direct B/BL; stop at first RET
                 let mut i = 0usize;
                 while i + 4 <= bytes.len() {
-                    let word = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    let word =
+                        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
                     let top = word >> 26;
                     if top == 0b000101 || top == 0b100101 {
                         // B / BL: pc-relative imm26
@@ -4103,7 +6861,12 @@ impl RecoveryContext {
                 while i + 5 <= bytes.len() && i < 128 {
                     let b0 = bytes[i];
                     if b0 == 0xE8 || b0 == 0xE9 {
-                        let rel = i32::from_le_bytes([bytes[i + 1], bytes[i + 2], bytes[i + 3], bytes[i + 4]]);
+                        let rel = i32::from_le_bytes([
+                            bytes[i + 1],
+                            bytes[i + 2],
+                            bytes[i + 3],
+                            bytes[i + 4],
+                        ]);
                         let tgt = (*rva as i64 + i as i64 + 5 + rel as i64) as u64;
                         if !self.maps.methods_by_rva.contains_key(&tgt) {
                             wrappers.entry(tgt).or_default().push(m.clone());
@@ -4115,7 +6878,7 @@ impl RecoveryContext {
                 }
             }
         }
-        let dbg = std::env::var("ILR_ICALL").is_ok();
+        let dbg = crate::recovery::env_flags::flag("ILR_ICALL");
         if dbg {
             let mut flat: Vec<(u64, usize)> = wrappers
                 .iter()
@@ -4155,7 +6918,10 @@ fn build_parent_chains(metadata: &Metadata, il2cpp: &Il2Cpp) -> HashMap<i32, Vec
     // resolve each type's parent once (parent_index → types entry → klass)
     let mut parents: Vec<Option<i32>> = vec![None; n];
     for tdi in 0..n {
-        if let Some(pt) = il2cpp.types.get(metadata.type_defs[tdi].parent_index as usize) {
+        if let Some(pt) = il2cpp
+            .types
+            .get(metadata.type_defs[tdi].parent_index as usize)
+        {
             let te = Il2CppTypeEnum::from_u8(pt.type_enum);
             if matches!(
                 te,

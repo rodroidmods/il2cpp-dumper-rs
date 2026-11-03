@@ -56,6 +56,7 @@ pub trait TypeOracle {
     }
 }
 
+#[derive(Clone)]
 pub struct LocalInfo {
     pub slot_origin: String,
     pub ty: ManagedType,
@@ -87,9 +88,17 @@ pub struct LocalInfo {
     /// signature). Caller-saved temporaries (`x9..x18`) are NOT incoming, so a
     /// read of one the body never wrote is still a genuine lost definition.
     pub is_incoming_arg: bool,
+    /// Defined by a CALL's ABI clobber rather than by a listing instruction.
+    ///
+    /// A call overwrites the caller-saved FP return registers; the SSA
+    /// definition exists so post-call reads do not reuse pre-call versions,
+    /// but there is no instruction to point at. The value is whatever the
+    /// callee delivered (or garbage), so the undefined-local oracle excuses
+    /// it; it is NOT an incoming argument and keeps its `vN` spelling.
+    pub is_call_clobber: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LocalTable {
     pub infos: Vec<LocalInfo>,
     /// version id → table index
@@ -196,10 +205,7 @@ pub fn unclaim_written_entry_this(table: &mut LocalTable, insns: &[super::ir::In
     }
 }
 
-pub fn create(
-    ssa_version_slot: &HashMap<u32, String>,
-    seed: &SeedInfo,
-) -> LocalTable {
+pub fn create(ssa_version_slot: &HashMap<u32, String>, seed: &SeedInfo) -> LocalTable {
     let mut table = LocalTable {
         param_names: seed.param_names.clone(),
         param_comp_names: seed.param_comp_names.clone(),
@@ -219,8 +225,8 @@ pub fn create(
     // matter what class the parameter was — a `Vector3` parameter sits in
     // s0-s2, not x1, and the x-register it got instead was stale scratch.
     //
-    // Slot origins: arm64 names SIMD registers by view width ("vs0" for the
-    // 32-bit s-view, "vd0" for the 64-bit d-view); x86-64 SysV normalizes
+    // Slot origins: arm64 names SIMD registers by view width (flattened `vs`
+    // lane indices for the 32-bit s-view, "vd0" for the 64-bit d-view); x86-64 SysV normalizes
     // XMM to "vf0".."vf7". Pick the scheme from the registers present.
     let fp_arm64 = by_slot_order.iter().any(|v| {
         let o = &ssa_version_slot[v];
@@ -250,7 +256,10 @@ pub fn create(
             fp_arm64,
             sret_shift,
         )
-    }.into_iter().map(|(reg, pi, comp)| (reg, (pi, comp))).collect();
+    }
+    .into_iter()
+    .map(|(reg, pi, comp)| (reg, (pi, comp)))
+    .collect();
 
     // Every register an ABI can hand a value to a function in, so a slot the
     // declared signature does not cover can be recognised as incoming (see
@@ -260,7 +269,8 @@ pub fn create(
     //   * the callee-saved `x19..x28`, whose ENTRY value is the caller's — the
     //     prologue spills it and the epilogue restores it, and the method
     //     itself never defines it;
-    //   * the FP argument registers `v0..v7` (and FP callee-saved `v8..v15`).
+    //   * the FP argument registers `v0..v7` (all four S lanes), and the
+    //     callee-saved low 64 bits of `v8..v15` (S lanes 0 and 1).
     // Deliberately EXCLUDED are the caller-saved temporaries `x9..x18`: they
     // have no incoming meaning, so a read of one the body never wrote is a
     // genuine lost definition and must keep being reported.
@@ -291,7 +301,9 @@ pub fn create(
             // (sret) pointer — incoming, never computed by the callee.
             abi_arg_names.insert(format!("x{i}"));
             if i < 8 {
-                abi_arg_names.insert(format!("vs{i}"));
+                for lane in 0..4 {
+                    abi_arg_names.insert(format!("vs{}", i * 4 + lane));
+                }
                 abi_arg_names.insert(format!("vd{i}"));
             }
         }
@@ -299,7 +311,10 @@ pub fn create(
             abi_arg_names.insert(format!("x{i}"));
         }
         for i in 8..16 {
-            abi_arg_names.insert(format!("vs{i}"));
+            // AAPCS64 preserves only the low 64 bits of v8-v15.
+            for lane in 0..2 {
+                abi_arg_names.insert(format!("vs{}", i * 4 + lane));
+            }
             abi_arg_names.insert(format!("vd{i}"));
         }
     }
@@ -323,6 +338,7 @@ pub fn create(
             param_comp: None,
             is_return_buffer: false,
             is_incoming_arg: false,
+            is_call_clobber: false,
         };
         // The indirect-result buffer occupies `x0` and is an INCOMING value the
         // callee only ever WRITES through — never `this`, never a parameter.
@@ -335,12 +351,36 @@ pub fn create(
                 None => ManagedType::Class(super::types::NamedType::object()),
             };
             info.is_this = true;
+            // Count `this` as a seeded typed parameter.
+            {
+                use std::sync::atomic::Ordering;
+                super::timing::PARAMS_SEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                super::timing::PARAMS_SEEDED_TYPED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if is_entry_version {
             if let Some(&(pi, comp)) = assign.get(&origin) {
-                info.ty = seed.param_types[pi].clone();
+                // An HFA parameter occupies one FP register per float field.
+                // The local is that scalar component, not a second copy of the
+                // aggregate type. Giving (say) `s0` the type Vector3 let field
+                // resolution treat it as an aggregate base, producing invalid
+                // chains such as `position.x.y` when the ABI spill of the
+                // parameter was analyzed as stack memory.
+                info.ty = if comp.is_some() {
+                    ManagedType::Primitive(PrimKind::R4)
+                } else {
+                    seed.param_types[pi].clone()
+                };
                 info.is_param = Some(pi);
                 info.param_comp = comp;
+                // Count parameter seeding for impact measurement.
+                {
+                    use std::sync::atomic::Ordering;
+                    super::timing::PARAMS_SEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    if !matches!(info.ty, ManagedType::Unknown) {
+                        super::timing::PARAMS_SEEDED_TYPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             } else if !info.is_this && !info.is_return_buffer && abi_arg_names.contains(&origin) {
                 // An argument register the declared signature does not cover.
                 // Only the ENTRY version can be incoming; a later version is
@@ -389,7 +429,6 @@ fn abi_arm32_param_locations(
     out
 }
 
-
 /// ABI register assignment for a method's declared parameters (AAPCS64 / x64
 /// SysV), returned in PARAMETER order as `(register, param index, float
 /// component)`.
@@ -431,8 +470,13 @@ pub fn abi_param_registers(
                 _ => PrimKind::R4,
             };
             if fp < 8 {
-                let name = if fp_arm64 {
-                    format!("{}{}", fp_prefix(w), fp)
+                let name = if fp_arm64 && w != PrimKind::R8 {
+                    // Flattened lane-0 identity: scalar `sN` is lane 0 of `vN`
+                    // and the lifter names lanes `vs{4*reg + lane}`. Naming
+                    // the parameter `vs{fp}` (the ARGUMENT ORDINAL) never
+                    // matched the register the callee actually read, so every
+                    // float argument beyond s0 became `__abi`.
+                    format!("vs{}", fp * 4)
                 } else {
                     format!("{}{}", fp_prefix(w), fp)
                 };
@@ -442,7 +486,8 @@ pub fn abi_param_registers(
         } else if is_hfa {
             for (k, _name) in comps.iter().enumerate() {
                 if fp + k < 8 {
-                    out.push((format!("vs{}", fp + k), pi, Some(k)));
+                    // HFA component k is s{fp+k} = lane 0 of v{fp+k}.
+                    out.push((format!("vs{}", (fp + k) * 4), pi, Some(k)));
                 }
             }
             fp = fp.saturating_add(comps.len());
@@ -476,7 +521,11 @@ pub fn abi_param_registers(
 fn canon_reg(name: &str) -> String {
     let mut chars = name.chars();
     if chars.next() == Some('v') {
-        let digits: String = name[1..].chars().skip(1).take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = name[1..]
+            .chars()
+            .skip(1)
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         if !digits.is_empty() {
             return format!("v{digits}");
         }
@@ -523,14 +572,24 @@ pub fn align_call_arguments(
         if !matches!(insn.op, Op::Call | Op::CallVoid) {
             continue;
         }
-        let sig = match insn.operands.first() {
-            Some(Op_::Method(m)) => m.sig.clone(),
+        let (sig, resolved_method) = match insn.operands.first() {
+            Some(Op_::Method(m)) => (m.sig.clone(), None),
             Some(Op_::Immediate(a)) => match resolve(*a as u64) {
-                Some(m) => m.sig,
+                Some(m) => {
+                    let sig = m.sig.clone();
+                    (sig, Some(m))
+                }
                 None => continue,
             },
             _ => continue,
         };
+        // Embed the resolved method so downstream passes (propagate_types)
+        // can see the callee's parameter types without re-resolving.
+        if let Some(m) = resolved_method {
+            insn.operands[0] = Op_::Method(m);
+            use std::sync::atomic::Ordering;
+            super::timing::CALLSITE_EMBEDDED.fetch_add(1, Ordering::Relaxed);
+        }
         let arg_start = if has_result_slot { 2 } else { 1 };
         // operand register-name → operand, over the whole dumped region
         let mut by_reg: HashMap<String, Op_> = HashMap::new();
@@ -563,7 +622,9 @@ pub fn align_call_arguments(
             .count();
         for (i, op) in dump.iter().enumerate() {
             let Some(v) = op.as_local() else { continue };
-            let Some(&li) = table.index_of.get(&v) else { continue };
+            let Some(&li) = table.index_of.get(&v) else {
+                continue;
+            };
             if i < int_entries {
                 by_reg.insert(format!("x{i}"), op.clone());
             } else {
@@ -639,8 +700,7 @@ pub fn align_call_arguments(
                 super::timing::ABI_MISS_BY_POS[0].fetch_add(1, Ordering::Relaxed);
             }
             for (pi, beyond) in &miss_params {
-                super::timing::ABI_MISS_BY_POS[(*pi + 1).min(10)]
-                    .fetch_add(1, Ordering::Relaxed);
+                super::timing::ABI_MISS_BY_POS[(*pi + 1).min(10)].fetch_add(1, Ordering::Relaxed);
                 if *beyond {
                     super::timing::ABI_MISS_STACK.fetch_add(1, Ordering::Relaxed);
                 }
@@ -728,11 +788,18 @@ fn rooted_versions(insns: &[Insn], table: &LocalTable) -> std::collections::Hash
     //    PROPAGATION (`Move`/`Phi` reading only locals — rootedness inherits).
     let mut inherit: Vec<(u32, Vec<u32>)> = Vec::new();
     for insn in insns {
-        let Some(pos) = Insn::dest_position(&insn.op) else { continue };
-        let Some(Op_::Local(d)) = insn.operands.get(pos) else { continue };
+        let Some(pos) = Insn::dest_position(&insn.op) else {
+            continue;
+        };
+        let Some(Op_::Local(d)) = insn.operands.get(pos) else {
+            continue;
+        };
         match insn.op {
             Op::Move | Op::Phi => {
-                let srcs: Vec<u32> = insn.operands.iter().skip(pos + 1)
+                let srcs: Vec<u32> = insn
+                    .operands
+                    .iter()
+                    .skip(pos + 1)
                     .filter_map(|o| o.as_local())
                     .collect();
                 // No local source (immediate, memory read, field, `AddressOf`)
@@ -890,16 +957,14 @@ pub fn rewrite_pinned_copies(insns: &mut [Insn], seed: &SeedInfo) {
     }
     let abi_arg_regs = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
     let caller_saved: &[&str] = &[
-        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
-        "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+        "x14", "x15", "x16", "x17",
     ];
     let this_off = usize::from(!seed.is_static);
 
     // identity of a register: Some(reg) where reg is "x0" (receiver) or a
     // parameter register currently holding that param's incoming value.
-    let identity_of_src = |s: &str,
-                           holds: &HashMap<String, String>|
-     -> Option<String> {
+    let identity_of_src = |s: &str, holds: &HashMap<String, String>| -> Option<String> {
         // The receiver identity is LIVE, not eternal.
         //
         // This used to `return Some("x0")` unconditionally, asserting that x0
@@ -971,7 +1036,10 @@ pub fn rewrite_pinned_copies(insns: &mut [Insn], seed: &SeedInfo) {
         if let Some(d) = &dst_reg {
             holds.remove(d);
         }
-        if matches!(insn.op, Op::Call | Op::IndirectCall | Op::NewObj(_) | Op::NewArr(_)) {
+        if matches!(
+            insn.op,
+            Op::Call | Op::IndirectCall | Op::NewObj(_) | Op::NewArr(_)
+        ) {
             for r in caller_saved {
                 holds.remove(*r);
             }
@@ -981,7 +1049,9 @@ pub fn rewrite_pinned_copies(insns: &mut [Insn], seed: &SeedInfo) {
         eprintln!(
             "[abicopy] rva={:#x} pins: {:?}",
             insns.first().map(|i| i.address).unwrap_or(0),
-            pins.iter().map(|(i, r, _)| (i, r.as_str())).collect::<Vec<_>>()
+            pins.iter()
+                .map(|(i, r, _)| (i, r.as_str()))
+                .collect::<Vec<_>>()
         );
     }
     if pins.is_empty() {
@@ -1122,7 +1192,10 @@ pub fn rewrite_pinned_copies(insns: &mut [Insn], seed: &SeedInfo) {
         // Restore the pin copy as a real move so the pin register keeps a
         // definition and SSA tracks the correct value.
         let mut clobbered: Vec<String> = Vec::new();
-        if matches!(insn.op, Op::Call | Op::IndirectCall | Op::NewObj(_) | Op::NewArr(_)) {
+        if matches!(
+            insn.op,
+            Op::Call | Op::IndirectCall | Op::NewObj(_) | Op::NewArr(_)
+        ) {
             clobbered.extend(caller_saved.iter().map(|r| r.to_string()));
         } else if let Some(d) = insn.dest() {
             if let Operand::Register(r) = d {
@@ -1188,7 +1261,10 @@ pub fn rewrite_pinned_copies(insns: &mut [Insn], seed: &SeedInfo) {
         if let Some(d) = &dst_reg {
             rename.remove(d);
         }
-        if matches!(insn.op, Op::Call | Op::IndirectCall | Op::NewObj(_) | Op::NewArr(_)) {
+        if matches!(
+            insn.op,
+            Op::Call | Op::IndirectCall | Op::NewObj(_) | Op::NewArr(_)
+        ) {
             for r in caller_saved {
                 rename.remove(*r);
             }
@@ -1228,8 +1304,16 @@ fn rewrite_reg_operands(insn: &mut Insn, rename: &HashMap<String, String>) {
     }
     let dest_first = matches!(
         insn.op,
-        Op::Move | Op::Arith(_) | Op::FloatArith(_) | Op::Compare(_) | Op::Not
-            | Op::Negate | Op::NewObj(_) | Op::NewArr(_) | Op::Box(_) | Op::LoadLength
+        Op::Move
+            | Op::Arith(_)
+            | Op::FloatArith(_)
+            | Op::Compare(_)
+            | Op::Not
+            | Op::Negate
+            | Op::NewObj(_)
+            | Op::NewArr(_)
+            | Op::Box(_)
+            | Op::LoadLength
             | Op::Select(_)
     );
     for (i, op) in insn.operands.iter_mut().enumerate() {
@@ -1336,7 +1420,10 @@ fn arith_field_address_seed(
     let Operand::Local(bv) = base else {
         return refuse(&FIELD_ADDR_REFUSED_UNPROVEN);
     };
-    let base_ty = table.index_of.get(&bv).map(|&i| table.infos[i].ty.clone())?;
+    let base_ty = table
+        .index_of
+        .get(&bv)
+        .map(|&i| table.infos[i].ty.clone())?;
     // The owner: `Class` directly, or the struct inside one level of `ByRef`
     // (an address an earlier seed produced). `Pointer` is deliberately NOT
     // peeled — see above.
@@ -1454,14 +1541,20 @@ pub fn propagate_types(
     for insn in insns.iter() {
         match &insn.op {
             Op::Move => {
-                let Some(dst) = insn.dest().and_then(|o| o.as_local()) else { continue };
-                let Some(Operand::Local(src)) = insn.operands.get(1) else { continue };
+                let Some(dst) = insn.dest().and_then(|o| o.as_local()) else {
+                    continue;
+                };
+                let Some(Operand::Local(src)) = insn.operands.get(1) else {
+                    continue;
+                };
                 if copy_src.insert(dst, *src).is_some() {
                     copy_src.insert(dst, u32::MAX); // multi-def → ambiguous
                 }
             }
             Op::Phi => {
-                let Some(dst) = insn.dest().and_then(|o| o.as_local()) else { continue };
+                let Some(dst) = insn.dest().and_then(|o| o.as_local()) else {
+                    continue;
+                };
                 let ins: Vec<u32> = insn
                     .operands
                     .iter()
@@ -1499,14 +1592,24 @@ pub fn propagate_types(
         .collect();
     let mut iterations = 0usize;
     let mut changed = true;
-    while changed && iterations < 16 {
+    while changed && iterations < 32 {
         changed = false;
         iterations += 1;
+
+        // T2: a local the code DEREFERENCES is an address. Runs before the
+        // per-op rules so an address cursor is `IntPtr` on the same visit that
+        // first sees the deref, instead of staying `Unknown` (which made
+        // `type_role_name` abstain and kept the `vN` spelling).
+        if seed_address_uses(insns, table) {
+            changed = true;
+        }
 
         for insn in insns.iter_mut() {
             match &insn.op {
                 Op::Move => {
-                    let Some(src_ty) = operand_type(insn.operands.get(1), table, oracle) else { continue };
+                    let Some(src_ty) = operand_type(insn.operands.get(1), table, oracle) else {
+                        continue;
+                    };
                     apply_dest_type(insn, table, src_ty, &mut changed);
                 }
                 Op::Arith(kind) => {
@@ -1539,6 +1642,12 @@ pub fn propagate_types(
                                             table.infos[li].ty,
                                             ManagedType::Unknown
                                                 | ManagedType::Primitive(PrimKind::I8)
+                                                // T2/T1 may have already typed the
+                                                // address cursor `IntPtr`; a proven
+                                                // `ByRef(struct)` is strictly more
+                                                // informative, so the seed still
+                                                // wins. A concrete type never does.
+                                                | ManagedType::IntPtr
                                         ) {
                                             table.infos[li].ty = seed_ty;
                                             changed = true;
@@ -1550,12 +1659,18 @@ pub fn propagate_types(
                         }
                     }
                     if !seeded {
-                        let ty = arith_result_type(*kind, insn.operands.get(1), insn.operands.get(2), table);
+                        let ty = arith_result_type(
+                            *kind,
+                            insn.operands.get(1),
+                            insn.operands.get(2),
+                            table,
+                        );
                         apply_dest_type(insn, table, ty, &mut changed);
                     }
                 }
                 Op::FloatArith(_) | Op::Negate => {
-                    let src = operand_type(insn.operands.get(1), table, oracle).unwrap_or(ManagedType::Unknown);
+                    let src = operand_type(insn.operands.get(1), table, oracle)
+                        .unwrap_or(ManagedType::Unknown);
                     let ty = if matches!(src, ManagedType::Primitive(PrimKind::R8)) {
                         ManagedType::Primitive(PrimKind::R8)
                     } else {
@@ -1564,7 +1679,12 @@ pub fn propagate_types(
                     apply_dest_type(insn, table, ty, &mut changed);
                 }
                 Op::Compare(_) => {
-                    apply_dest_type(insn, table, ManagedType::Primitive(PrimKind::Boolean), &mut changed);
+                    apply_dest_type(
+                        insn,
+                        table,
+                        ManagedType::Primitive(PrimKind::Boolean),
+                        &mut changed,
+                    );
                 }
                 Op::Select(_) => {
                     // The `CSET` / `CSETM` aliases were folded by the lifter to
@@ -1589,7 +1709,8 @@ pub fn propagate_types(
                 }
                 Op::Not => {
                     // bool not vs bitwise — refine from source when known
-                    let src = operand_type(insn.operands.get(1), table, oracle).unwrap_or(ManagedType::Unknown);
+                    let src = operand_type(insn.operands.get(1), table, oracle)
+                        .unwrap_or(ManagedType::Unknown);
                     let ty = match src {
                         ManagedType::Primitive(p @ PrimKind::Boolean) => ManagedType::Primitive(p),
                         ManagedType::Unknown => ManagedType::Primitive(PrimKind::Boolean),
@@ -1609,14 +1730,124 @@ pub fn propagate_types(
                     let ty = ManagedType::Class(std::sync::Arc::new(t.ty.clone()));
                     apply_dest_type(insn, table, ty, &mut changed);
                 }
-                Op::Call => {
+                Op::Call | Op::CallVoid => {
                     if let Some(Operand::Method(m)) = insn.operands.first() {
+                        // Return type → destination local (Call only; CallVoid
+                        // has no result slot, so apply_dest_type is a no-op).
                         let ret = m.sig.ret.clone();
                         apply_dest_type(insn, table, ret, &mut changed);
+                        // Back-propagate parameter types from the callee's
+                        // declared signature to the caller's argument locals.
+                        // After align_call_arguments the operand layout is:
+                        //   Call:    [target, result, receiver?, param0, …]
+                        //   CallVoid:[target, receiver?, param0, …]
+                        let has_result = matches!(insn.op, Op::Call);
+                        let param_start = if has_result {
+                            if m.sig.is_static { 2 } else { 3 }
+                        } else {
+                            if m.sig.is_static { 1 } else { 2 }
+                        };
+                        for (pi, pty) in m.sig.params.iter().enumerate() {
+                            if matches!(pty, ManagedType::Unknown) {
+                                continue;
+                            }
+                            let arg_idx = param_start + pi;
+                            let Some(arg_op) = insn.operands.get(arg_idx) else {
+                                continue;
+                            };
+                            if let Operand::Local(v) = arg_op {
+                                if let Some(&li) = table.index_of.get(v) {
+                                    if refine_type(&table.infos[li].ty, pty) {
+                                        table.infos[li].ty = pty.clone();
+                                        changed = true;
+                                        use std::sync::atomic::Ordering;
+                                        super::timing::CALLSITE_PARAM_TYPED.fetch_add(
+                                            1,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // The RECEIVER is the other half of the same fact: an
+                        // instance call to `T.M` proves its receiver is a `T`.
+                        // Only `Unknown`/`IntPtr`/`I8` locals move — a
+                        // `this`, a declared parameter, a field-typed or
+                        // call-typed receiver is a proven type and `refine_type`
+                        // refuses to downgrade it.
+                        if !m.sig.is_static {
+                            let recv_idx = if has_result { 2 } else { 1 };
+                            if let Some(Operand::Local(v)) = insn.operands.get(recv_idx) {
+                                if let Some(&li) = table.index_of.get(v) {
+                                    // A frame cell is STORAGE, not a value: the
+                                    // renderer decides [cell + off] from the
+                                    // cell type (mem_base_expr pointer-cell
+                                    // test), so typing a ref/out cell as a class
+                                    // would turn the value it holds back into
+                                    // its own address.
+                                    let frame_cell =
+                                        table.infos[li].slot_origin.starts_with("stack_");
+                                    if let Some(rty) =
+                                        receiver_type(m, oracle).filter(|_| !frame_cell)
+                                    {
+                                        if refine_type(&table.infos[li].ty, &rty) {
+                                            table.infos[li].ty = rty;
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                Op::Convert(conv) => {
+                    // Numeric conversions produce a known primitive type
+                    // regardless of the source: the conversion's target
+                    // determines the result type exactly.
+                    let ty = match conv {
+                        super::ir::Conversion::IntToFloat32 => {
+                            ManagedType::Primitive(PrimKind::R4)
+                        }
+                        super::ir::Conversion::IntToFloat64 => {
+                            ManagedType::Primitive(PrimKind::R8)
+                        }
+                        super::ir::Conversion::FloatToInt => {
+                            ManagedType::Primitive(PrimKind::I8)
+                        }
+                        super::ir::Conversion::Float32ToFloat64 => {
+                            ManagedType::Primitive(PrimKind::R8)
+                        }
+                        super::ir::Conversion::Float64ToFloat32 => {
+                            ManagedType::Primitive(PrimKind::R4)
+                        }
+                    };
+                    apply_dest_type(insn, table, ty, &mut changed);
+                }
+                Op::MulAcc { is_float, .. } => {
+                    // FMA/FMS: result is float when is_float, else integer.
+                    let ty = if *is_float {
+                        ManagedType::Primitive(PrimKind::R4)
+                    } else {
+                        ManagedType::Primitive(PrimKind::I8)
+                    };
+                    apply_dest_type(insn, table, ty, &mut changed);
+                }
+                Op::Clz => {
+                    // Count leading zeros always produces an integer result.
+                    apply_dest_type(
+                        insn,
+                        table,
+                        ManagedType::Primitive(PrimKind::I4),
+                        &mut changed,
+                    );
+                }
                 Op::LoadLength => {
-                    apply_dest_type(insn, table, ManagedType::Primitive(PrimKind::I4), &mut changed);
+                    apply_dest_type(
+                        insn,
+                        table,
+                        ManagedType::Primitive(PrimKind::I4),
+                        &mut changed,
+                    );
                 }
                 Op::Phi => {
                     // merge arg types
@@ -1655,7 +1886,8 @@ pub fn propagate_types(
                                 {
                                     let fty = field.field_type.clone();
                                     // mark stored-field type on the VALUE local
-                                    if let Some(v) = insn.operands.get(1).and_then(|o| o.as_local()) {
+                                    if let Some(v) = insn.operands.get(1).and_then(|o| o.as_local())
+                                    {
                                         if let Some(&li) = table.index_of.get(&v) {
                                             if refine_type(&table.infos[li].ty, &fty) {
                                                 table.infos[li].ty = fty;
@@ -1748,13 +1980,11 @@ pub fn propagate_types(
                 continue;
             }
             for slot in [0usize, 1usize] {
-                let Some(Operand::Memory { base, addend, .. }) =
-                    insn.operands.get(slot).cloned()
+                let Some(Operand::Memory { base, addend, .. }) = insn.operands.get(slot).cloned()
                 else {
                     continue;
                 };
-                let Some(addr) =
-                    absolute_static_addr(&base, addend, &imm_def, &def_count, table)
+                let Some(addr) = absolute_static_addr(&base, addend, &imm_def, &def_count, table)
                 else {
                     continue;
                 };
@@ -1808,14 +2038,20 @@ pub fn propagate_types(
             if !matches!(&insn.op, Op::Arith(super::ir::ArithKind::Add)) {
                 continue;
             }
-            let Some(dst) = insn.dest().cloned() else { continue };
+            let Some(dst) = insn.dest().cloned() else {
+                continue;
+            };
             let base = insn.operands.get(1).cloned().unwrap_or(Operand::Unknown);
-            let Some(Operand::Immediate(off)) = insn.operands.get(2).cloned() else { continue };
+            let Some(Operand::Immediate(off)) = insn.operands.get(2).cloned() else {
+                continue;
+            };
             if !base_is_this(&base, table, &copy_src, &phi_inputs) {
                 continue;
             }
             let base_ty = operand_type(Some(&base), table, oracle);
-            let Some(nt) = base_ty.as_ref().and_then(class_of) else { continue };
+            let Some(nt) = base_ty.as_ref().and_then(class_of) else {
+                continue;
+            };
             if nt.type_def_index < 0 {
                 continue;
             }
@@ -1946,12 +2182,7 @@ fn restore_phi_structure(insns: &mut [Insn], pre: &[Insn]) {
     }
 }
 
-fn apply_dest_type(
-    insn: &Insn,
-    table: &mut LocalTable,
-    ty: ManagedType,
-    changed: &mut bool,
-) {
+fn apply_dest_type(insn: &Insn, table: &mut LocalTable, ty: ManagedType, changed: &mut bool) {
     if matches!(ty, ManagedType::Unknown) {
         return;
     }
@@ -1980,9 +2211,89 @@ fn refine_type(cur: &ManagedType, inc: &ManagedType) -> bool {
         (Unknown, x) => !matches!(x, Unknown),
         // IntPtr is the weakest pointer guess; any authoritative concrete
         // type (class ref, array, string, primitive from a resolved field
-        // load, …) is strictly better. Equal IntPtr/Unknown are not changes.
-        (IntPtr, x) => !matches!(x, Unknown | IntPtr),
+        // load, …) is strictly better. Equal IntPtr/Unknown are not changes,
+        // and neither is `I8` — the WIDTH-FREE integer guess is WEAKER than
+        // "this is an address" (pointer arithmetic yields IntPtr, so an I8
+        // reaching an IntPtr local came from a rule that knows less). Letting
+        // I8 downgrade IntPtr also made the lattice oscillate
+        // (IntPtr -> I8 -> IntPtr ...) until the 32-iteration cap, which cost
+        // 3x render time on the 200-method sample.
+        (IntPtr, x) => !matches!(x, Unknown | IntPtr | Primitive(PrimKind::I8)),
+        // I8 is the WIDTH-FREE integer guess (`arith_result_type` returns it
+        // for every integer operation), not a fact about the value. Treating
+        // it as final made every later authoritative fact unreachable: a local
+        // whose first visit was an `Add` could never become the field's
+        // declared `bool`/`int`/`Enum`/`SomeClass`, nor a call's declared
+        // parameter/return type. Measured on 0x15A5B6C: `v22 = static_fields +
+        // 8` is `long` although the load that produced its base is
+        // pointer-width, and `refine_type` refused every correction.
+        //
+        // Only a CONCRETE type may demote the guess (and I8->I8 is no
+        // information); a proven type is still never downgraded.
+        (Primitive(PrimKind::I8), x) => !matches!(x, Unknown | Primitive(PrimKind::I8)),
         _ => false,
+    }
+}
+
+/// Public wrapper for [`refine_type`] — used by the interprocedural pass.
+pub fn refine_type_public(cur: &ManagedType, inc: &ManagedType) -> bool {
+    refine_type(cur, inc)
+}
+
+/// T2 — type every local the code DEREFERENCES as an address.
+///
+/// `Memory { base: Local(v) }` is a native load/store through `v`: whatever
+/// `v` holds, the instruction treats it as a pointer. That is proof, not a
+/// guess, and it is the largest single evidence source the lattice was
+/// ignoring — measured on a 200-method sample, 46 % of surviving `vN` refs sit
+/// on locals used as a deref base and 28 % of all refs sit on ones typed
+/// `Unknown`.
+///
+/// Refusals, each for a reason:
+///  * `this` and parameters — already carry identity (and never print `vN`);
+///  * frame cells (`slot_origin` `stack_*`) — `[sp+off]` denotes the CELL's
+///    address, not a pointer stored in it, and `mem_base_expr` already
+///    distinguishes the two through `address_taken`;
+///  * any local that already has a concrete type — `refine_type` only accepts
+///    `Unknown`/`IntPtr`, so a proven `Class`/`SzArray`/`I4` is untouched.
+fn seed_address_uses(insns: &[Insn], table: &mut LocalTable) -> bool {
+    let mut changed = false;
+    for insn in insns {
+        for op in &insn.operands {
+            seed_memory_base(op, table, &mut changed);
+        }
+    }
+    changed
+}
+
+fn seed_memory_base(op: &Operand, table: &mut LocalTable, changed: &mut bool) {
+    match op {
+        Operand::Memory { base, index, .. } => {
+            if let Operand::Local(v) = base.as_ref() {
+                if let Some(&li) = table.index_of.get(v) {
+                    let info = &mut table.infos[li];
+                    let frame_cell = info.slot_origin.starts_with("stack_");
+                    if !info.is_this
+                        && info.is_param.is_none()
+                        && !frame_cell
+                        && refine_type(&info.ty, &ManagedType::IntPtr)
+                    {
+                        info.ty = ManagedType::IntPtr;
+                        *changed = true;
+                    }
+                }
+            }
+            seed_memory_base(base, table, changed);
+            if let Some(i) = index {
+                seed_memory_base(i, table, changed);
+            }
+        }
+        Operand::ArrayAccess { array, index } => {
+            seed_memory_base(array, table, changed);
+            seed_memory_base(index, table, changed);
+        }
+        Operand::InstanceField { base, .. } => seed_memory_base(base, table, changed),
+        _ => {}
     }
 }
 
@@ -1997,6 +2308,11 @@ fn class_of(ty: &ManagedType) -> Option<std::sync::Arc<super::types::NamedType>>
         ManagedType::ByRef(inner) | ManagedType::Pointer(inner) => class_of(inner),
         _ => None,
     }
+}
+
+/// Public wrapper for [`class_of`] — used by the interprocedural pass.
+pub fn class_of_public(ty: &ManagedType) -> Option<std::sync::Arc<super::types::NamedType>> {
+    class_of(ty)
 }
 
 /// The ABSOLUTE address a memory operand denotes, when it can be proven.
@@ -2047,9 +2363,20 @@ fn absolute_static_addr(
 /// Memory form: collapsing it would drop the receiver and render
 /// `__unknown.field` (or a wrong `this.field` when the field's declaring
 /// type merely shares the class chain).
-fn base_is_this(base: &Operand, table: &LocalTable, copy_src: &HashMap<u32, u32>, phi_inputs: &HashMap<u32, Vec<u32>>) -> bool {
+fn base_is_this(
+    base: &Operand,
+    table: &LocalTable,
+    copy_src: &HashMap<u32, u32>,
+    phi_inputs: &HashMap<u32, Vec<u32>>,
+) -> bool {
     match base {
-        Operand::Local(v) => is_this_alias(*v, table, copy_src, phi_inputs, &mut std::collections::HashSet::new()),
+        Operand::Local(v) => is_this_alias(
+            *v,
+            table,
+            copy_src,
+            phi_inputs,
+            &mut std::collections::HashSet::new(),
+        ),
         // entry `this` register (arm64 x0 / x86 this-ptr); non-renamed
         // registers are skipped by the type check anyway (type None)
         _ => false,
@@ -2087,9 +2414,9 @@ fn is_this_alias(
             // Phi: every input must be a this-alias (any non-this input
             // means the value varies across paths — not provably this)
             match phi_inputs.get(&v) {
-                Some(inputs) if !inputs.is_empty() => inputs.iter().all(|i| {
-                    is_this_alias(*i, table, copy_src, phi_inputs, seen)
-                }),
+                Some(inputs) if !inputs.is_empty() => inputs
+                    .iter()
+                    .all(|i| is_this_alias(*i, table, copy_src, phi_inputs, seen)),
                 _ => false,
             }
         }
@@ -2109,15 +2436,17 @@ pub fn operand_type(
         Operand::StringLiteral { .. } => Some(ManagedType::String),
         Operand::Method(m) => Some(ManagedType::Opaque(format!("method {}", m.full_name()))),
         Operand::Field(f) => Some(f.field_type.clone()),
-        Operand::Memory { base, addend, .. } => {
+        Operand::InstanceField { field, .. } => Some(field.field_type.clone()),
+        Operand::Memory { base, addend, width, .. } => {
             // A load through a base whose class the fixpoint already knows is the
             // FIELD's own type, not an opaque pointer. This is what carries a
             // type across a chain: `obj = SomeCall();` types `obj` from the
             // call's return, and this makes `v = obj.field` take the field's
             // declared type on the next visit, so `v.subfield` resolves at depth
-            // > 1 instead of stopping at the first deref. Falls back to `IntPtr`
-            // — the old weak pointer guess — whenever the base or the offset is
-            // not provably a metadata field, so it is never a downgrade.
+            // > 1 instead of stopping at the first deref. Falls back to the
+            // WIDTH-derived shape — or `IntPtr`, the old weak pointer guess —
+            // whenever the base or the offset is not provably a metadata field,
+            // so it is never a downgrade.
             let base_ty = operand_type(Some(&**base), table, oracle);
             if let Some(nt) = base_ty.as_ref().and_then(class_of) {
                 if nt.type_def_index >= 0 {
@@ -2126,7 +2455,19 @@ pub fn operand_type(
                     }
                 }
             }
-            Some(ManagedType::IntPtr)
+            // The access WIDTH is a fact the lifter recorded (`ldr w0` vs
+            // `ldr x0`), and without it a provably 32-bit integer load was
+            // typed `IntPtr` — a pointer. That mis-typing is not cosmetic: the
+            // next `Add` on it produced `I8` (see `arith_result_type`), and the
+            // value stayed "long" for the rest of the method. Width 0 is "not
+            // stated" and keeps the pointer guess; 8 is pointer-width, where
+            // long-vs-pointer cannot be decided from the width alone.
+            match width {
+                1 => Some(ManagedType::Primitive(PrimKind::I1)),
+                2 => Some(ManagedType::Primitive(PrimKind::I2)),
+                4 => Some(ManagedType::Primitive(PrimKind::I4)),
+                _ => Some(ManagedType::IntPtr),
+            }
         }
         Operand::AddressOf(inner) => {
             operand_type(Some(&**inner), table, oracle).map(|t| ManagedType::ByRef(Box::new(t)))
@@ -2145,6 +2486,52 @@ fn merge_types(a: ManagedType, b: ManagedType) -> ManagedType {
         (Primitive(_), Primitive(_)) => Primitive(PrimKind::I8),
         _ => Object,
     }
+}
+
+/// The managed type a call's RECEIVER operand is known to have.
+///
+/// An instance call's receiver must be an instance of the DECLARING type: that
+/// is what the callee's metadata says, and it is the only evidence the call
+/// site carries about the object. `align_call_arguments` already uses the
+/// signature to type every PARAMETER local, but it starts at `param0` and skips
+/// the receiver slot — so a local whose only use was `obj.Foo()` stayed
+/// `Unknown`, `type_role_name` abstained, and the `vN` spelling survived even
+/// though the callee named the object's class.
+///
+/// Refusals: a STATIC call has no receiver; a `MethodRef` with no TypeDef index
+/// (`type_def_index < 0`) or no declaring type name carries no evidence. For a
+/// STRUCT declaring type the receiver holds the ADDRESS of the struct (that is
+/// how IL2CPP passes a value-type `this`), so it is typed `ByRef(Class)` —
+/// still an address, and `class_of` peels it to resolve the struct's fields.
+fn receiver_type(m: &super::types::MethodRef, oracle: &dyn TypeOracle) -> Option<ManagedType> {
+    if m.sig.is_static || m.type_def_index < 0 || m.declaring_type_name.is_empty() {
+        return None;
+    }
+    let nt = std::sync::Arc::new(super::types::NamedType {
+        namespace: m.declaring_namespace.clone(),
+        name: m.declaring_type_name.clone(),
+        assembly: (!m.assembly.is_empty()).then(|| m.assembly.clone()),
+        type_def_index: m.type_def_index,
+    });
+    let cls = ManagedType::Class(nt);
+    Some(match oracle.is_struct_value_type(m.type_def_index) {
+        Some(true) => ManagedType::ByRef(Box::new(cls)),
+        _ => cls,
+    })
+}
+
+/// Does this type denote an ADDRESS in the native code?
+///
+/// A managed reference is an address in IL2CPP (objects, arrays, strings are
+/// raw pointers), `ByRef`/`Pointer` are addresses by construction, and
+/// `IntPtr` is the lattice's own pointer guess. `Unknown` is deliberately NOT
+/// address-like: refusing is what keeps this rule from guessing.
+fn is_address_like(t: &ManagedType) -> bool {
+    use ManagedType::*;
+    matches!(
+        t,
+        IntPtr | Class(_) | ByRef(_) | Pointer(_) | SzArray(_) | String | Object | Opaque(_)
+    )
 }
 
 fn arith_result_type(
@@ -2170,6 +2557,24 @@ fn arith_result_type(
         {
             ManagedType::Primitive(PrimKind::Boolean)
         }
+        // POINTER ARITHMETIC. `base + k` / `base - k` with exactly one
+        // address-like side is an ADDRESS: it is how IL2CPP spells every
+        // field, element and vtable-slot address computation
+        // (`add x8, x19, #0x28`, `add x22, x0, w1, uxtw #4`). Returning
+        // `I8` here threw the address-ness away, and since `refine_type` used
+        // to treat `I8` as final nothing downstream could restore it, so the
+        // cursor could never be named (type_role_name maps `IntPtr` -> `ptr`).
+        //
+        // `Sub(ptr, ptr)` is an element/byte DIFFERENCE — an integer — and
+        // `Add` of two addresses is not an address; both keep `I8`.
+        ArithKind::Add | ArithKind::Sub => {
+            let lp = lt.as_ref().is_some_and(is_address_like);
+            let rp = rt.as_ref().is_some_and(is_address_like);
+            match (lp, rp) {
+                (true, false) | (false, true) => ManagedType::IntPtr,
+                _ => ManagedType::Primitive(PrimKind::I8),
+            }
+        }
         _ => ManagedType::Primitive(PrimKind::I8),
     }
 }
@@ -2180,7 +2585,6 @@ impl TypeOracle for NullOracle {
         None
     }
 }
-
 
 /// Klass-pointer typing: `Move dst, *slot` where slot's address is a known
 /// TypeInfo metadata-usage → dst (and the slot local) get the real class
@@ -2214,8 +2618,12 @@ pub fn type_klass_pointers(
                 _ => None,
             };
             let Some(bs) = base_slot else { continue };
-            let Some(addr) = imm_defs.get(&bs) else { continue };
-            let Some(&tdi) = klass_to_tdi.get(&(*addr as u64)) else { continue };
+            let Some(addr) = imm_defs.get(&bs) else {
+                continue;
+            };
+            let Some(&tdi) = klass_to_tdi.get(&(*addr as u64)) else {
+                continue;
+            };
             if tdi < 0 || tdi as usize >= metadata.type_defs.len() {
                 continue;
             }
@@ -2231,7 +2639,9 @@ pub fn type_klass_pointers(
                 type_def_index: tdi,
             });
             // type both the base local and this move's destination
-            for slot in [Some(bs), insn.dest().and_then(|d| d.as_local())].into_iter().flatten()
+            for slot in [Some(bs), insn.dest().and_then(|d| d.as_local())]
+                .into_iter()
+                .flatten()
             {
                 if let Some(&li) = table.index_of.get(&slot) {
                     if matches!(table.infos[li].ty, ManagedType::Unknown) {
@@ -2323,6 +2733,7 @@ mod typing_tests {
                 param_comp: None,
                 is_return_buffer: false,
                 is_incoming_arg: false,
+                is_call_clobber: false,
             });
             t.index_of.insert(*v, idx);
         }
@@ -2353,7 +2764,12 @@ mod typing_tests {
     #[test]
     fn derived_receiver_load_is_typed_not_collapsed() {
         let oracle = Oracle {
-            inst: Some(field("health", ManagedType::Primitive(PrimKind::R4), 7, false)),
+            inst: Some(field(
+                "health",
+                ManagedType::Primitive(PrimKind::R4),
+                7,
+                false,
+            )),
             statics: vec![],
         };
         let mut table = table_with(&[
@@ -2370,7 +2786,10 @@ mod typing_tests {
             table.infos[idx(&table, 2)].ty,
             ManagedType::Primitive(PrimKind::R4)
         );
-        assert_eq!(insns[0].dest_type, Some(ManagedType::Primitive(PrimKind::R4)));
+        assert_eq!(
+            insns[0].dest_type,
+            Some(ManagedType::Primitive(PrimKind::R4))
+        );
         assert!(
             matches!(
                 &insns[0].operands[1],
@@ -2385,7 +2804,12 @@ mod typing_tests {
     #[test]
     fn this_receiver_load_collapses_to_field() {
         let oracle = Oracle {
-            inst: Some(field("health", ManagedType::Primitive(PrimKind::R4), 7, false)),
+            inst: Some(field(
+                "health",
+                ManagedType::Primitive(PrimKind::R4),
+                7,
+                false,
+            )),
             statics: vec![],
         };
         let mut table = table_with(&[
@@ -2427,7 +2851,10 @@ mod typing_tests {
             }
             other => panic!("expected static Field, got {other:?}"),
         }
-        assert_eq!(insns[0].dest_type, Some(ManagedType::Primitive(PrimKind::I4)));
+        assert_eq!(
+            insns[0].dest_type,
+            Some(ManagedType::Primitive(PrimKind::I4))
+        );
     }
 
     /// A static STORE `*(nint*)(0x63a…) = v` becomes `Type.field = v`.
@@ -2467,7 +2894,11 @@ mod typing_tests {
                 vec![Operand::Local(1), Operand::Immediate(0x63a_0000)],
                 0x1ff0,
             ),
-            Insn::new(Op::Move, vec![Operand::Local(5), mem(Operand::Local(1), 16)], 0x2000),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(5), mem(Operand::Local(1), 16)],
+                0x2000,
+            ),
         ];
         propagate_types(&mut insns, &mut table, &oracle);
         match &insns[1].operands[1] {
@@ -2480,7 +2911,12 @@ mod typing_tests {
     #[test]
     fn untyped_base_stays_raw() {
         let oracle = Oracle {
-            inst: Some(field("health", ManagedType::Primitive(PrimKind::R4), 7, false)),
+            inst: Some(field(
+                "health",
+                ManagedType::Primitive(PrimKind::R4),
+                7,
+                false,
+            )),
             statics: vec![],
         };
         let mut table = table_with(&[
@@ -2512,7 +2948,12 @@ mod typing_tests {
     #[test]
     fn byref_value_type_base_resolves() {
         let oracle = Oracle {
-            inst: Some(field("LinePos", ManagedType::Primitive(PrimKind::R4), 7, false)),
+            inst: Some(field(
+                "LinePos",
+                ManagedType::Primitive(PrimKind::R4),
+                7,
+                false,
+            )),
             statics: vec![],
         };
         let mut table = table_with(&[
@@ -2540,7 +2981,12 @@ mod typing_tests {
     #[test]
     fn operand_type_names_field_through_memory() {
         let oracle = Oracle {
-            inst: Some(field("health", ManagedType::Primitive(PrimKind::R4), 7, false)),
+            inst: Some(field(
+                "health",
+                ManagedType::Primitive(PrimKind::R4),
+                7,
+                false,
+            )),
             statics: vec![],
         };
         let table = table_with(&[(0, ManagedType::Class(nt(7)), false)]);
@@ -2578,8 +3024,8 @@ mod typing_tests {
         propagate_types(&mut insns, &mut table, &oracle);
         assert_eq!(
             table.infos[idx(&table, 2)].ty,
-            ManagedType::Primitive(PrimKind::I8),
-            "a dynamic offset names no slot: the destination must stay the integer guess"
+            ManagedType::IntPtr,
+            "a dynamic offset names no slot, but `base + w` off a REFERENCE is still an address"
         );
         assert!(
             matches!(insns[0].op, Op::Arith(ArithKind::Add)),
@@ -2703,8 +3149,8 @@ mod typing_tests {
         propagate_types(&mut insns, &mut table, &oracle);
         assert_eq!(
             table.infos[idx(&table, 2)].ty,
-            ManagedType::Primitive(PrimKind::I8),
-            "the address of a reference-typed field must stay the integer guess"
+            ManagedType::IntPtr,
+            "the address of a reference-typed field must stay an ADDRESS, never its class"
         );
         assert!(
             matches!(insns[0].op, Op::Arith(ArithKind::Add)),
@@ -2736,8 +3182,8 @@ mod typing_tests {
         propagate_types(&mut insns, &mut table, &oracle);
         assert_eq!(
             table.infos[idx(&table, 2)].ty,
-            ManagedType::Primitive(PrimKind::I8),
-            "the address of an enum field names no subfield and must stay integer"
+            ManagedType::IntPtr,
+            "the address of an enum field names no subfield and must stay an address"
         );
     }
 
@@ -2763,8 +3209,8 @@ mod typing_tests {
         propagate_types(&mut insns, &mut table, &oracle);
         assert_eq!(
             table.infos[idx(&table, 2)].ty,
-            ManagedType::Primitive(PrimKind::I8),
-            "a primitive field has no subfields: its address must stay integer"
+            ManagedType::IntPtr,
+            "a primitive field has no subfields: its address must stay an address"
         );
     }
 
@@ -2789,8 +3235,8 @@ mod typing_tests {
         propagate_types(&mut insns, &mut table, &oracle);
         assert_eq!(
             table.infos[idx(&table, 2)].ty,
-            ManagedType::Primitive(PrimKind::I8),
-            "unprovable struct-ness must refuse, never guess"
+            ManagedType::IntPtr,
+            "unprovable struct-ness must refuse the ByRef seed, never guess it"
         );
     }
 
@@ -2809,7 +3255,12 @@ mod typing_tests {
             statics: vec![],
         };
         let mut table = LocalTable::default();
-        for (v, is_param) in [(11u32, true), (53u32, false), (55u32, false), (29u32, false)] {
+        for (v, is_param) in [
+            (11u32, true),
+            (53u32, false),
+            (55u32, false),
+            (29u32, false),
+        ] {
             let idx = table.infos.len();
             table.infos.push(LocalInfo {
                 slot_origin: format!("s{v}"),
@@ -2819,12 +3270,21 @@ mod typing_tests {
                 param_comp: None,
                 is_return_buffer: false,
                 is_incoming_arg: false,
+                is_call_clobber: false,
             });
             table.index_of.insert(v, idx);
         }
         let mut insns = vec![
-            Insn::new(Op::Move, vec![Operand::Local(53), Operand::Local(11)], 0x1000),
-            Insn::new(Op::Move, vec![Operand::Local(55), Operand::Immediate(5)], 0x1004),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(53), Operand::Local(11)],
+                0x1000,
+            ),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(55), Operand::Immediate(5)],
+                0x1004,
+            ),
             Insn::new(
                 Op::Phi,
                 vec![Operand::Local(29), Operand::Local(53), Operand::Local(55)],
@@ -2841,6 +3301,400 @@ mod typing_tests {
         assert!(
             matches!(&insns[0].op, Op::Move),
             "the folded copy's definition must survive until eliminate+DCE"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 4.2 — evidence-driven typing (docs/orientation/10-recon-typing.md)
+    // -----------------------------------------------------------------
+
+    fn empty_oracle() -> Oracle {
+        Oracle {
+            inst: None,
+            statics: vec![],
+        }
+    }
+
+    /// T1: `base + k` with one address-like side is an ADDRESS. IL2CPP spells
+    /// every field/element/vtable address this way; typing it `I8` threw the
+    /// address-ness away and nothing downstream could restore it, so the
+    /// cursor could never be named (type_role_name maps IntPtr -> `ptr`).
+    #[test]
+    fn pointer_plus_constant_is_a_pointer() {
+        let oracle = empty_oracle();
+        let mut table = table_with(&[
+            (1, ManagedType::IntPtr, false),
+            (2, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Arith(super::super::ir::ArithKind::Add),
+            vec![Operand::Local(2), Operand::Local(1), Operand::Immediate(8)],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 2)].ty,
+            ManagedType::IntPtr,
+            "address + constant must stay an address"
+        );
+    }
+
+    /// T1 refusal: the DIFFERENCE of two addresses is an integer, not an
+    /// address. Typing it `IntPtr` would make every length/offset computation
+    /// look like a pointer.
+    #[test]
+    fn pointer_minus_pointer_is_an_integer() {
+        let oracle = empty_oracle();
+        let mut table = table_with(&[
+            (1, ManagedType::IntPtr, false),
+            (2, ManagedType::IntPtr, false),
+            (3, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Arith(super::super::ir::ArithKind::Sub),
+            vec![Operand::Local(3), Operand::Local(1), Operand::Local(2)],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 3)].ty,
+            ManagedType::Primitive(PrimKind::I8),
+            "pointer difference is an integer"
+        );
+    }
+
+    /// T2: a local the code DEREFERENCES is an address. This is proof, not a
+    /// guess — the native instruction treats whatever it holds as a pointer.
+    #[test]
+    fn dereferenced_local_is_typed_as_an_address() {
+        let oracle = empty_oracle();
+        let mut table = table_with(&[
+            (0, ManagedType::Unknown, false),
+            (2, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Move,
+            vec![Operand::Local(2), mem(Operand::Local(0), 24)],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 0)].ty,
+            ManagedType::IntPtr,
+            "a deref base is an address"
+        );
+    }
+
+    /// T2 refusal: a FRAME cell is not a pointer. `[sp+off]` denotes the
+    /// cell's address, not a pointer stored in it, and `mem_base_expr` already
+    /// distinguishes the two through `address_taken`; typing the cell itself
+    /// would corrupt that decision.
+    #[test]
+    fn stack_cell_deref_is_not_typed_as_a_pointer() {
+        let oracle = empty_oracle();
+        let mut table = table_with(&[(0, ManagedType::Unknown, false)]);
+        table.infos[0].slot_origin = "stack_16".into();
+        let mut insns = vec![Insn::new(
+            Op::Move,
+            vec![Operand::Local(2), mem(Operand::Local(0), 0)],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 0)].ty,
+            ManagedType::Unknown,
+            "a frame cell must not be typed as a pointer"
+        );
+    }
+
+    /// T3: `I8` is the WIDTH-FREE integer guess, not a proof. Field evidence
+    /// must be able to correct it — before this, `refine_type` refused every
+    /// move out of I8, so a local whose first visit was an `Add` could never
+    /// become the field's declared class/struct type.
+    #[test]
+    fn field_evidence_demotes_the_i8_guess() {
+        let oracle = Oracle {
+            inst: Some(field("motor", ManagedType::Class(nt(7)), 7, false)),
+            statics: vec![],
+        };
+        // Local 1 holds `this` (type T7); local 9 is the stored value, already
+        // poisoned with the I8 guess by an earlier arithmetic visit.
+        let mut table = table_with(&[
+            (1, ManagedType::Class(nt(7)), true),
+            (9, ManagedType::Primitive(PrimKind::I8), false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Move,
+            vec![mem(Operand::Local(1), 24), Operand::Local(9)],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 9)].ty,
+            ManagedType::Class(nt(7)),
+            "the stored value must take the field's declared type"
+        );
+    }
+
+    /// T3 refusal: a PROVEN type is never downgraded to the I8 guess.
+    #[test]
+    fn a_proven_type_is_not_downgraded_to_the_integer_guess() {
+        let oracle = empty_oracle();
+        let mut table = table_with(&[
+            (1, ManagedType::Class(nt(7)), false),
+            (2, ManagedType::Primitive(PrimKind::I4), false),
+            (3, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![
+            Insn::new(
+                Op::Arith(super::super::ir::ArithKind::Add),
+                vec![Operand::Local(3), Operand::Local(1), Operand::Immediate(4)],
+                0x1000,
+            ),
+            Insn::new(
+                Op::Arith(super::super::ir::ArithKind::Add),
+                vec![Operand::Local(2), Operand::Local(1), Operand::Immediate(4)],
+                0x1004,
+            ),
+        ];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 2)].ty,
+            ManagedType::Primitive(PrimKind::I4),
+            "a proven int32 must not be replaced by the width-free guess"
+        );
+    }
+
+    /// T4: the ACCESS WIDTH is a type. The renderer already spells a 4-byte
+    /// access `*(int*)`, a 2-byte one `*(short*)` and a 1-byte one
+    /// `*(byte*)`; the lattice must agree, or the value is called a pointer.
+    #[test]
+    fn width_four_load_is_a_32_bit_integer() {
+        let oracle = empty_oracle();
+        let mut table = table_with(&[
+            (0, ManagedType::Unknown, false),
+            (1, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Move,
+            vec![
+                Operand::Local(1),
+                Operand::Memory {
+                    base: Box::new(Operand::Local(0)),
+                    index: None,
+                    scale: 1,
+                    addend: 0,
+                    width: 4,
+                },
+            ],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 1)].ty,
+            ManagedType::Primitive(PrimKind::I4),
+            "a 4-byte load is a 32-bit integer, not a pointer"
+        );
+    }
+
+    /// T4 refusal: width 0 is "not stated" and keeps the pointer guess.
+    #[test]
+    fn width_zero_load_stays_a_pointer() {
+        let oracle = empty_oracle();
+        let mut table = table_with(&[
+            (0, ManagedType::Unknown, false),
+            (1, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Move,
+            vec![Operand::Local(1), mem(Operand::Local(0), 0)],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 1)].ty,
+            ManagedType::IntPtr,
+            "an unstated width keeps the pointer guess"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 4.2 — receiver typing (the call site's other half of the evidence)
+    // -----------------------------------------------------------------
+
+    fn nt_asm(tdi: i32, asm: &str) -> Arc<NamedType> {
+        Arc::new(NamedType {
+            namespace: String::new(),
+            name: format!("T{tdi}"),
+            assembly: Some(asm.to_string()),
+            type_def_index: tdi,
+        })
+    }
+
+    fn method(name: &str, tdi: i32, is_static: bool) -> super::super::types::MethodRef {
+        super::super::types::MethodRef {
+            image_index: 0,
+            type_def_index: tdi,
+            method_index: 0,
+            name: name.to_string(),
+            declaring_namespace: String::new(),
+            declaring_type_name: format!("T{tdi}"),
+            assembly: "Test".to_string(),
+            sig: super::super::types::MethodSigInfo {
+                ret: ManagedType::Unknown,
+                params: vec![],
+                is_static,
+            },
+        }
+    }
+
+    /// A local whose ONLY use is `obj.Foo()` is proven to be a `Foo` by the
+    /// callee's own metadata. Before this rule the receiver slot was skipped
+    /// (parameter back-propagation starts at `param0`), so such a local stayed
+    /// `Unknown`, `type_role_name` abstained, and the `vN` spelling survived
+    /// although the call named the object's class.
+    #[test]
+    fn a_call_receiver_takes_the_callee_declaring_type() {
+        let oracle = AddrOracle {
+            field_type: ManagedType::Unknown,
+            structs: Some(vec![]),
+        };
+        let mut table = table_with(&[
+            (1, ManagedType::Unknown, false),
+            (2, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Call,
+            vec![
+                Operand::Method(method("Update", 7, false)),
+                Operand::Local(2), // result
+                Operand::Local(1), // receiver
+            ],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 1)].ty,
+            ManagedType::Class(nt_asm(7, "Test")),
+            "the receiver of T7.Update is a T7"
+        );
+    }
+
+    /// Refusal: a STRUCT declaring type passes its `this` as a pointer, so the
+    /// receiver is an ADDRESS of the struct (`ByRef`), never the struct value.
+    #[test]
+    fn a_struct_receiver_is_the_struct_address() {
+        let oracle = AddrOracle {
+            field_type: ManagedType::Unknown,
+            structs: Some(vec![7]),
+        };
+        let mut table = table_with(&[
+            (1, ManagedType::Unknown, false),
+            (2, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Call,
+            vec![
+                Operand::Method(method("Normalize", 7, false)),
+                Operand::Local(2),
+                Operand::Local(1),
+            ],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 1)].ty,
+            ManagedType::ByRef(Box::new(ManagedType::Class(nt_asm(7, "Test")))),
+            "a value-type receiver holds the struct's address"
+        );
+    }
+
+    /// Refusal: a STATIC call has no receiver, and its first argument is not
+    /// one — typing it would be a fabricated fact about an unrelated local.
+    #[test]
+    fn a_static_call_does_not_type_its_first_argument_as_a_receiver() {
+        let oracle = AddrOracle {
+            field_type: ManagedType::Unknown,
+            structs: Some(vec![]),
+        };
+        let mut table = table_with(&[
+            (1, ManagedType::Unknown, false),
+            (2, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Call,
+            vec![
+                Operand::Method(method("Parse", 7, true)),
+                Operand::Local(2),
+                Operand::Local(1),
+            ],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 1)].ty,
+            ManagedType::Unknown,
+            "a static call carries no receiver"
+        );
+    }
+
+    /// Refusal: a FRAME cell is storage, not a value. `mem_base_expr` decides
+    /// whether `[cell + off]` reads the cell's address or the reference the
+    /// callee stored in it from the cell's TYPE, so typing a `ref`/`out` cell
+    /// as a class would silently turn the reference back into its own address.
+    #[test]
+    fn a_frame_cell_receiver_is_not_retyped() {
+        let oracle = AddrOracle {
+            field_type: ManagedType::Unknown,
+            structs: Some(vec![]),
+        };
+        let mut table = table_with(&[
+            (1, ManagedType::Unknown, false),
+            (2, ManagedType::Unknown, false),
+        ]);
+        table.infos[0].slot_origin = "stack_16".into();
+        let mut insns = vec![Insn::new(
+            Op::Call,
+            vec![
+                Operand::Method(method("Update", 7, false)),
+                Operand::Local(2),
+                Operand::Local(1),
+            ],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 1)].ty,
+            ManagedType::Unknown,
+            "a frame cell keeps its storage type"
+        );
+    }
+
+    /// Refusal: a receiver that is already a PROVEN type is never rewritten.
+    #[test]
+    fn a_proven_receiver_is_not_retyped_by_a_base_class_call() {
+        let oracle = AddrOracle {
+            field_type: ManagedType::Unknown,
+            structs: Some(vec![]),
+        };
+        let mut table = table_with(&[
+            (1, ManagedType::Class(nt(9)), false),
+            (2, ManagedType::Unknown, false),
+        ]);
+        let mut insns = vec![Insn::new(
+            Op::Call,
+            vec![
+                Operand::Method(method("ToString", 7, false)),
+                Operand::Local(2),
+                Operand::Local(1),
+            ],
+            0x1000,
+        )];
+        propagate_types(&mut insns, &mut table, &oracle);
+        assert_eq!(
+            table.infos[idx(&table, 1)].ty,
+            ManagedType::Class(nt(9)),
+            "a proven receiver keeps its own class"
         );
     }
 }

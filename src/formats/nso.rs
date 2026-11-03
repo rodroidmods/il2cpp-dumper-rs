@@ -1,11 +1,10 @@
-use crate::io::BinaryStream;
-use crate::search::{SectionHelper, SearchSection};
 use crate::error::{Error, Result};
 use crate::formats::elf::{
-    ElfDyn, ElfSym,
-    DT_HASH, DT_GNU_HASH, DT_SYMTAB, DT_STRTAB, DT_RELA, DT_RELASZ,
+    DT_GNU_HASH, DT_HASH, DT_RELA, DT_RELASZ, DT_STRTAB, DT_SYMTAB, ElfDyn, ElfSym,
     R_AARCH64_ABS64, R_AARCH64_RELATIVE, SHN_UNDEF,
 };
+use crate::io::BinaryStream;
+use crate::search::{SearchSection, SectionHelper};
 
 pub const NSO_MAGIC: u32 = 0x304F534E;
 
@@ -69,7 +68,8 @@ impl Nso {
         self.stream.set_position(header.text_file_offset as u64 + 4);
         let mod_offset = self.stream.read_u32()? as u64;
 
-        self.stream.set_position(header.text_file_offset as u64 + mod_offset + 4);
+        self.stream
+            .set_position(header.text_file_offset as u64 + mod_offset + 4);
         let dynamic_offset = self.stream.read_u32()? as u64 + mod_offset;
         let bss_start = self.stream.read_u32()? as u64;
         let bss_end = self.stream.read_u32()? as u64;
@@ -90,7 +90,9 @@ impl Nso {
         for _ in 0..max_entries {
             let d_tag = self.stream.read_i64()?;
             let d_un = self.stream.read_u64()?;
-            if d_tag == 0 { break; }
+            if d_tag == 0 {
+                break;
+            }
             dynamic_section.push(ElfDyn { d_tag, d_un });
         }
 
@@ -121,7 +123,14 @@ impl Nso {
             let st_shndx = self.stream.read_u16()?;
             let st_value = self.stream.read_u64()?;
             let st_size = self.stream.read_u64()?;
-            symbols.push(ElfSym { st_name, st_info, st_other, st_shndx, st_value, st_size });
+            symbols.push(ElfSym {
+                st_name,
+                st_info,
+                st_other,
+                st_shndx,
+                st_value,
+                st_size,
+            });
         }
 
         Ok(symbols)
@@ -149,7 +158,9 @@ impl Nso {
             let mut last_symbol = 0u32;
             for _ in 0..nbuckets {
                 let bucket = self.stream.read_u32()?;
-                if bucket > last_symbol { last_symbol = bucket; }
+                if bucket > last_symbol {
+                    last_symbol = bucket;
+                }
             }
 
             if last_symbol < symoffset {
@@ -157,11 +168,14 @@ impl Nso {
             }
 
             let chains_base = buckets_address + 4 * nbuckets as u64;
-            self.stream.set_position(chains_base + (last_symbol - symoffset) as u64 * 4);
+            self.stream
+                .set_position(chains_base + (last_symbol - symoffset) as u64 * 4);
             loop {
                 let chain_entry = self.stream.read_u32()?;
                 last_symbol += 1;
-                if (chain_entry & 1) != 0 { break; }
+                if (chain_entry & 1) != 0 {
+                    break;
+                }
             }
             return Ok(last_symbol as usize);
         }
@@ -169,7 +183,11 @@ impl Nso {
         Ok(0)
     }
 
-    fn process_relocations(&mut self, dynamic_section: &[ElfDyn], symbol_table: &[ElfSym]) -> Result<()> {
+    fn process_relocations(
+        &mut self,
+        dynamic_section: &[ElfDyn],
+        symbol_table: &[ElfSym],
+    ) -> Result<()> {
         let rela_entry = match dynamic_section.iter().find(|d| d.d_tag == DT_RELA) {
             Some(e) => e,
             None => return Ok(()),
@@ -229,7 +247,9 @@ impl Nso {
             return Err(Error::InvalidFormat("Invalid NSO magic".into()));
         }
 
-        let r = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+        let r = |off: usize| {
+            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        };
 
         Ok(NsoHeader {
             flags: r(12),
@@ -258,9 +278,9 @@ impl Nso {
             return Ok(data.to_vec());
         }
 
-        let total_size = header.data_memory_offset as usize +
-            header.data_decompressed_size as usize +
-            header.bss_size as usize;
+        let total_size = header.data_memory_offset as usize
+            + header.data_decompressed_size as usize
+            + header.bss_size as usize;
 
         let mut result = vec![0u8; total_size.max(0x100)];
         result[..0x100.min(data.len())].copy_from_slice(&data[..0x100.min(data.len())]);
@@ -274,7 +294,8 @@ impl Nso {
         result[12..16].copy_from_slice(&0u32.to_le_bytes());
 
         Self::decompress_segment(
-            data, &mut result,
+            data,
+            &mut result,
             header.text_file_offset as usize,
             header.text_file_offset as usize,
             header.text_decompressed_size as usize,
@@ -283,7 +304,8 @@ impl Nso {
         )?;
 
         Self::decompress_segment(
-            data, &mut result,
+            data,
+            &mut result,
             header.rodata_file_offset as usize,
             new_ro_offset as usize,
             header.rodata_decompressed_size as usize,
@@ -292,7 +314,8 @@ impl Nso {
         )?;
 
         Self::decompress_segment(
-            data, &mut result,
+            data,
+            &mut result,
             header.data_file_offset as usize,
             new_data_offset as usize,
             header.data_decompressed_size as usize,
@@ -315,7 +338,9 @@ impl Nso {
         if is_compressed {
             let end = file_offset + compressed_size;
             if end > src.len() {
-                return Err(Error::InvalidFormat("Compressed segment out of bounds".into()));
+                return Err(Error::InvalidFormat(
+                    "Compressed segment out of bounds".into(),
+                ));
             }
             let compressed = &src[file_offset..end];
             let decompressed = lz4_flex::decompress(compressed, decompressed_size)
@@ -325,10 +350,13 @@ impl Nso {
         } else {
             let end = file_offset + decompressed_size;
             if end > src.len() {
-                return Err(Error::InvalidFormat("Uncompressed segment out of bounds".into()));
+                return Err(Error::InvalidFormat(
+                    "Uncompressed segment out of bounds".into(),
+                ));
             }
             let copy_len = std::cmp::min(decompressed_size, dst.len().saturating_sub(dest_offset));
-            dst[dest_offset..dest_offset + copy_len].copy_from_slice(&src[file_offset..file_offset + copy_len]);
+            dst[dest_offset..dest_offset + copy_len]
+                .copy_from_slice(&src[file_offset..file_offset + copy_len]);
         }
         Ok(())
     }
@@ -372,7 +400,14 @@ impl Nso {
         data_list
     }
 
-    pub fn get_section_helper(&self, method_count: usize, type_definitions_count: usize, metadata_usages_count: usize, image_count: usize, version: f64) -> SectionHelper<'_> {
+    pub fn get_section_helper(
+        &self,
+        method_count: usize,
+        type_definitions_count: usize,
+        metadata_usages_count: usize,
+        image_count: usize,
+        version: f64,
+    ) -> SectionHelper<'_> {
         let mut exec_list = Vec::new();
         let data_list = self.data_search_sections();
         let mut bss_list = Vec::new();
@@ -380,26 +415,50 @@ impl Nso {
 
         if self.segments.len() >= 3 {
             let text = &self.segments[0];
-            let s = SearchSection::new(text.file_offset, text.file_offset + text.decompressed_size, text.memory_offset, text.memory_offset + text.decompressed_size);
+            let s = SearchSection::new(
+                text.file_offset,
+                text.file_offset + text.decompressed_size,
+                text.memory_offset,
+                text.memory_offset + text.decompressed_size,
+            );
             all.push(s.clone());
             exec_list.push(s);
 
             let rodata = &self.segments[1];
-            let s = SearchSection::new(rodata.file_offset, rodata.file_offset + rodata.decompressed_size, rodata.memory_offset, rodata.memory_offset + rodata.decompressed_size);
+            let s = SearchSection::new(
+                rodata.file_offset,
+                rodata.file_offset + rodata.decompressed_size,
+                rodata.memory_offset,
+                rodata.memory_offset + rodata.decompressed_size,
+            );
             all.push(s.clone());
 
             let data_seg = &self.segments[2];
-            let s = SearchSection::new(data_seg.file_offset, data_seg.file_offset + data_seg.decompressed_size, data_seg.memory_offset, data_seg.memory_offset + data_seg.decompressed_size);
+            let s = SearchSection::new(
+                data_seg.file_offset,
+                data_seg.file_offset + data_seg.decompressed_size,
+                data_seg.memory_offset,
+                data_seg.memory_offset + data_seg.decompressed_size,
+            );
             all.push(s.clone());
         }
 
         if let Some(bss) = &self.bss_segment {
-            let s = SearchSection::new(bss.file_offset, bss.file_offset + bss.decompressed_size, bss.memory_offset, bss.memory_offset + bss.decompressed_size);
+            let s = SearchSection::new(
+                bss.file_offset,
+                bss.file_offset + bss.decompressed_size,
+                bss.memory_offset,
+                bss.memory_offset + bss.decompressed_size,
+            );
             all.push(s.clone());
             bss_list.push(s);
         }
 
-        let bss = if bss_list.is_empty() { data_list.clone() } else { bss_list };
+        let bss = if bss_list.is_empty() {
+            data_list.clone()
+        } else {
+            bss_list
+        };
 
         SectionHelper::new(
             self.stream.data(),
@@ -433,12 +492,19 @@ impl Nso {
             Err(_) => return Ok(exports),
         };
         for sym in self.symbols.clone() {
-            if sym.st_value == 0 || sym.st_shndx == SHN_UNDEF { continue; }
-            let name = match self.stream.read_string_to_null_at(strtab_offset + sym.st_name as u64) {
+            if sym.st_value == 0 || sym.st_shndx == SHN_UNDEF {
+                continue;
+            }
+            let name = match self
+                .stream
+                .read_string_to_null_at(strtab_offset + sym.st_name as u64)
+            {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
             exports.push((name, sym.st_value));
         }
         Ok(exports)

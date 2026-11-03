@@ -1,20 +1,71 @@
 pub static CPP_RESERVED_KEYWORDS: &[&str] = &[
-    "klass", "monitor", "register", "_cs", "auto", "friend", "template",
-    "flat", "default", "_ds", "interrupt", "unsigned", "signed", "asm",
-    "if", "case", "break", "continue", "do", "new", "_", "short",
-    "union", "class", "namespace", "volatile", "const", "extern",
-    "static", "struct", "typedef", "enum", "return", "switch",
-    "goto", "void", "for", "while", "else", "sizeof", "this",
-    "public", "private", "protected", "operator", "true", "false",
-    "nullptr", "method",
+    "klass",
+    "monitor",
+    "register",
+    "_cs",
+    "auto",
+    "friend",
+    "template",
+    "flat",
+    "default",
+    "_ds",
+    "interrupt",
+    "unsigned",
+    "signed",
+    "asm",
+    "if",
+    "case",
+    "break",
+    "continue",
+    "do",
+    "new",
+    "_",
+    "short",
+    "union",
+    "class",
+    "namespace",
+    "volatile",
+    "const",
+    "extern",
+    "static",
+    "struct",
+    "typedef",
+    "enum",
+    "return",
+    "switch",
+    "goto",
+    "void",
+    "for",
+    "while",
+    "else",
+    "sizeof",
+    "this",
+    "public",
+    "private",
+    "protected",
+    "operator",
+    "true",
+    "false",
+    "nullptr",
+    "method",
 ];
 
 pub static CPP_RESERVED_SPECIAL: &[&str] = &["inline", "near", "far"];
 
 pub static LIBC_RESERVED_NAMES: &[&str] = &[
-    "__sF", "__sE", "__sS", "__stdin", "__stdout", "__stderr",
-    "__cleanup", "__progname", "__environ", "errno",
-    "stdin", "stdout", "stderr",
+    "__sF",
+    "__sE",
+    "__sS",
+    "__stdin",
+    "__stdout",
+    "__stderr",
+    "__cleanup",
+    "__progname",
+    "__environ",
+    "errno",
+    "stdin",
+    "stdout",
+    "stderr",
 ];
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,8 +83,14 @@ pub fn sanitize_path_component(name: &str) -> String {
             c => out.push(c),
         }
     }
-    let trimmed = out.trim_end_matches(|c: char| c == '.' || c == ' ').to_string();
-    if trimmed.is_empty() { "_".into() } else { trimmed }
+    let trimmed = out
+        .trim_end_matches(|c: char| c == '.' || c == ' ')
+        .to_string();
+    if trimmed.is_empty() {
+        "_".into()
+    } else {
+        trimmed
+    }
 }
 
 pub fn sanitize_cpp_identifier(name: &str, opts: NameSanitizerOptions) -> String {
@@ -105,7 +162,8 @@ pub fn escape_string_preview(s: &str, max_len: usize) -> String {
         return escaped;
     }
     let cutoff = max_len.saturating_sub(3);
-    let safe_end = escaped.char_indices()
+    let safe_end = escaped
+        .char_indices()
         .map(|(i, _)| i)
         .take_while(|&i| i <= cutoff)
         .last()

@@ -170,6 +170,34 @@ fn find_lsda_offset_in_unwind_info(unwind_data: &[u8], func_rva: u64) -> Option<
 // LSDA (Itanium-ABI .gcc_except_tab) parsing
 // ---------------------------------------------------------------------------
 
+/// One entry of an Itanium action chain, in selector order.
+///
+/// The chain is the personality routine's ORDERED list of actions for one
+/// call-site range; selector value `k` (the `w1` dispatch in the landing
+/// pad) picks `chain[k - 1]`. Keeping the chain instead of a
+/// `(catches, is_cleanup)` pair is what separates two facts that the old
+/// model merged:
+///
+/// * `ttypeIndex == 0` is the personality's **cleanup** action. IL2CPP emits
+///   one as the no-match arm of every managed catch
+///   (`[catch(wrapper), cleanup]`), so its presence does NOT make the region
+///   a `finally`.
+/// * a `ttypeIndex > 0` whose type-table entry is NULL is an untyped
+///   **catch-all** — a different thing from a cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Clause {
+    /// `ttypeIndex > 0` with a non-null type-table entry: `catch (T)`.
+    /// `name` is the decoded `type_info` name (the wrapper for every managed
+    /// catch; the managed type filter is inside the landing pad).
+    Catch { name: String },
+    /// `ttypeIndex > 0` with a NULL type-table entry: an untyped catch.
+    CatchAll,
+    /// `ttypeIndex == 0`: the personality's cleanup action.
+    Cleanup,
+    /// `ttypeIndex < 0`: an exception specification (filter).
+    Filter,
+}
+
 /// One decoded try region.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EhRegion {
@@ -179,12 +207,61 @@ pub struct EhRegion {
     pub try_end: u64,
     /// Landing-pad RVA (absolute; `lpStart + offset`).
     pub landing_pad: u64,
-    /// Caught types, in `catch` order. Empty = cleanup/finally.
-    /// `None` entries are `catch (...)` (ttypeIndex == 0 / null type_info).
+    /// The action chain, in selector order. Never empty for a row with a
+    /// landing pad: `actionEntry == 0` yields `[Cleanup]`.
+    pub chain: Vec<Clause>,
+    /// Caught types, in `catch` order, DERIVED from `chain` for the printer:
+    /// `Some(name)` per `Clause::Catch`, `None` per `Clause::CatchAll`.
+    /// `Clause::Cleanup` contributes nothing, so a managed catch's trailing
+    /// no-match cleanup no longer shows up as a phantom `catch (...)`.
     pub catches: Vec<Option<String>>,
-    /// True when the landing pad is reached only for cleanup (finally/fault
-    /// semantics: actionEntry == 0 or action chain ends with ttypeIndex == 0).
+    /// True only when the whole chain is cleanup actions (`actionEntry == 0`
+    /// for the LSDA paths, JumpTarget 0 / kind 0 for the Mach-O / ARM-EHABI
+    /// paths). DERIVED from `chain`; never set by a trailing arm.
     pub is_cleanup: bool,
+}
+
+impl EhRegion {
+    /// Build a region and its compatibility views from the chain.
+    pub fn new(try_start: u64, try_end: u64, landing_pad: u64, chain: Vec<Clause>) -> Self {
+        let catches = chain
+            .iter()
+            .filter_map(|c| match c {
+                Clause::Catch { name, .. } => Some(Some(name.clone())),
+                Clause::CatchAll => Some(None),
+                Clause::Filter => Some(Some("/* filter */".to_string())),
+                Clause::Cleanup => None,
+            })
+            .collect();
+        let is_cleanup = !chain.is_empty() && chain.iter().all(|c| matches!(c, Clause::Cleanup));
+        Self {
+            try_start,
+            try_end,
+            landing_pad,
+            chain,
+            catches,
+            is_cleanup,
+        }
+    }
+
+    /// Does any arm catch (`catch (T)` or an untyped catch)?
+    pub fn has_catch(&self) -> bool {
+        self.chain
+            .iter()
+            .any(|c| matches!(c, Clause::Catch { .. } | Clause::CatchAll))
+    }
+
+    /// Does the chain contain a personality cleanup action?
+    pub fn has_cleanup(&self) -> bool {
+        self.chain.iter().any(|c| matches!(c, Clause::Cleanup))
+    }
+
+    /// The catch clauses, in selector order (cleanup actions excluded).
+    pub fn catch_clauses(&self) -> impl Iterator<Item = &Clause> {
+        self.chain
+            .iter()
+            .filter(|c| matches!(c, Clause::Catch { .. } | Clause::CatchAll | Clause::Filter))
+    }
 }
 
 /// Format-neutral EH table source: one variant per executable format.
@@ -263,19 +340,21 @@ impl EhTables {
     ) -> Vec<EhRegion> {
         match self {
             EhTables::MachO(t) => t.regions_for(func_rva, func_len, deref_typeinfo).regions,
-            EhTables::Elf { fdes, table, table_rva, ptr_size } => {
+            EhTables::Elf {
+                fdes,
+                table,
+                table_rva,
+                ptr_size,
+            } => {
                 // binary search the FDE list for this function
                 let idx = fdes.partition_point(|&(start, _)| start <= func_rva);
-                let Some(&(start, lsda_rva)) = idx.checked_sub(1).and_then(|i| fdes.get(i))
-                else {
+                let Some(&(start, lsda_rva)) = idx.checked_sub(1).and_then(|i| fdes.get(i)) else {
                     return Vec::new();
                 };
                 if lsda_rva == 0 || func_rva >= start + func_len && func_rva != start {
                     return Vec::new();
                 }
-                let lsda_in_tab = match (lsda_rva as usize)
-                    .checked_sub(*table_rva as usize)
-                {
+                let lsda_in_tab = match (lsda_rva as usize).checked_sub(*table_rva as usize) {
                     Some(o) if o < table.len() => o,
                     _ => return Vec::new(),
                 };
@@ -292,7 +371,12 @@ impl EhTables {
                 });
                 regs
             }
-            EhTables::ArmEhAbi { exidx, exidx_rva, extab, extab_rva } => arm_ehabi_regions(
+            EhTables::ArmEhAbi {
+                exidx,
+                exidx_rva,
+                extab,
+                extab_rva,
+            } => arm_ehabi_regions(
                 *exidx_rva,
                 exidx,
                 *extab_rva,
@@ -324,11 +408,21 @@ impl<'a> LsdaReader<'a> {
     /// datarel base — the common case.
     #[cfg(test)]
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0, ptr_size: 8, data_base: 0 }
+        Self {
+            data,
+            pos: 0,
+            ptr_size: 8,
+            data_base: 0,
+        }
     }
 
     fn with_ptr_size(data: &'a [u8], ptr_size: usize, data_base: u64) -> Self {
-        Self { data, pos: 0, ptr_size, data_base }
+        Self {
+            data,
+            pos: 0,
+            ptr_size,
+            data_base,
+        }
     }
 
     fn u8(&mut self) -> Option<u8> {
@@ -508,6 +602,14 @@ fn parse_lsda(
         return out;
     }
     let action_table_start = call_site_end;
+    if std::env::var("ILR_EHCHAINDBG").is_ok() {
+        let end = lsda_data.len().min(call_site_end + 40);
+        eprintln!(
+            "[lsda] rva={lsda_rva:#x} func={func_start:#x} lpenc={lp_start_enc:#x} lps={lp_start:#x} ttenc={ttype_enc:#x} ci={class_info:?} csenc={call_site_enc:#x} cslen={call_site_table_len} csstart={call_site_start} act={action_table_start} head={:02x?}",
+            &lsda_data[..call_site_end.min(lsda_data.len())],
+        );
+        let _ = end;
+    }
 
     // -- call-site table ----------------------------------------------------
     while r.pos < call_site_end {
@@ -557,12 +659,15 @@ fn parse_lsda(
         }
 
         // -- action chain ---------------------------------------------------
-        let mut catches: Vec<Option<String>> = Vec::new();
-        let mut is_cleanup = false;
+        // The chain is kept in selector order; the region KIND is a property
+        // of the pad, not of the chain (a managed catch's chain ends with a
+        // cleanup arm that is the personality's no-match path, not a
+        // `finally`). See `Clause`.
+        let mut chain: Vec<Clause> = Vec::new();
         if action_entry == 0 {
             // cxa_personality.cpp: actionEntry == 0 (with a landing pad)
             // IS a cleanup — phase-2-only handler (finally/fault semantics).
-            is_cleanup = true;
+            chain.push(Clause::Cleanup);
         }
         if action_entry != 0 && landing_pad != 0 {
             let mut action_pos = action_table_start + (action_entry as usize - 1);
@@ -582,10 +687,30 @@ fn parse_lsda(
                     Some(t) => t,
                     None => break,
                 };
+                // The next-action offset is relative to the ADDRESS OF THIS
+                // FIELD, not to the end of the record. Both readings agree for
+                // forward offsets, but the compiler chains a managed catch to
+                // its shared cleanup record BACKWARDS (-3 for a 2-byte
+                // record), and only this base lands on the record:
+                //   0xaf0600 + 546: [00 00] [01 7d] [02 00]
+                //   action 3 -> record at 548 = (catch 1, next -3)
+                //   next field at 549, 549 - 3 = 546 = the cleanup record.
+                // With the old base (position AFTER both fields, 550) the walk
+                // landed one byte into the table, read garbage, and appended a
+                // phantom third clause to every managed catch (7,588/7,588
+                // regions on this corpus: (catch, cleanup, catch-all)).
+                let next_field_pos = ar.pos;
                 let action_offset = match ar.sleb128() {
                     Some(o) => o,
                     None => break,
                 };
+                if std::env::var("ILR_EHCHAINDBG").is_ok() {
+                    let end = (action_pos + 8).min(lsda_data.len());
+                    eprintln!(
+                        "[chain] try={try_start:#x} pad={landing_pad:#x} pos={action_pos} ttype={ttype_index} next={action_offset} bytes={:02x?} action_table={action_table_start}",
+                        &lsda_data[action_pos..end]
+                    );
+                }
                 if ttype_index > 0 {
                     // catch(T): ttypeIndex is a 1-based index INTO the type
                     // table, counted BACKWARD from classInfo in entry-sized
@@ -601,8 +726,8 @@ fn parse_lsda(
                         // classInfoOffset is relative to the position AFTER
                         // its own ULEB128, so `ci` is a byte offset into
                         // lsda_data directly.
-                        let entry_pos = (ci as i64)
-                            .checked_sub(ttype_index.saturating_mul(entry_size as i64));
+                        let entry_pos =
+                            (ci as i64).checked_sub(ttype_index.saturating_mul(entry_size as i64));
                         if let Some(ep) =
                             entry_pos.filter(|&e| e >= 0 && (e as usize) < lsda_data.len())
                         {
@@ -614,51 +739,57 @@ fn parse_lsda(
                             };
                             let typeinfo_pc = pc(ep as usize);
                             match tr.encoded(ttype_enc, typeinfo_pc) {
-                                Some(0) => catches.push(None), // null → catch (...)
+                                // A NULL type-table entry is an UNTYPED catch
+                                // (catch-all), which is NOT the same fact as
+                                // ttypeIndex == 0 (cleanup). The old model
+                                // pushed `None` for both and could not tell a
+                                // compiler terminate guard from a `finally`.
+                                Some(0) => chain.push(Clause::CatchAll),
                                 Some(va) => {
                                     let name =
                                         resolve_indirect(va).unwrap_or_else(|| format!("{va:#x}"));
-                                    catches.push(Some(name));
+                                    chain.push(Clause::Catch { name });
                                 }
-                                None => catches.push(None),
+                                None => chain.push(Clause::CatchAll),
                             }
                         } else {
-                            catches.push(None);
+                            chain.push(Clause::CatchAll);
                         }
                     } else {
-                        catches.push(None);
+                        chain.push(Clause::CatchAll);
                     }
                 } else if ttype_index == 0 {
-                    is_cleanup = true;
+                    // The personality's cleanup action. In a managed catch
+                    // this is the NO-MATCH arm (the wrapper's catch already
+                    // ran); it is a cleanup ACTION, not a region kind, so it
+                    // must not set `is_cleanup` (that was E2: every managed
+                    // catch rendered as `finally`).
+                    chain.push(Clause::Cleanup);
                 } else {
                     // ttypeIndex < 0: exception SPECIFICATION (filter).
                     // C# has no direct equivalent; keep it visible.
-                    catches.push(Some("/* filter */".to_string()));
+                    chain.push(Clause::Filter);
                 }
                 if action_offset == 0 {
                     break;
                 }
-                // Per cxa_personality.cpp: `action += actionOffset` where
-                // `action` points just AFTER both SLEB fields were read —
-                // i.e. relative to the end of the current entry. A negative
-                // offset cannot point forward; treat unsigned wraps as end.
-                let next = action_pos as i64
-                    + (ar.pos - action_pos) as i64
-                    + action_offset;
-                if next <= 0 || next as usize >= lsda_data.len() {
+                // Walk from the next_offset field's own address (see above).
+                // The target must stay inside the action table: the table runs
+                // from `action_table_start` up to the class-info table, and a
+                // corrupt/unexpected offset must END the chain rather than
+                // wander into the type table and invent clauses.
+                let next = next_field_pos as i64 + action_offset;
+                let action_end = class_info
+                    .map(|ci| ci.min(lsda_data.len() as u64) as i64)
+                    .unwrap_or(lsda_data.len() as i64);
+                if next < action_table_start as i64 || next >= action_end {
                     break;
                 }
                 action_pos = next as usize;
             }
         }
 
-        out.push(EhRegion {
-            try_start,
-            try_end,
-            landing_pad,
-            catches,
-            is_cleanup,
-        });
+        out.push(EhRegion::new(try_start, try_end, landing_pad, chain));
     }
 
     out
@@ -783,7 +914,7 @@ fn parse_one_fde(
     let mut cp = cie_start_off + 4;
     if cie_len == 0xffffffff {
         cp += 8; // 64-bit length already consumed by caller's framing? no —
-                 // CIE length is its own record; handle it
+        // CIE length is its own record; handle it
     }
     let cie_id = u32le_at(data, cp)?;
     if cie_id != 0 {
@@ -862,7 +993,7 @@ fn parse_one_fde(
             let peek_val = fr.encoded(lsda_encoding & 0x0f, 0)?;
             if peek_val != 0 {
                 fr.pos = peek_pos;
-                let lsda_addr = fr.encoded(lsda_encoding, fr.pos as u64)?;
+                let lsda_addr = fr.encoded(lsda_encoding, section_rva + fr.pos as u64 + image_base)?;
                 // .eh_frame LSDA pointers are pcrel-to-section or absptr;
                 // pcrel already resolved via base. absptr values are VAs.
                 lsda_rva = lsda_addr;
@@ -955,15 +1086,12 @@ impl MachOExceptionTables {
         // (RVA). UnwindCursor.hpp: `lsda = lsdaIndex.lsdaOffset(mid) +
         // sects.dso_base` where dso_base is the Mach-O header VA — so the
         // LSDA bytes live at RVA == lsdaOffset directly.
-        let Some(lsda_rva) = find_lsda_offset_in_unwind_info(&self.unwind_info, func_rva)
-        else {
+        let Some(lsda_rva) = find_lsda_offset_in_unwind_info(&self.unwind_info, func_rva) else {
             return FunctionEh { regions };
         };
         // Translate the image-relative LSDA RVA into an offset within the
         // `__gcc_except_tab` section bytes we hold.
-        let Some(lsda_in_tab) =
-            (lsda_rva as u64).checked_sub(self.gcc_except_tab_file_rva)
-        else {
+        let Some(lsda_in_tab) = (lsda_rva as u64).checked_sub(self.gcc_except_tab_file_rva) else {
             return FunctionEh { regions };
         };
         let lsda_in_tab = lsda_in_tab as usize;
@@ -982,9 +1110,7 @@ impl MachOExceptionTables {
         // call sites with landingPad == 0 mean "no handler here" — drop them
         regs.retain(|rg| rg.landing_pad != 0);
         // sanity: keep only regions that actually intersect this function
-        regs.retain(|rg| {
-            rg.try_end > func_rva && rg.try_start < func_rva.wrapping_add(func_len)
-        });
+        regs.retain(|rg| rg.try_end > func_rva && rg.try_start < func_rva.wrapping_add(func_len));
         regions = regs;
         FunctionEh { regions }
     }
@@ -1106,8 +1232,7 @@ impl PeExceptionTables {
         // `.pdata` is sorted by function start: take the last entry at or before
         // the query and require it to actually cover the function.
         let idx = self.funcs.partition_point(|&(s, _)| s <= func_rva);
-        let Some(&(start, unwind_rva)) = idx.checked_sub(1).and_then(|i| self.funcs.get(i))
-        else {
+        let Some(&(start, unwind_rva)) = idx.checked_sub(1).and_then(|i| self.funcs.get(i)) else {
             return Vec::new();
         };
         if unwind_rva == 0 {
@@ -1191,12 +1316,8 @@ impl PeExceptionTables {
         if dir_off + 4 > d.len() {
             return Vec::new();
         }
-        let handler_rva = u32::from_le_bytes([
-            d[dir_off],
-            d[dir_off + 1],
-            d[dir_off + 2],
-            d[dir_off + 3],
-        ]);
+        let handler_rva =
+            u32::from_le_bytes([d[dir_off], d[dir_off + 1], d[dir_off + 2], d[dir_off + 3]]);
         if handler_rva == 0 {
             return Vec::new();
         }
@@ -1230,12 +1351,9 @@ impl PeExceptionTables {
             if count == 0 || count > MAX_SCOPE_RECORDS {
                 continue;
             }
-            if let Some(regs) = self.decode_scope_records(
-                &d[count_at + 4..],
-                count as usize,
-                func_base,
-                func_len,
-            ) {
+            if let Some(regs) =
+                self.decode_scope_records(&d[count_at + 4..], count as usize, func_base, func_len)
+            {
                 if !regs.is_empty() {
                     return regs;
                 }
@@ -1288,8 +1406,12 @@ impl PeExceptionTables {
         for i in 0..count {
             let o = i * 16;
             let rd = |k: usize| -> u64 {
-                u32::from_le_bytes([recs[o + k], recs[o + k + 1], recs[o + k + 2], recs[o + k + 3]])
-                    as u64
+                u32::from_le_bytes([
+                    recs[o + k],
+                    recs[o + k + 1],
+                    recs[o + k + 2],
+                    recs[o + k + 3],
+                ]) as u64
             };
             let begin = rd(0);
             let mut end = rd(4);
@@ -1314,17 +1436,14 @@ impl PeExceptionTables {
             // whose funclet is `HandlerAddress`; otherwise the handler body.
             let is_cleanup = jump == 0;
             let landing_pad = if is_cleanup { handler } else { jump };
-            out.push(EhRegion {
-                try_start: begin,
-                try_end: end,
-                landing_pad,
-                catches: if is_cleanup {
-                    Vec::new()
-                } else {
-                    vec![Some(MANAGED_CATCH.to_string())]
-                },
-                is_cleanup,
-            });
+            let chain = if is_cleanup {
+                vec![Clause::Cleanup]
+            } else {
+                vec![Clause::Catch {
+                    name: MANAGED_CATCH.to_string(),
+                }]
+            };
+            out.push(EhRegion::new(begin, end, landing_pad, chain));
         }
         Some(out)
     }
@@ -1365,7 +1484,9 @@ impl PeExceptionTables {
 
 /// Read a little-endian `u32` at byte offset `off`.
 fn rd_le_u32(bytes: &[u8], off: usize) -> Option<u32> {
-    bytes.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    bytes
+        .get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Decode an R_ARM_PREL31 word at byte offset `off`: bits 0-30 are a signed
@@ -1374,7 +1495,11 @@ fn rd_le_u32(bytes: &[u8], off: usize) -> Option<u32> {
 fn arm_prel31(bytes: &[u8], at: u64, off: usize) -> Option<u64> {
     let w = rd_le_u32(bytes, off)?;
     let v = (w & 0x7fff_ffff) as i64;
-    let signed = if v & 0x4000_0000 != 0 { v - 0x8000_0000 } else { v };
+    let signed = if v & 0x4000_0000 != 0 {
+        v - 0x8000_0000
+    } else {
+        v
+    };
     Some((at as i64 + signed) as u64 & 0xffff_ffff)
 }
 
@@ -1421,13 +1546,7 @@ fn parse_arm_descriptors(
             0 => {
                 // Cleanup: one prel31 landing pad.
                 let lp = arm_prel31(extab, extab_rva + o as u64, o).unwrap_or(0);
-                out.push(EhRegion {
-                    try_start,
-                    try_end,
-                    landing_pad: lp,
-                    catches: Vec::new(),
-                    is_cleanup: true,
-                });
+                out.push(EhRegion::new(try_start, try_end, lp, vec![Clause::Cleanup]));
                 o += 4;
             }
             1 => {
@@ -1438,13 +1557,7 @@ fn parse_arm_descriptors(
                 let lp = arm_prel31(extab, extab_rva + o as u64, o).unwrap_or(0);
                 let ty = rd_le_u32(extab, o + 4).unwrap_or(0);
                 if ty != 0xffff_fffe {
-                    out.push(EhRegion {
-                        try_start,
-                        try_end,
-                        landing_pad: lp,
-                        catches: vec![None],
-                        is_cleanup: false,
-                    });
+                    out.push(EhRegion::new(try_start, try_end, lp, vec![Clause::CatchAll]));
                 }
                 o += 8;
             }
@@ -1639,6 +1752,163 @@ mod tests {
         );
     }
 
+    /// LSDA with the corpus's real action-table shape (see
+    /// `managed_catch_chain_walks_the_shared_cleanup_record`), parameterised
+    /// by the call-site row's action entry.
+    fn corpus_style_chain_lsda(action_entry: u8) -> Vec<u8> {
+        let mut lsda: Vec<u8> = Vec::new();
+        lsda.push(0xff); // [0] lpStartEncoding omit
+        lsda.push(0x9b); // [1] ttypeEncoding pcrel|indirect|sdata4
+        let cio_off = lsda.len(); // [2] classInfoOffset, patched below
+        lsda.push(0x00);
+        lsda.push(0x01); // [3] callSiteEncoding uleb128
+        lsda.push(0x04); // [4] callSiteTableLength = 4
+        lsda.push(0x00); // [5] start = 0
+        lsda.push(0x40); // [6] len = 0x40
+        lsda.push(0x10); // [7] landingPad = 0x10
+        lsda.push(action_entry); // [8] action entry
+        assert_eq!(lsda.len(), 9);
+        lsda.extend_from_slice(&[0x00, 0x00]); // [9]  action 1: cleanup, next 0
+        lsda.extend_from_slice(&[0x01, 0x7d]); // [11] action 3: catch 1, next -3
+        lsda.extend_from_slice(&[0x02, 0x00]); // [13] action 5: catch-all, next 0
+        lsda.extend_from_slice(&0u32.to_le_bytes()); // [15] type entry 2 = NULL
+        lsda.extend_from_slice(&0x2000u32.to_le_bytes()); // [19] type entry 1
+        let class_info = lsda.len() as u64; // 23
+        lsda[cio_off] = (class_info - (cio_off as u64 + 1)) as u8;
+        lsda
+    }
+
+    fn corpus_deref(rva: u64) -> Option<String> {
+        // type entry 1 at offset 19, pcrel from lsda_rva 0x3000
+        if rva == 0x3000 + 19 + 0x2000 {
+            Some("System.Exception".to_string())
+        } else {
+            None
+        }
+    }
+    /// A managed catch compiles to the Itanium chain
+    /// [catch(wrapper) -> cleanup]. The trailing arm is the personality's
+    /// NO-MATCH path (ttypeIndex 0 = a cleanup ACTION), not a destructor run
+    /// and not a second clause, so the region is a CATCH, not a cleanup.
+    /// Reading the arm as the region kind made every managed catch render as
+    /// C# `finally` (E2: 4,970/4,970 typed rows).
+    #[test]
+    fn a_chain_ending_in_a_catch_all_is_a_catch_not_a_cleanup() {
+        let mut lsda: Vec<u8> = Vec::new();
+        lsda.push(0x00); //                              [0]  lpStartEncoding absptr
+        lsda.extend_from_slice(&0x1000u64.to_le_bytes()); // [1..9] lpStart
+        lsda.push(0x9b); //                              [9]  ttypeEncoding pcrel|indirect|sdata4
+        let cio_off = lsda.len() as u8; //               [10] classInfoOffset byte
+        lsda.push(0x00); // placeholder, patched below
+        lsda.push(0x01); //                              [11] callSiteEncoding uleb128
+        lsda.push(0x04); //                              [12] callSiteTableLength = 4
+        let cs_start = 13usize;
+        assert_eq!(cs_start, lsda.len());
+        lsda.push(0x00); //                              [13] cs: start = 0
+        lsda.push(0x40); //                              [14] cs: len = 0x40
+        lsda.push(0x10); //                              [15] cs: landingPad = 0x10
+        lsda.push(0x01); //                              [16] cs: action = 1
+        assert_eq!(cs_start + 4, lsda.len());
+        lsda.push(0x01); //                              [17] arm 1: ttypeIndex = 1
+        lsda.push(0x02); //                              [18] arm 1: actionOffset -> [21]
+        lsda.push(0x00); //                              [19] filler
+        lsda.push(0x00); //                              [20] filler
+        lsda.push(0x00); //                              [21] arm 2: ttypeIndex = 0 (fallback)
+        lsda.push(0x00); //                              [22] arm 2: actionOffset = 0 (end)
+        let type_entry_at = lsda.len() as u64; //        [23]
+        lsda.extend_from_slice(&0x2000u32.to_le_bytes()); // [23..27] type ptr (pcrel)
+        let class_info = lsda.len() as u64; //           27 = one-past the entry
+        lsda.extend_from_slice(&[0u8; 2]);
+        lsda[cio_off as usize] = (class_info - (cio_off as u64 + 1)) as u8;
+
+        let lsda_rva = 0x3000u64;
+        let expect_ti = lsda_rva + type_entry_at + 0x2000;
+        let deref = |rva: u64| -> Option<String> {
+            if rva == expect_ti {
+                Some("System.Exception".to_string())
+            } else {
+                None
+            }
+        };
+        let regions = parse_lsda(&lsda, 0x1000, lsda_rva, 8, 0, &deref);
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert!(
+            !r.is_cleanup,
+            "a catch chain must not be classified as a cleanup: {r:?}"
+        );
+        assert_eq!(
+            r.chain,
+            vec![
+                Clause::Catch {
+                    name: "System.Exception".to_string()
+                },
+                Clause::Cleanup
+            ],
+            "one typed arm, then the personality's no-match cleanup: {r:?}"
+        );
+        assert_eq!(
+            r.catches,
+            vec![Some("System.Exception".to_string())],
+            "the cleanup arm is not a catch clause and must not appear"
+        );
+        assert!(r.has_catch() && r.has_cleanup());
+    }
+
+    /// The exact action table this corpus's compiler emits for one managed
+    /// catch, taken from libil2cpp.so LSDA @0xaf0600 (function 0x15a07dc):
+    ///
+    ///   546: 00 00     action 1: (ttype 0 = cleanup, next 0)
+    ///   548: 01 7d     action 3: (ttype 1 = catch, next -3)
+    ///   550: 02 00     action 5: (ttype 2 = NULL entry = catch-all, next 0)
+    ///   552..: zeros, then the type table (index 1 at 560, ci = 568)
+    ///
+    /// Action 3's -3 is a BACKWARD offset: 549 - 3 = 546, the shared cleanup
+    /// record. Applying it from the end of the record (550 - 3 = 547) lands
+    /// one byte into the table, reads [00, 01] as (cleanup, next +1) and
+    /// appends a phantom third clause - which is what every one of the 7,588
+    /// managed-catch rows in this binary used to decode to.
+    #[test]
+    fn managed_catch_chain_walks_the_shared_cleanup_record() {
+        let lsda = corpus_style_chain_lsda(3);
+        let regions = parse_lsda(&lsda, 0x1000, 0x3000, 8, 0, &corpus_deref);
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert_eq!(
+            r.chain,
+            vec![
+                Clause::Catch {
+                    name: "System.Exception".to_string()
+                },
+                Clause::Cleanup
+            ],
+            "catch arm 3 must chain BACKWARDS to the shared cleanup record: {r:?}"
+        );
+        assert_eq!(r.catches, vec![Some("System.Exception".to_string())]);
+        assert!(!r.is_cleanup);
+    }
+
+    /// ttypeIndex > 0 with a NULL type-table entry is an untyped catch, and
+    /// must not be confused with ttypeIndex == 0 (a cleanup action). The
+    /// compiler emits this shape for the terminate guard it puts around calls
+    /// inside a cleanup: 1,645 of the 9,233 handler rows in this binary.
+    #[test]
+    fn null_type_entry_is_a_catch_all_not_a_cleanup() {
+        let lsda = corpus_style_chain_lsda(5);
+        let regions = parse_lsda(&lsda, 0x1000, 0x3000, 8, 0, &corpus_deref);
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert_eq!(
+            r.chain,
+            vec![Clause::CatchAll],
+            "a null type entry is a catch-all clause: {r:?}"
+        );
+        assert!(r.has_catch());
+        assert!(!r.has_cleanup());
+        assert!(!r.is_cleanup, "an untyped catch is not a cleanup");
+        assert_eq!(r.catches, vec![None]);
+    }
+
     #[test]
     fn lsda_cleanup_only() {
         // landingPad offset 0 = "no handler at this call site" (the runtime
@@ -1718,7 +1988,10 @@ mod tests {
         // the raw offset (the old behaviour) produced an address in whatever
         // section happened to start at file offset 0.
         let mut r = LsdaReader::with_ptr_size(&[0x10, 0, 0, 0], 8, 0x1000);
-        assert_eq!(r.encoded(DW_EH_PE_DATAREL | DW_EH_PE_UDATA4, 0), Some(0x1010));
+        assert_eq!(
+            r.encoded(DW_EH_PE_DATAREL | DW_EH_PE_UDATA4, 0),
+            Some(0x1010)
+        );
     }
 
     #[test]
@@ -1823,12 +2096,20 @@ mod tests {
     #[test]
     fn arm_ehabi_cantunwind_and_truncated_generic_yield_nothing() {
         let cant = exidx_entry(0x8000, 0x1000, 1).to_vec();
-        assert!(arm_tables(cant, Vec::new()).regions_for(0x1000, 0x100, &|_| None).is_empty());
+        assert!(
+            arm_tables(cant, Vec::new())
+                .regions_for(0x1000, 0x100, &|_| None)
+                .is_empty()
+        );
         // Generic (extab word 0 has bit 31 clear), but the entry is only the
         // personality-routine word — there is no LSDA to decode.
         let exidx = exidx_entry(0x8000, 0x1000, prel31_word(0x8004, 0x9000)).to_vec();
         let extab = prel31_word(0x9000, 0x5000).to_le_bytes().to_vec();
-        assert!(arm_tables(exidx, extab).regions_for(0x1000, 0x100, &|_| None).is_empty());
+        assert!(
+            arm_tables(exidx, extab)
+                .regions_for(0x1000, 0x100, &|_| None)
+                .is_empty()
+        );
     }
 
     /// A GENERIC entry whose payload is an Itanium LSDA yields its regions.
@@ -1923,9 +2204,15 @@ mod tests {
         assert_eq!(regs.len(), 1);
         assert_eq!(regs[0].try_start, 0x1020);
         assert_eq!(regs[0].try_end, 0x1040);
-        assert_eq!(regs[0].landing_pad, 0x1090, "JumpTarget names the handler body");
+        assert_eq!(
+            regs[0].landing_pad, 0x1090,
+            "JumpTarget names the handler body"
+        );
         assert!(!regs[0].is_cleanup);
-        assert_eq!(regs[0].catches, vec![Some("/* managed catch */".to_string())]);
+        assert_eq!(
+            regs[0].catches,
+            vec![Some("/* managed catch */".to_string())]
+        );
     }
 
     /// A `__finally` scope (`JumpTarget` 0) becomes a cleanup region.
@@ -1985,7 +2272,8 @@ mod tests {
         while xdata.len() < 0x100 {
             xdata.push(0); // pad so the parent lands at RVA 0x6100 (byte 0x100)
         }
-        let parent = pe_xdata_with_handler(0x1234, &scope_table(&[(0x1010, 0x1030, 0x1080, 0x1090)]));
+        let parent =
+            pe_xdata_with_handler(0x1234, &scope_table(&[(0x1010, 0x1030, 0x1080, 0x1090)]));
         xdata.extend_from_slice(&parent);
         let regs = pe_tables(xdata, 0x1000, 0x6000).regions_for(0x1000, 0x200, &|_| None);
         assert_eq!(regs.len(), 1, "the handler lives in the chained parent");

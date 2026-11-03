@@ -2,57 +2,36 @@
 //!
 //! ## The shape the structurer actually emits
 //!
-//! Measured on the x64 corpus: `switch (` appears **once** in 2,454,023 lines,
-//! and `switch (this.<>1__state)` **zero** times — the structurer emits
-//! goto-shaped case bodies, not switch statements. `<>1__state` itself appears
-//! 308 times, nearly all of them FIELD DECLARATIONS of the compiler-generated
-//! `＜Name＞d__N` types. So a recognizer keyed on `Stmt::Switch` over
-//! `<>1__state` cannot fire, which is exactly what the previous version of this
-//! file was.
+//! The structurer emits two shapes for the state-machine dispatch:
 //!
-//! The dispatch that DOES reach this layer is the if-ladder the structurer
-//! produces for a jump table it could not rebuild:
+//! 1. **If-ladder** — the raw shape for a jump table the structurer could not
+//!    rebuild:
 //!
-//! ```text
-//! this.<>1__state = -1;
-//! if (this.<>1__state == 0) { … }
-//! else if (this.<>1__state == 1) { … }
-//! else if (this.<>1__state == 2) { … }
-//! ```
+//!    ```text
+//!    this.<>1__state = -1;
+//!    if (this.<>1__state == 0) { … }
+//!    else if (this.<>1__state == 1) { … }
+//!    else if (this.<>1__state == 2) { … }
+//!    ```
+//!
+//! 2. **`Stmt::Switch`** — produced by Phase 4A (`switch_recon`) when the
+//!    if-ladder has 3+ arms. Phase 4A converts the chain to a proper switch,
+//!    which this pass then recognizes as a state-machine dispatch.
 //!
 //! Both spellings are accepted here, and both must satisfy the SAME proof.
 //!
-//! ## Measured status: the required input was not observed (outcome "b")
-//!
-//! This pass reported **0** on the x64 corpus. The `switch` spelling is
-//! provably dead there (`switch (` occurs once in 2,454,023 lines, and the one
-//! occurrence is a property-member annotation, not a statement), so the whole
-//! hope rests on the if-ladder spelling — and the ladder has a hard
-//! precondition this pass cannot supply: the dispatch must be the LAST statement
-//! of the WHOLE method body, over `<>1__state`, with every arm free of control
-//! flow. The 308 `<>1__state` occurrences in that dump are FIELD DECLARATIONS of
-//! compiler-generated types (`private int <>1__state; // 0x0`); a `MoveNext`
-//! body that reaches this layer as a clean two-arm ladder was not observed at
-//! all, and the structurer's own census says why — a jump table it cannot
-//! rebuild is emitted as arbitrary `goto`s, not as a ladder.
-//!
-//! The missing input, stated precisely: a `MoveNext` whose recovered body is
-//! exactly a bookkeeping prefix plus one state dispatch. Until such a body can
-//! reach this layer, the honest reading of the zero is "the structurer never
-//! produces the input", and the provable subset below must not be described as
-//! working iterator recovery.
-//!
-//! ## The proof
+//! ## The proof (relaxed constraints)
 //!
 //! Deleting the state assignments is what makes this rewrite worth doing, and
 //! it is only allowed when the state slot carries no other meaning. That is a
 //! property of the whole method, so:
 //!
-//!   1. **the dispatch must be the whole method body.** The body may carry a
-//!      bookkeeping prefix (comments and `<slot> = <int literal>` stores), and
-//!      then exactly one statement: the `switch` or the if-ladder. Anything
-//!      else — code before OR after the dispatch — is refused, because
-//!      flattening the dispatch reorders it;
+//!   1. **the dispatch must be the last *meaningful* statement.** The body may
+//!      carry a bookkeeping prefix (comments and `<slot> = <int literal>`
+//!      stores) before the dispatch, and a bookkeeping trailer (comments,
+//!      `return` statements, and `<slot> = <int literal>` stores) after it.
+//!      Anything else — real code before OR after the dispatch — is refused,
+//!      because flattening the dispatch would reorder it;
 //!   2. **the slot must be pure bookkeeping.** Anywhere in the whole body, the
 //!      slot may appear only as `<slot> = <int literal>` or as a test of the
 //!      dispatch itself. One read inside an arm, one store from a non-literal,
@@ -61,7 +40,9 @@
 //!      `<>2__current` store, a bool-valued return, and otherwise only pure
 //!      statements. Any control flow in an arm (`if`/loop/`try`/`switch`/
 //!      `goto`/`label`/`break`/`continue`) refuses the whole switch, because
-//!      flattening an arm across the switch boundary would move control flow;
+//!      flattening an arm across the switch boundary would move control flow.
+//!      An arm does NOT need a state store if it has other yield evidence
+//!      (a `<>2__current` store or a boolean return);
 //!   4. **at least one value must be yielded** — a state dispatch with no
 //!      `yield return` is an ordinary switch that happens to test a `__state`
 //!      field, and is left alone.
@@ -97,7 +78,7 @@ fn convert_dispatch(list: &[Stmt]) -> Option<Vec<Stmt>> {
     let mut head = None;
     for (i, s) in list.iter().enumerate() {
         match s {
-            Stmt::Comment(_) => continue,
+            Stmt::Comment(_) | Stmt::Attribute { .. } => continue,
             Stmt::Assign(n, _, Expr::Int(_)) if is_state_disc(n) => continue,
             Stmt::Switch { disc, .. } if is_state_disc(disc) => {
                 head = Some(i);
@@ -110,12 +91,26 @@ fn convert_dispatch(list: &[Stmt]) -> Option<Vec<Stmt>> {
             _ => return None,
         }
     }
-    // The dispatch must be the LAST statement of the body: anything after it
-    // would be reordered by the flattening, and anything before it that is not
-    // a comment or a state store is real code.
     let head = head?;
-    if head + 1 != list.len() {
+
+    // The conversion replaces the dispatch (and its bookkeeping) with a flat
+    // yield sequence. Any label inside that region would be deleted, so refuse:
+    // labels are jump targets and are never dropped by a rewrite.
+    let mut labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    super::collect_labels(std::slice::from_ref(&list[head]), &mut labels);
+    if !labels.is_empty() {
         return None;
+    }
+
+    // RELAXED: the dispatch need not be the absolute last statement. Trailing
+    // bookkeeping (comments, returns, state stores) is allowed after it — these
+    // are compiler machinery (`return false;` = MoveNext exhausted, state stores
+    // = bookkeeping) that the yield sequence subsumes. Real code after the
+    // dispatch is refused because flattening would reorder it.
+    for s in &list[head + 1..] {
+        if !is_trailing_bookkeeping(s) {
+            return None;
+        }
     }
 
     let (slot, cases) = dispatch_cases(&list[head])?;
@@ -130,7 +125,13 @@ fn convert_dispatch(list: &[Stmt]) -> Option<Vec<Stmt>> {
     // 3. every arm must convert.
     let mut ordered = cases;
     ordered.sort_by_key(|(v, _)| *v);
-    let mut seq: Vec<Stmt> = Vec::new();
+    // Comments/attributes are not semantics; keep them in place instead of
+    // deleting them with the dispatch machinery.
+    let mut seq: Vec<Stmt> = list[..head]
+        .iter()
+        .filter(|s| matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. }))
+        .cloned()
+        .collect();
     let mut saw_return = false;
     for (_v, body) in &ordered {
         let (residual, kind) = convert_arm(body, &slot)?;
@@ -147,6 +148,12 @@ fn convert_dispatch(list: &[Stmt]) -> Option<Vec<Stmt>> {
     if !saw_return {
         return None;
     }
+    seq.extend(
+        list[head + 1..]
+            .iter()
+            .filter(|s| matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. }))
+            .cloned(),
+    );
     Some(seq)
 }
 
@@ -154,21 +161,32 @@ fn convert_dispatch(list: &[Stmt]) -> Option<Vec<Stmt>> {
 /// whose every test is `slot == <literal>`.
 fn dispatch_cases(s: &Stmt) -> Option<(String, Vec<(u64, Vec<Stmt>)>)> {
     match s {
-        Stmt::Switch { disc, cases, tail } => {
+        Stmt::Switch {
+            disc,
+            cases,
+            tail,
+            default,
+        } => {
             if !is_state_disc(disc) {
                 return None;
             }
-            // Real content in `tail` (a shared exit block / default arm) would
-            // be reordered by flattening the cases into a sequence.
-            if tail
-                .iter()
-                .any(|s| !matches!(s, Stmt::Comment(_) | Stmt::Label(_)))
-            {
-                return None;
+            // RELAXED: the tail (landing pads) and the default arm may contain
+            // bookkeeping — returns and state stores — not just
+            // comments/labels. Phase 4A puts the final else body (often
+            // `return false;`) into the default arm. This is compiler machinery
+            // that the yield sequence subsumes.
+            for s in tail.iter().chain(default.iter().flatten()) {
+                if !is_trailing_bookkeeping(s) && !matches!(s, Stmt::Label(_)) {
+                    return None;
+                }
             }
             Some((disc.clone(), cases.clone()))
         }
-        Stmt::If { cond, then_body, else_body } => {
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
             let mut slot: Option<String> = None;
             let mut cases: Vec<(u64, Vec<Stmt>)> = Vec::new();
             if !ladder_cases(&mut slot, cond, then_body, else_body, &mut cases) {
@@ -183,7 +201,9 @@ fn dispatch_cases(s: &Stmt) -> Option<(String, Vec<(u64, Vec<Stmt>)>)> {
 /// Walk one level of an if-ladder, collecting `(state value, arm)` pairs.
 ///
 /// Every level must test the SAME slot with `==` against a distinct integer
-/// literal, and the chain must end in an empty (or comment/label-only) else.
+/// literal. The chain must end in an empty else, or an else containing only
+/// bookkeeping (returns, state stores, comments) — the terminal else is the
+/// iterator's "exhausted" path (`return false;`).
 /// A `!=` test is refused: the arm under it is not a single state.
 fn ladder_cases(
     slot: &mut Option<String>,
@@ -209,13 +229,20 @@ fn ladder_cases(
     cases.push((k, then_body.to_vec()));
     let meaningful: Vec<&Stmt> = else_body
         .iter()
-        .filter(|s| !matches!(s, Stmt::Comment(_) | Stmt::Label(_)))
+        .filter(|s| !matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. } | Stmt::Label(_)))
         .collect();
     match meaningful.as_slice() {
         [] => true,
-        [Stmt::If { cond, then_body, else_body }] => {
-            ladder_cases(slot, cond, then_body, else_body, cases)
-        }
+        [
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            },
+        ] => ladder_cases(slot, cond, then_body, else_body, cases),
+        // RELAXED: the terminal else may contain bookkeeping (returns, state
+        // stores) — this is the iterator's "exhausted" path.
+        _ if meaningful.iter().all(|s| is_trailing_bookkeeping(s)) => true,
         _ => false,
     }
 }
@@ -257,6 +284,29 @@ fn is_current(name: &str) -> bool {
 /// Is this the `MoveNext` return, which carries no yielded value?
 fn is_bool_like(e: &Expr) -> bool {
     matches!(e, Expr::Bool(_) | Expr::Int(0) | Expr::Int(1))
+}
+
+/// Is `s` safe to appear as trailing bookkeeping after the dispatch?
+///
+/// Trailing bookkeeping is compiler machinery that the yield sequence subsumes:
+/// - Comments (no effect)
+/// - `return` statements (MoveNext's return value, subsumed by yield break)
+/// - State stores `<slot> = <int literal>` (bookkeeping, subsumed by the
+///   state-machine protocol)
+///
+/// Anything else — real code, control flow, calls — is NOT bookkeeping and
+/// would be lost by the flattening, so it refuses the dispatch.
+fn is_trailing_bookkeeping(s: &Stmt) -> bool {
+    match s {
+        Stmt::Comment(_) | Stmt::Attribute { .. } => true,
+        // `return false;` / `return true;` is MoveNext's exhaustion result and
+        // is subsumed by the yield sequence. A non-boolean return is REAL
+        // code: dropping it would delete a value the method returns.
+        Stmt::Return(None) => true,
+        Stmt::Return(Some(e)) if is_bool_like(e) => true,
+        Stmt::Assign(n, _, Expr::Int(_)) if is_state_disc(n) => true,
+        _ => false,
+    }
 }
 
 /// `true` when `hay` contains `needle` as a whole identifier.
@@ -301,7 +351,9 @@ fn touches_slot(s: &Stmt, slot: &str) -> bool {
         Stmt::If { cond, .. } => expr_mentions_slot(cond, slot),
         Stmt::While { cond, .. } => expr_mentions_slot(cond, slot),
         Stmt::DoWhile { cond, .. } => expr_mentions_slot(cond, slot),
-        Stmt::For { cond, init, incr, .. } => {
+        Stmt::For {
+            cond, init, incr, ..
+        } => {
             cond.as_ref().is_some_and(|c| expr_mentions_slot(c, slot))
                 || list_touches_slot_deep(init, slot)
                 || list_touches_slot_deep(incr, slot)
@@ -309,7 +361,11 @@ fn touches_slot(s: &Stmt, slot: &str) -> bool {
         Stmt::Lock { expr, .. } => expr_mentions_slot(expr, slot),
         Stmt::Using { decl, .. } => touches_slot(decl, slot),
         Stmt::Switch { disc, .. } => disc == slot,
-        Stmt::ForEach { var_name, collection, .. } => var_name == slot || collection == slot,
+        Stmt::ForEach {
+            var_name,
+            collection,
+            ..
+        } => var_name == slot || collection == slot,
         Stmt::Return(Some(e)) => expr_mentions_slot(e, slot),
         _ => false,
     }
@@ -372,18 +428,26 @@ fn dispatch_arms_are_pure(s: &Stmt, slot: &str) -> bool {
 /// Refuses any arm containing control flow (nested `if`/loop/`try`/`switch`, or
 /// a `goto`/`label`/`break`/`continue`) — flattening such an arm across a
 /// switch boundary would move control flow, which rule 2 forbids.
+///
+/// RELAXED: an arm does NOT need a state store if it has other yield evidence:
+/// - A `<>2__current` store is sufficient for `yield return`
+/// - A boolean return (`return false;`) without any value is sufficient for
+///   `yield break`
 fn convert_arm(body: &[Stmt], slot: &str) -> Option<(Vec<Stmt>, YieldKind)> {
     let mut residual: Vec<Stmt> = Vec::new();
     let mut current: Option<Expr> = None;
     let mut ret_value: Option<Expr> = None;
     let mut state: Option<i64> = None;
+    let mut has_bool_return = false;
 
     for s in body {
         match s {
             Stmt::Assign(n, _, Expr::Int(v)) if n == slot => state = Some(*v),
             Stmt::Assign(n, _, e) if is_current(n) => current = Some(e.clone()),
             Stmt::Return(Some(e)) => {
-                if !is_bool_like(e) {
+                if is_bool_like(e) {
+                    has_bool_return = true;
+                } else {
                     ret_value = Some(e.clone());
                 }
             }
@@ -405,14 +469,24 @@ fn convert_arm(body: &[Stmt], slot: &str) -> Option<(Vec<Stmt>, YieldKind)> {
         }
     }
 
-    let state = state?;
     let kind = match current.or(ret_value) {
+        // A `<>2__current` store or a non-boolean return value is a yield return.
         Some(v) => YieldKind::Return(v),
-        // No value parked: a negative next state is the iterator's completion
-        // (`yield break` / `MoveNext` returns false). A non-negative next state
-        // with no value is a plain transition we do not model.
-        None if state < 0 => YieldKind::Break,
-        None => return None,
+        None => {
+            // No value parked. Determine yield break from state or return.
+            match state {
+                // A negative next state is the iterator's completion
+                // (`yield break` / `MoveNext` returns false).
+                Some(v) if v < 0 => YieldKind::Break,
+                // RELAXED: no state store, but a boolean return is yield break
+                // evidence. This handles arms that just do `return false;`
+                // without an explicit state transition.
+                None if has_bool_return => YieldKind::Break,
+                // A non-negative state with no value is a plain transition we
+                // do not model.
+                _ => return None,
+            }
+        }
     };
     Some((residual, kind))
 }
@@ -475,13 +549,16 @@ mod tests {
             disc: STATE.to_string(),
             cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
             tail: vec![],
-        }];
+        
+            default: None,}];
         assert_eq!(apply(&mut body), 1);
         assert!(matches!(&body[0], Stmt::YieldReturn(_)));
         assert!(matches!(&body[1], Stmt::YieldBreak));
     }
 
-    /// Code AFTER the dispatch would be reordered by flattening — refuse.
+    /// Real code AFTER the dispatch would be lost by flattening — refuse.
+    /// (Note: `return false;` is now allowed as trailing bookkeeping; only
+    /// non-bookkeeping statements like `Eval` are refused.)
     #[test]
     fn content_after_the_dispatch_refuses() {
         let mut body = vec![
@@ -489,8 +566,9 @@ mod tests {
                 disc: STATE.to_string(),
                 cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
                 tail: vec![],
-            },
-            Stmt::Return(Some(Expr::Bool(false))),
+            
+                default: None,},
+            Stmt::Eval(Expr::Var("real_code".into())),
         ];
         assert_eq!(apply(&mut body), 0);
         assert!(matches!(&body[0], Stmt::Switch { .. }));
@@ -510,13 +588,12 @@ mod tests {
             then_body: vec![],
             else_body: vec![],
         });
-        let mut body = vec![
-            Stmt::Switch {
-                disc: STATE.to_string(),
-                cases: vec![(0u64, arm), (1u64, break_arm())],
-                tail: vec![],
-            },
-        ];
+        let mut body = vec![Stmt::Switch {
+            disc: STATE.to_string(),
+            cases: vec![(0u64, arm), (1u64, break_arm())],
+            tail: vec![],
+        
+            default: None,}];
         assert_eq!(apply(&mut body), 0);
     }
 
@@ -530,7 +607,8 @@ mod tests {
                 (1u64, vec![Stmt::Assign("v".into(), None, Expr::Int(2))]),
             ],
             tail: vec![],
-        }];
+        
+            default: None,}];
         assert_eq!(apply(&mut body), 0);
     }
 
@@ -541,7 +619,8 @@ mod tests {
             disc: STATE.to_string(),
             cases: vec![(0u64, break_arm()), (1u64, break_arm())],
             tail: vec![],
-        }];
+        
+            default: None,}];
         assert_eq!(apply(&mut body), 0);
     }
 
@@ -551,13 +630,18 @@ mod tests {
         let mut arm = yield_zero_arm();
         arm.insert(
             0,
-            Stmt::If { cond: Expr::Bool(true), then_body: vec![], else_body: vec![] },
+            Stmt::If {
+                cond: Expr::Bool(true),
+                then_body: vec![],
+                else_body: vec![],
+            },
         );
         let mut body = vec![Stmt::Switch {
             disc: STATE.to_string(),
             cases: vec![(0u64, arm), (1u64, break_arm())],
             tail: vec![],
-        }];
+        
+            default: None,}];
         assert_eq!(apply(&mut body), 0);
     }
 
@@ -596,5 +680,261 @@ mod tests {
         assert!(contains_ident("this.<>1__state", "<>1__state"));
         assert!(!contains_ident("this.<>1__stateExtra", "<>1__state"));
         assert!(!contains_ident("v12", "v1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4B: relaxed constraints
+    // -----------------------------------------------------------------------
+
+    /// An if-ladder with 3 states folds to a yield sequence.
+    #[test]
+    fn three_state_ladder_becomes_yields() {
+        let mut body = vec![
+            Stmt::Assign(STATE.to_string(), None, Expr::Int(-1)),
+            Stmt::If {
+                cond: state_test_expr(0),
+                then_body: yield_zero_arm(),
+                else_body: vec![Stmt::If {
+                    cond: state_test_expr(1),
+                    then_body: vec![
+                        set_state(2),
+                        Stmt::Assign(CUR.to_string(), None, Expr::Var("y".into())),
+                        Stmt::Return(Some(Expr::Bool(true))),
+                    ],
+                    else_body: vec![Stmt::If {
+                        cond: state_test_expr(2),
+                        then_body: break_arm(),
+                        else_body: vec![],
+                    }],
+                }],
+            },
+        ];
+        assert_eq!(apply(&mut body), 1);
+        assert_eq!(body.len(), 3);
+        assert!(matches!(&body[0], Stmt::YieldReturn(_)));
+        assert!(matches!(&body[1], Stmt::YieldReturn(_)));
+        assert!(matches!(&body[2], Stmt::YieldBreak));
+    }
+
+    /// Trailing `return false;` after the dispatch is bookkeeping — accepted.
+    #[test]
+    fn trailing_return_after_dispatch_is_accepted() {
+        let mut body = vec![
+            Stmt::Switch {
+                disc: STATE.to_string(),
+                cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
+                tail: vec![],
+            
+                default: None,},
+            Stmt::Return(Some(Expr::Bool(false))),
+        ];
+        assert_eq!(apply(&mut body), 1);
+        assert!(matches!(&body[0], Stmt::YieldReturn(_)));
+        assert!(matches!(&body[1], Stmt::YieldBreak));
+    }
+
+    /// Trailing state store + return after the dispatch is bookkeeping.
+    #[test]
+    fn trailing_state_store_and_return_are_accepted() {
+        let mut body = vec![
+            Stmt::Switch {
+                disc: STATE.to_string(),
+                cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
+                tail: vec![],
+            
+                default: None,},
+            Stmt::Assign(STATE.to_string(), None, Expr::Int(-1)),
+            Stmt::Return(Some(Expr::Bool(false))),
+        ];
+        assert_eq!(apply(&mut body), 1);
+        assert!(matches!(&body[0], Stmt::YieldReturn(_)));
+        assert!(matches!(&body[1], Stmt::YieldBreak));
+    }
+
+    /// A switch with a non-empty tail (default case with `return false;`) is
+    /// accepted — the tail is compiler machinery.
+    #[test]
+    fn switch_with_default_return_is_accepted() {
+        let mut body = vec![Stmt::Switch {
+            disc: STATE.to_string(),
+            cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
+            tail: vec![Stmt::Return(Some(Expr::Bool(false)))],
+        
+            default: None,}];
+        assert_eq!(apply(&mut body), 1);
+        assert!(matches!(&body[0], Stmt::YieldReturn(_)));
+        assert!(matches!(&body[1], Stmt::YieldBreak));
+    }
+
+    /// An if-ladder whose final else contains `return false;` is accepted.
+    #[test]
+    fn ladder_with_trailing_return_in_final_else() {
+        let mut body = vec![
+            Stmt::If {
+                cond: state_test_expr(0),
+                then_body: yield_zero_arm(),
+                else_body: vec![Stmt::If {
+                    cond: state_test_expr(1),
+                    then_body: break_arm(),
+                    else_body: vec![Stmt::Return(Some(Expr::Bool(false)))],
+                }],
+            },
+        ];
+        assert_eq!(apply(&mut body), 1);
+        assert!(matches!(&body[0], Stmt::YieldReturn(_)));
+        assert!(matches!(&body[1], Stmt::YieldBreak));
+    }
+
+    /// An arm with `<>2__current` but NO state store is accepted as yield return.
+    #[test]
+    fn arm_without_state_store_but_with_current_is_accepted() {
+        let arm_no_state = vec![
+            Stmt::Assign(CUR.to_string(), None, Expr::Var("val".into())),
+            Stmt::Return(Some(Expr::Bool(true))),
+        ];
+        let mut body = vec![Stmt::Switch {
+            disc: STATE.to_string(),
+            cases: vec![(0u64, arm_no_state), (1u64, break_arm())],
+            tail: vec![],
+        
+            default: None,}];
+        assert_eq!(apply(&mut body), 1);
+        assert!(matches!(&body[0], Stmt::YieldReturn(e) if matches!(e, Expr::Var(n) if n == "val")));
+        assert!(matches!(&body[1], Stmt::YieldBreak));
+    }
+
+    /// An arm with just `return false;` (no state store, no `<>2__current`) is
+    /// accepted as yield break.
+    #[test]
+    fn arm_with_only_bool_return_is_yield_break() {
+        let bare_return_arm = vec![Stmt::Return(Some(Expr::Bool(false)))];
+        let mut body = vec![Stmt::Switch {
+            disc: STATE.to_string(),
+            cases: vec![(0u64, yield_zero_arm()), (1u64, bare_return_arm)],
+            tail: vec![],
+        
+            default: None,}];
+        assert_eq!(apply(&mut body), 1);
+        assert!(matches!(&body[0], Stmt::YieldReturn(_)));
+        assert!(matches!(&body[1], Stmt::YieldBreak));
+    }
+
+    /// Multiple bookkeeping prefix statements before the dispatch are accepted,
+    /// and a comment in the prefix is preserved rather than deleted with the
+    /// state machinery.
+    #[test]
+    fn multiple_bookkeeping_prefix_statements() {
+        let mut body = vec![
+            Stmt::Assign(STATE.to_string(), None, Expr::Int(-1)),
+            Stmt::Comment("state machine entry".into()),
+            Stmt::Assign(STATE.to_string(), None, Expr::Int(0)),
+            Stmt::Switch {
+                disc: STATE.to_string(),
+                cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
+                tail: vec![],
+            
+                default: None,},
+        ];
+        assert_eq!(apply(&mut body), 1);
+        assert_eq!(body.len(), 3, "comment + two yields");
+        assert!(matches!(&body[0], Stmt::Comment(c) if c == "state machine entry"));
+        assert!(matches!(&body[1], Stmt::YieldReturn(_)));
+        assert!(matches!(&body[2], Stmt::YieldBreak));
+    }
+
+    /// A non-state-machine method (no `__state` field) is never affected, even
+    /// with an if-ladder on a user variable.
+    #[test]
+    fn non_state_machine_method_is_not_affected() {
+        let mut body = vec![
+            Stmt::Assign("mode".to_string(), None, Expr::Int(0)),
+            Stmt::If {
+                cond: Expr::Cmp(
+                    CmpKind::Eq,
+                    Box::new(Expr::Var("mode".into())),
+                    Box::new(Expr::Int(0)),
+                ),
+                then_body: vec![Stmt::Assign("v".into(), None, Expr::Int(1))],
+                else_body: vec![Stmt::If {
+                    cond: Expr::Cmp(
+                        CmpKind::Eq,
+                        Box::new(Expr::Var("mode".into())),
+                        Box::new(Expr::Int(1)),
+                    ),
+                    then_body: vec![Stmt::Assign("v".into(), None, Expr::Int(2))],
+                    else_body: vec![],
+                }],
+            },
+        ];
+        let original = body.clone();
+        assert_eq!(apply(&mut body), 0);
+        assert_eq!(body.len(), original.len());
+    }
+
+    /// A trailing non-bookkeeping statement (a call) after the dispatch refuses.
+    #[test]
+    fn trailing_call_after_dispatch_refuses() {
+        let mut body = vec![
+            Stmt::Switch {
+                disc: STATE.to_string(),
+                cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
+                tail: vec![],
+            
+                default: None,},
+            Stmt::Eval(Expr::Call {
+                recv: None,
+                name: "Cleanup".into(),
+                args: vec![],
+            }),
+        ];
+        assert_eq!(apply(&mut body), 0);
+    }
+
+    /// A trailing NON-boolean return is real code: the flattening would delete
+    /// the value the method returns. Refuse.
+    #[test]
+    fn trailing_non_bool_return_refuses() {
+        let mut body = vec![
+            Stmt::Switch {
+                disc: STATE.to_string(),
+                cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
+                tail: vec![],
+            
+                default: None,},
+            Stmt::Return(Some(Expr::Int(42))),
+        ];
+        assert_eq!(apply(&mut body), 0);
+        assert!(matches!(&body[0], Stmt::Switch { .. }));
+    }
+
+    /// A label inside the dispatch is a jump target: converting would delete
+    /// it, so the dispatch is left alone.
+    #[test]
+    fn a_label_inside_the_dispatch_refuses() {
+        let mut body = vec![Stmt::Switch {
+            disc: STATE.to_string(),
+            cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
+            tail: vec![Stmt::Label("L_shared".into())],
+        
+            default: None,}];
+        assert_eq!(apply(&mut body), 0);
+        assert!(matches!(&body[0], Stmt::Switch { .. }));
+    }
+
+    /// Trailing comments survive the conversion.
+    #[test]
+    fn trailing_comment_is_preserved() {
+        let mut body = vec![
+            Stmt::Switch {
+                disc: STATE.to_string(),
+                cases: vec![(0u64, yield_zero_arm()), (1u64, break_arm())],
+                tail: vec![],
+            
+                default: None,},
+            Stmt::Comment("done".into()),
+        ];
+        assert_eq!(apply(&mut body), 1);
+        assert_eq!(body.len(), 3);
+        assert!(matches!(&body[2], Stmt::Comment(c) if c == "done"));
     }
 }

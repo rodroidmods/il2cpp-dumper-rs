@@ -1,7 +1,10 @@
+use super::{ConstantOp, DisassembledInstruction, LoadInfo, RegRegAccess};
 use yaxpeax_arch::{Decoder, LengthedInstruction, U8Reader};
-use yaxpeax_arm::armv8::a64::{InstDecoder as A64Decoder, Instruction as A64Instruction, Opcode as A64Opcode, Operand as A64Operand, SizeCode as A64SizeCode};
 use yaxpeax_arm::armv7::{InstDecoder as A32Decoder, Instruction as A32Instruction};
-use super::{DisassembledInstruction, RegRegAccess, ConstantOp, LoadInfo};
+use yaxpeax_arm::armv8::a64::{
+    InstDecoder as A64Decoder, Instruction as A64Instruction, Opcode as A64Opcode,
+    Operand as A64Operand, SizeCode as A64SizeCode,
+};
 
 pub fn disassemble_arm64(
     bytes: &[u8],
@@ -38,15 +41,12 @@ pub fn disassemble_arm64(
 
         let is_call = matches!(insn.opcode, A64Opcode::BL | A64Opcode::BLR);
 
-        let is_unconditional_branch = matches!(
-            insn.opcode,
-            A64Opcode::B | A64Opcode::BR | A64Opcode::RET
-        );
+        let is_unconditional_branch =
+            matches!(insn.opcode, A64Opcode::B | A64Opcode::BR | A64Opcode::RET);
 
         let is_conditional_branch = matches!(
             insn.opcode,
-            A64Opcode::Bcc(_) | A64Opcode::CBZ | A64Opcode::CBNZ
-            | A64Opcode::TBZ | A64Opcode::TBNZ
+            A64Opcode::Bcc(_) | A64Opcode::CBZ | A64Opcode::CBNZ | A64Opcode::TBZ | A64Opcode::TBNZ
         );
 
         let is_branch = is_unconditional_branch || is_call || is_conditional_branch;
@@ -69,11 +69,12 @@ pub fn disassemble_arm64(
         let reg_reg_access = extract_arm64_reg_reg_access(&insn);
         let constant_op = extract_arm64_constant_op(&insn, address);
         let load_info = extract_arm64_load_info(&insn, &mnemonic);
-        let indirect_call_reg = if (is_call && call_target.is_none())
-            || matches!(insn.opcode, A64Opcode::BR)
-        {
-            extract_arm64_indirect_call_reg(&insn)
-        } else { None };
+        let indirect_call_reg =
+            if (is_call && call_target.is_none()) || matches!(insn.opcode, A64Opcode::BR) {
+                extract_arm64_indirect_call_reg(&insn)
+            } else {
+                None
+            };
 
         result.push(DisassembledInstruction {
             address,
@@ -144,17 +145,23 @@ pub fn disassemble_arm32(
             || full_text == "bx r14"
             || (full_text.starts_with("ldm") && full_text.contains("pc"));
 
-        let is_call = full_text.starts_with("bl ") || full_text.starts_with("blx ")
-            || full_text.starts_with("blal ") || full_text.starts_with("blxal ");
+        let is_call = full_text.starts_with("bl ")
+            || full_text.starts_with("blx ")
+            || full_text.starts_with("blal ")
+            || full_text.starts_with("blxal ");
 
         let mnemonic_upper = mnemonic.to_uppercase();
 
         let is_unconditional_branch = mnemonic_upper == "B" || mnemonic_upper == "BX" || is_return;
 
-        let is_conditional_branch = !is_call && !is_unconditional_branch
+        let is_conditional_branch = !is_call
+            && !is_unconditional_branch
             && ((mnemonic_upper.starts_with('B')
-                && !matches!(mnemonic_upper.as_str(), "BIC" | "BFC" | "BFI" | "BL" | "BLX" | "BKPT" | "BX"))
-            || matches!(mnemonic_upper.as_str(), "CBZ" | "CBNZ"));
+                && !matches!(
+                    mnemonic_upper.as_str(),
+                    "BIC" | "BFC" | "BFI" | "BL" | "BLX" | "BKPT" | "BX"
+                ))
+                || matches!(mnemonic_upper.as_str(), "CBZ" | "CBNZ"));
 
         let is_branch = is_unconditional_branch || is_call || is_conditional_branch;
 
@@ -225,10 +232,19 @@ fn split_mnemonic_operands(text: &str) -> (String, String) {
 fn extract_arm32_reg_num(s: &str) -> Option<u16> {
     let s = s.trim().trim_start_matches(|c: char| !c.is_alphanumeric());
     let s = s.trim_start_matches(|c: char| c == 'r' || c == 'R');
-    if s == "sp" || s == "SP" || s == "r13" || s == "R13" { return Some(13); }
-    if s == "lr" || s == "LR" || s == "r14" || s == "R14" { return Some(14); }
-    if s == "pc" || s == "PC" || s == "r15" || s == "R15" { return Some(15); }
-    s.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u16>().ok()
+    if s == "sp" || s == "SP" || s == "r13" || s == "R13" {
+        return Some(13);
+    }
+    if s == "lr" || s == "LR" || s == "r14" || s == "R14" {
+        return Some(14);
+    }
+    if s == "pc" || s == "PC" || s == "r15" || s == "R15" {
+        return Some(15);
+    }
+    s.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse::<u16>()
+        .ok()
 }
 
 fn parse_arm32_operand_reg(token: &str) -> Option<u16> {
@@ -248,29 +264,47 @@ fn parse_arm32_immediate(token: &str) -> Option<i64> {
     }
 }
 
-fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) -> Option<ConstantOp> {
+fn extract_arm32_constant_op(
+    text: &str,
+    mnemonic_upper: &str,
+    _address: u64,
+) -> Option<ConstantOp> {
     let bare = strip_arm32_condition(mnemonic_upper);
 
     match bare {
         "MOV" | "MOVS" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(2, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             let src = parts[1].trim();
             if src.starts_with('#') || src.starts_with("0x") {
                 let val = parse_arm32_immediate(src)? as u64;
-                return Some(ConstantOp::MovImm { dest_reg: dest, value: val });
+                return Some(ConstantOp::MovImm {
+                    dest_reg: dest,
+                    value: val,
+                });
             }
             if let Some(src_reg) = parse_arm32_operand_reg(src.split(',').next().unwrap_or(src)) {
-                if !src.contains("lsl") && !src.contains("LSL")
-                    && !src.contains("lsr") && !src.contains("LSR")
-                    && !src.contains("asr") && !src.contains("ASR")
-                    && !src.contains("ror") && !src.contains("ROR")
+                if !src.contains("lsl")
+                    && !src.contains("LSL")
+                    && !src.contains("lsr")
+                    && !src.contains("LSR")
+                    && !src.contains("asr")
+                    && !src.contains("ASR")
+                    && !src.contains("ror")
+                    && !src.contains("ROR")
                 {
-                    return Some(ConstantOp::MovReg { dest_reg: dest, src_reg });
+                    return Some(ConstantOp::MovReg {
+                        dest_reg: dest,
+                        src_reg,
+                    });
                 }
             }
             Some(ConstantOp::Kill { dest_reg: dest })
@@ -278,53 +312,83 @@ fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) ->
 
         "MOVW" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(2, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             let val = parse_arm32_immediate(parts[1].trim())? as u64;
-            Some(ConstantOp::MovImm { dest_reg: dest, value: val & 0xFFFF })
+            Some(ConstantOp::MovImm {
+                dest_reg: dest,
+                value: val & 0xFFFF,
+            })
         }
 
         "MOVT" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(2, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             let hi = (parse_arm32_immediate(parts[1].trim())? as u64) & 0xFFFF;
-            Some(ConstantOp::MovKeep { dest_reg: dest, imm16: hi as u16, shift: 16 })
+            Some(ConstantOp::MovKeep {
+                dest_reg: dest,
+                imm16: hi as u16,
+                shift: 16,
+            })
         }
 
         "MVN" | "MVNS" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(2, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             let src = parts[1].trim();
             if src.starts_with('#') {
                 let val = parse_arm32_immediate(src)? as u64;
-                return Some(ConstantOp::MovImm { dest_reg: dest, value: !val & 0xFFFF_FFFF });
+                return Some(ConstantOp::MovImm {
+                    dest_reg: dest,
+                    value: !val & 0xFFFF_FFFF,
+                });
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
 
         "ADD" | "ADDS" | "ADC" | "ADCS" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(3, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             if parts.len() == 2 {
                 let src2 = parts[1].trim();
                 if src2.starts_with('#') || src2.starts_with("0x") {
                     let imm = parse_arm32_immediate(src2)?;
-                    return Some(ConstantOp::AddSubImm { dest_reg: dest, src_reg: dest, imm });
+                    return Some(ConstantOp::AddSubImm {
+                        dest_reg: dest,
+                        src_reg: dest,
+                        imm,
+                    });
                 }
                 return Some(ConstantOp::Kill { dest_reg: dest });
             }
@@ -332,23 +396,35 @@ fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) ->
             let src2 = parts[2].trim();
             if src2.starts_with('#') || src2.starts_with("0x") {
                 let imm = parse_arm32_immediate(src2)?;
-                return Some(ConstantOp::AddSubImm { dest_reg: dest, src_reg: src1, imm });
+                return Some(ConstantOp::AddSubImm {
+                    dest_reg: dest,
+                    src_reg: src1,
+                    imm,
+                });
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
 
         "SUB" | "SUBS" | "SBC" | "SBCS" | "RSB" | "RSBS" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(3, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             if parts.len() == 2 {
                 let src2 = parts[1].trim();
                 if src2.starts_with('#') || src2.starts_with("0x") {
                     let imm = -(parse_arm32_immediate(src2)?);
-                    return Some(ConstantOp::AddSubImm { dest_reg: dest, src_reg: dest, imm });
+                    return Some(ConstantOp::AddSubImm {
+                        dest_reg: dest,
+                        src_reg: dest,
+                        imm,
+                    });
                 }
                 return Some(ConstantOp::Kill { dest_reg: dest });
             }
@@ -356,17 +432,25 @@ fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) ->
             let src2 = parts[2].trim();
             if src2.starts_with('#') || src2.starts_with("0x") {
                 let imm = -(parse_arm32_immediate(src2)?);
-                return Some(ConstantOp::AddSubImm { dest_reg: dest, src_reg: src1, imm });
+                return Some(ConstantOp::AddSubImm {
+                    dest_reg: dest,
+                    src_reg: src1,
+                    imm,
+                });
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
 
         "ORR" | "ORRS" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(3, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             if parts.len() >= 3 {
                 let src1 = parse_arm32_operand_reg(parts[1]);
@@ -384,44 +468,61 @@ fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) ->
 
         "EOR" | "EORS" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(3, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             if parts.len() >= 3 {
                 let src1 = parse_arm32_operand_reg(parts[1]);
                 let src2 = parts[2].trim();
                 if let (Some(s1), Some(s2)) = (src1, parse_arm32_operand_reg(src2)) {
                     if s1 == dest && s2 == dest {
-                        return Some(ConstantOp::MovImm { dest_reg: dest, value: 0 });
+                        return Some(ConstantOp::MovImm {
+                            dest_reg: dest,
+                            value: 0,
+                        });
                     }
                 }
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
 
-        "AND" | "ANDS" | "BIC" | "BICS" | "LSL" | "LSR" | "ASR" | "ROR"
-        | "MUL" | "MLA" | "MLS" | "SMULL" | "UMULL" | "SMLAL" | "UMLAL"
-        | "SDIV" | "UDIV" | "CLZ" | "RBIT" | "REV" | "REV16" | "REVSH"
-        | "UXTB" | "UXTH" | "SXTB" | "SXTH" | "UBFX" | "SBFX" | "BFI" | "BFC"
-        | "USAT" | "SSAT" | "PKHBT" | "PKHTB"
-        | "LDR" | "LDRB" | "LDRH" | "LDRSB" | "LDRSH" | "LDRD"
-        | "LDREX" | "LDREXB" | "LDREXH" | "LDREXD"
-        | "LDA" | "LDAB" | "LDAH" | "LDAEX" | "LDAEXB" | "LDAEXH" | "LDAEXD"
-        | "POP" => {
+        "AND" | "ANDS" | "BIC" | "BICS" | "LSL" | "LSR" | "ASR" | "ROR" | "MUL" | "MLA" | "MLS"
+        | "SMULL" | "UMULL" | "SMLAL" | "UMLAL" | "SDIV" | "UDIV" | "CLZ" | "RBIT" | "REV"
+        | "REV16" | "REVSH" | "UXTB" | "UXTH" | "SXTB" | "SXTH" | "UBFX" | "SBFX" | "BFI"
+        | "BFC" | "USAT" | "SSAT" | "PKHBT" | "PKHTB" | "LDR" | "LDRB" | "LDRH" | "LDRSB"
+        | "LDRSH" | "LDRD" | "LDREX" | "LDREXB" | "LDREXH" | "LDREXD" | "LDA" | "LDAB" | "LDAH"
+        | "LDAEX" | "LDAEXB" | "LDAEXH" | "LDAEXD" | "POP" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(2, ',').collect();
-            if parts.is_empty() { return None; }
-            let first = parts[0].trim().trim_start_matches('[').trim_end_matches(']').trim_end_matches('!');
+            if parts.is_empty() {
+                return None;
+            }
+            let first = parts[0]
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_end_matches('!');
             if bare == "POP" {
                 let reg_list = parse_arm32_reg_list(first);
                 if reg_list.len() == 1 {
-                    return Some(ConstantOp::Kill { dest_reg: reg_list[0] });
+                    return Some(ConstantOp::Kill {
+                        dest_reg: reg_list[0],
+                    });
                 } else if reg_list.len() == 2 {
-                    return Some(ConstantOp::KillPair { dest_reg1: reg_list[0], dest_reg2: reg_list[1] });
+                    return Some(ConstantOp::KillPair {
+                        dest_reg1: reg_list[0],
+                        dest_reg2: reg_list[1],
+                    });
                 }
                 return None;
             }
@@ -429,17 +530,20 @@ fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) ->
             Some(ConstantOp::Kill { dest_reg: dest })
         }
 
-        "LDM" | "LDMIA" | "LDMIB" | "LDMDA" | "LDMDB" | "LDMFD" | "LDMEA"
-        | "LDMED" | "LDMFA" | "LDMCA" => {
+        "LDM" | "LDMIA" | "LDMIB" | "LDMDA" | "LDMDB" | "LDMFD" | "LDMEA" | "LDMED" | "LDMFA"
+        | "LDMCA" => {
             if let (Some(bs), Some(be)) = (text.find('{'), text.find('}')) {
                 let regs = parse_arm32_reg_list(&text[bs..=be]);
-                let loadable: Vec<u16> = regs.into_iter()
-                    .filter(|&r| r != 13 && r != 15)
-                    .collect();
+                let loadable: Vec<u16> = regs.into_iter().filter(|&r| r != 13 && r != 15).collect();
                 return match loadable.len() {
                     0 => None,
-                    1 => Some(ConstantOp::Kill { dest_reg: loadable[0] }),
-                    _ => Some(ConstantOp::KillPair { dest_reg1: loadable[0], dest_reg2: loadable[1] }),
+                    1 => Some(ConstantOp::Kill {
+                        dest_reg: loadable[0],
+                    }),
+                    _ => Some(ConstantOp::KillPair {
+                        dest_reg1: loadable[0],
+                        dest_reg2: loadable[1],
+                    }),
                 };
             }
             None
@@ -447,10 +551,14 @@ fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) ->
 
         "ADR" | "ADRL" => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let parts: Vec<&str> = rest.splitn(2, ',').collect();
-            if parts.len() < 2 { return None; }
+            if parts.len() < 2 {
+                return None;
+            }
             let dest = parse_arm32_operand_reg(parts[0])?;
             let target_str = parts[1].trim();
             let page: u64 = if let Some(rel) = target_str.strip_prefix("$+") {
@@ -466,20 +574,23 @@ fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) ->
             } else {
                 parse_arm32_immediate(target_str).unwrap_or(0) as u64
             };
-            Some(ConstantOp::Adrp { dest_reg: dest, page })
+            Some(ConstantOp::Adrp {
+                dest_reg: dest,
+                page,
+            })
         }
 
-        "STR" | "STRB" | "STRH" | "STRD"
-        | "STREX" | "STREXB" | "STREXH" | "STREXD"
-        | "STL" | "STLB" | "STLH" | "STLEX" | "STLEXB" | "STLEXH" | "STLEXD"
-        | "PUSH" | "CMP" | "CMN" | "TST" | "TEQ"
-        | "B" | "BL" | "BX" | "BLX" | "CBZ" | "CBNZ"
-        | "SVC" | "BKPT" | "HLT" | "UDF" | "NOP" | "WFE" | "WFI" | "SEV"
-        | "DMB" | "DSB" | "ISB" | "PLD" | "PLI" | "VMRS" | "VMSR" => None,
+        "STR" | "STRB" | "STRH" | "STRD" | "STREX" | "STREXB" | "STREXH" | "STREXD" | "STL"
+        | "STLB" | "STLH" | "STLEX" | "STLEXB" | "STLEXH" | "STLEXD" | "PUSH" | "CMP" | "CMN"
+        | "TST" | "TEQ" | "B" | "BL" | "BX" | "BLX" | "CBZ" | "CBNZ" | "SVC" | "BKPT" | "HLT"
+        | "UDF" | "NOP" | "WFE" | "WFI" | "SEV" | "DMB" | "DSB" | "ISB" | "PLD" | "PLI"
+        | "VMRS" | "VMSR" => None,
 
         _ => {
             let ops: Vec<&str> = text.splitn(3, ' ').collect();
-            if ops.len() < 2 { return None; }
+            if ops.len() < 2 {
+                return None;
+            }
             let rest = ops[1..].join(" ");
             let first = rest.splitn(2, ',').next()?.trim().trim_end_matches('!');
             if let Some(dest) = parse_arm32_operand_reg(first) {
@@ -492,7 +603,10 @@ fn extract_arm32_constant_op(text: &str, mnemonic_upper: &str, _address: u64) ->
 }
 
 fn strip_arm32_condition(mnemonic: &str) -> &str {
-    let conditions = ["EQ","NE","CS","HS","CC","LO","MI","PL","VS","VC","HI","LS","GE","LT","GT","LE","AL"];
+    let conditions = [
+        "EQ", "NE", "CS", "HS", "CC", "LO", "MI", "PL", "VS", "VC", "HI", "LS", "GE", "LT", "GT",
+        "LE", "AL",
+    ];
     for cond in &conditions {
         if mnemonic.ends_with(cond) && mnemonic.len() > cond.len() {
             let base = &mnemonic[..mnemonic.len() - cond.len()];
@@ -512,7 +626,10 @@ fn parse_arm32_reg_list(text: &str) -> Vec<u16> {
         if t.contains('-') {
             let range: Vec<&str> = t.splitn(2, '-').collect();
             if range.len() == 2 {
-                if let (Some(start), Some(end)) = (extract_arm32_reg_num(range[0]), extract_arm32_reg_num(range[1])) {
+                if let (Some(start), Some(end)) = (
+                    extract_arm32_reg_num(range[0]),
+                    extract_arm32_reg_num(range[1]),
+                ) {
                     for r in start..=end {
                         regs.push(r);
                     }
@@ -527,12 +644,23 @@ fn parse_arm32_reg_list(text: &str) -> Vec<u16> {
 
 fn extract_arm32_load_info(text: &str, mnemonic_upper: &str) -> Option<LoadInfo> {
     let bare = strip_arm32_condition(mnemonic_upper);
-    let is_load = matches!(bare,
-        "LDR" | "LDRB" | "LDRH" | "LDRSB" | "LDRSH"
-        | "LDREX" | "LDREXB" | "LDREXH"
-        | "LDA" | "LDAB" | "LDAH"
+    let is_load = matches!(
+        bare,
+        "LDR"
+            | "LDRB"
+            | "LDRH"
+            | "LDRSB"
+            | "LDRSH"
+            | "LDREX"
+            | "LDREXB"
+            | "LDREXH"
+            | "LDA"
+            | "LDAB"
+            | "LDAH"
     );
-    if !is_load { return None; }
+    if !is_load {
+        return None;
+    }
 
     let bracket_start = text.find('[')?;
     let bracket_end = text.find(']')?;
@@ -556,12 +684,18 @@ fn extract_arm32_load_info(text: &str, mnemonic_upper: &str) -> Option<LoadInfo>
     let dest_token = ops_text.split(',').next().unwrap_or("").trim();
     let dest_reg = extract_arm32_reg_num(dest_token)?;
 
-    Some(LoadInfo { dest_reg, base_reg, offset })
+    Some(LoadInfo {
+        dest_reg,
+        base_reg,
+        offset,
+    })
 }
 
 fn extract_arm32_indirect_call_reg(text: &str, mnemonic_upper: &str) -> Option<u16> {
     let bare = strip_arm32_condition(mnemonic_upper);
-    if bare != "BX" && bare != "BLX" { return None; }
+    if bare != "BX" && bare != "BLX" {
+        return None;
+    }
     let after = text.splitn(2, ' ').nth(1)?.trim();
     if after.starts_with('r') || after.starts_with('R') {
         extract_arm32_reg_num(after)
@@ -572,30 +706,39 @@ fn extract_arm32_indirect_call_reg(text: &str, mnemonic_upper: &str) -> Option<u
 
 fn extract_arm32_reg_reg_access(text: &str, mnemonic_upper: &str) -> Option<RegRegAccess> {
     let bare = strip_arm32_condition(mnemonic_upper);
-    let is_mem = matches!(bare,
-        "LDR" | "LDRB" | "LDRH" | "LDRSB" | "LDRSH"
-        | "STR" | "STRB" | "STRH"
+    let is_mem = matches!(
+        bare,
+        "LDR" | "LDRB" | "LDRH" | "LDRSB" | "LDRSH" | "STR" | "STRB" | "STRH"
     );
-    if !is_mem { return None; }
+    if !is_mem {
+        return None;
+    }
 
     let bracket_start = text.find('[')?;
     let bracket_end = text.find(']')?;
     let inner = &text[bracket_start + 1..bracket_end];
 
     let parts: Vec<&str> = inner.splitn(3, ',').collect();
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
 
     let base_reg = extract_arm32_reg_num(parts[0].trim())?;
     let index_part = parts[1].trim();
 
-    if index_part.starts_with('#') { return None; }
+    if index_part.starts_with('#') {
+        return None;
+    }
 
     let index_reg = extract_arm32_reg_num(index_part.split_whitespace().next()?)?;
 
     let shift: u8 = if parts.len() >= 3 {
         let shift_part = parts[2].trim().to_uppercase();
         if shift_part.starts_with("LSL #") || shift_part.starts_with("LSL#") {
-            let n = shift_part.trim_start_matches("LSL").trim().trim_start_matches('#');
+            let n = shift_part
+                .trim_start_matches("LSL")
+                .trim()
+                .trim_start_matches('#');
             n.parse::<u8>().unwrap_or(0)
         } else {
             0
@@ -604,7 +747,11 @@ fn extract_arm32_reg_reg_access(text: &str, mnemonic_upper: &str) -> Option<RegR
         0
     };
 
-    Some(RegRegAccess { base_reg, index_reg, shift })
+    Some(RegRegAccess {
+        base_reg,
+        index_reg,
+        shift,
+    })
 }
 
 fn extract_arm32_branch_target(text: &str, current_address: u64) -> Option<u64> {
@@ -626,11 +773,22 @@ fn extract_arm32_branch_target(text: &str, current_address: u64) -> Option<u64> 
 }
 
 fn extract_arm32_condition(mnemonic: &str) -> Option<String> {
-    if mnemonic == "CBZ" { return Some("== 0".to_string()); }
-    if mnemonic == "CBNZ" { return Some("!= 0".to_string()); }
-    if mnemonic.len() < 2 { return None; }
-    if !mnemonic.starts_with('B') { return None; }
-    if matches!(mnemonic, "B" | "BL" | "BX" | "BLX" | "BIC" | "BFC" | "BFI" | "BKPT") {
+    if mnemonic == "CBZ" {
+        return Some("== 0".to_string());
+    }
+    if mnemonic == "CBNZ" {
+        return Some("!= 0".to_string());
+    }
+    if mnemonic.len() < 2 {
+        return None;
+    }
+    if !mnemonic.starts_with('B') {
+        return None;
+    }
+    if matches!(
+        mnemonic,
+        "B" | "BL" | "BX" | "BLX" | "BIC" | "BFC" | "BFI" | "BKPT"
+    ) {
         return None;
     }
 
@@ -659,7 +817,8 @@ fn extract_arm32_memory_offset(text: &str) -> Option<i64> {
     if let Some(bracket_start) = text.find('[') {
         if let Some(hash_pos) = text[bracket_start..].find('#') {
             let after_hash = &text[bracket_start + hash_pos + 1..];
-            let end = after_hash.find(']')
+            let end = after_hash
+                .find(']')
                 .or_else(|| after_hash.find(','))
                 .unwrap_or(after_hash.len());
             let num_str = after_hash[..end].trim();
@@ -703,21 +862,21 @@ fn extract_arm64_condition(insn: &A64Instruction, operands: &str) -> Option<Stri
     match insn.opcode {
         A64Opcode::Bcc(cond) => {
             let cond_str = match cond {
-                0 => "==",       // EQ
-                1 => "!=",       // NE
+                0 => "==",            // EQ
+                1 => "!=",            // NE
                 2 => ">= (unsigned)", // CS/HS
                 3 => "< (unsigned)",  // CC/LO
-                4 => "< 0",     // MI (negative)
-                5 => ">= 0",    // PL (positive/zero)
-                6 => "overflow", // VS
-                7 => "!overflow", // VC
-                8 => "> (unsigned)", // HI
+                4 => "< 0",           // MI (negative)
+                5 => ">= 0",          // PL (positive/zero)
+                6 => "overflow",      // VS
+                7 => "!overflow",     // VC
+                8 => "> (unsigned)",  // HI
                 9 => "<= (unsigned)", // LS
-                10 => ">=",      // GE
-                11 => "<",       // LT
-                12 => ">",       // GT
-                13 => "<=",      // LE
-                14 => "always",  // AL
+                10 => ">=",           // GE
+                11 => "<",            // LT
+                12 => ">",            // GT
+                13 => "<=",           // LE
+                14 => "always",       // AL
                 _ => "?",
             };
             Some(cond_str.to_string())
@@ -774,16 +933,23 @@ fn extract_arm64_memory_offset(insn: &A64Instruction) -> Option<i64> {
     if let Some(bracket_start) = text.find('[') {
         if let Some(hash_pos) = text[bracket_start..].find('#') {
             let after_hash = &text[bracket_start + hash_pos + 1..];
-            let end = after_hash.find(']')
+            let end = after_hash
+                .find(']')
                 .or_else(|| after_hash.find(','))
                 .unwrap_or(after_hash.len());
             let num_str = after_hash[..end].trim().trim_end_matches('!');
 
-            if let Some(stripped) = num_str.strip_prefix("0x").or_else(|| num_str.strip_prefix("0X")) {
+            if let Some(stripped) = num_str
+                .strip_prefix("0x")
+                .or_else(|| num_str.strip_prefix("0X"))
+            {
                 if let Ok(val) = i64::from_str_radix(stripped, 16) {
                     return Some(val);
                 }
-            } else if let Some(stripped) = num_str.strip_prefix("-0x").or_else(|| num_str.strip_prefix("-0X")) {
+            } else if let Some(stripped) = num_str
+                .strip_prefix("-0x")
+                .or_else(|| num_str.strip_prefix("-0X"))
+            {
                 if let Ok(val) = i64::from_str_radix(stripped, 16) {
                     return Some(-val);
                 }
@@ -797,10 +963,29 @@ fn extract_arm64_memory_offset(insn: &A64Instruction) -> Option<i64> {
 }
 
 fn extract_arm64_load_info(insn: &A64Instruction, mnemonic: &str) -> Option<LoadInfo> {
-    let is_load = matches!(mnemonic, "LDR" | "LDRB" | "LDRH" | "LDRSB" | "LDRSH" | "LDRSW"
-        | "LDUR" | "LDURB" | "LDURH" | "LDURSB" | "LDURSH" | "LDURSW"
-        | "LDAR" | "LDARB" | "LDARH" | "LDAXR" | "LDXR");
-    if !is_load { return None; }
+    let is_load = matches!(
+        mnemonic,
+        "LDR"
+            | "LDRB"
+            | "LDRH"
+            | "LDRSB"
+            | "LDRSH"
+            | "LDRSW"
+            | "LDUR"
+            | "LDURB"
+            | "LDURH"
+            | "LDURSB"
+            | "LDURSH"
+            | "LDURSW"
+            | "LDAR"
+            | "LDARB"
+            | "LDARH"
+            | "LDAXR"
+            | "LDXR"
+    );
+    if !is_load {
+        return None;
+    }
 
     let dest_reg = match insn.operands[0] {
         A64Operand::Register(_, r) => r,
@@ -810,10 +995,18 @@ fn extract_arm64_load_info(insn: &A64Instruction, mnemonic: &str) -> Option<Load
     for i in 1..4 {
         match insn.operands[i] {
             A64Operand::RegPreIndex(base, offset, _) => {
-                return Some(LoadInfo { dest_reg, base_reg: base, offset: offset as i64 });
+                return Some(LoadInfo {
+                    dest_reg,
+                    base_reg: base,
+                    offset: offset as i64,
+                });
             }
             A64Operand::RegPostIndex(base, offset) => {
-                return Some(LoadInfo { dest_reg, base_reg: base, offset: offset as i64 });
+                return Some(LoadInfo {
+                    dest_reg,
+                    base_reg: base,
+                    offset: offset as i64,
+                });
             }
             A64Operand::Nothing => break,
             _ => {}
@@ -854,8 +1047,13 @@ fn extract_arm64_constant_op(insn: &A64Instruction, address: u64) -> Option<Cons
             };
             if let A64Operand::ImmShift(imm, shift) = insn.operands[1] {
                 let mut value = (imm as u64) << shift;
-                if size == A64SizeCode::W { value = value as u32 as u64; }
-                return Some(ConstantOp::MovImm { dest_reg: reg, value });
+                if size == A64SizeCode::W {
+                    value = value as u32 as u64;
+                }
+                return Some(ConstantOp::MovImm {
+                    dest_reg: reg,
+                    value,
+                });
             }
             None
         }
@@ -865,7 +1063,11 @@ fn extract_arm64_constant_op(insn: &A64Instruction, address: u64) -> Option<Cons
                 _ => return None,
             };
             if let A64Operand::ImmShift(imm, shift) = insn.operands[1] {
-                return Some(ConstantOp::MovKeep { dest_reg: reg, imm16: imm, shift });
+                return Some(ConstantOp::MovKeep {
+                    dest_reg: reg,
+                    imm16: imm,
+                    shift,
+                });
             }
             None
         }
@@ -876,8 +1078,13 @@ fn extract_arm64_constant_op(insn: &A64Instruction, address: u64) -> Option<Cons
             };
             if let A64Operand::ImmShift(imm, shift) = insn.operands[1] {
                 let mut value = !((imm as u64) << shift);
-                if size == A64SizeCode::W { value = value as u32 as u64; }
-                return Some(ConstantOp::MovImm { dest_reg: reg, value });
+                if size == A64SizeCode::W {
+                    value = value as u32 as u64;
+                }
+                return Some(ConstantOp::MovImm {
+                    dest_reg: reg,
+                    value,
+                });
             }
             None
         }
@@ -895,15 +1102,25 @@ fn extract_arm64_constant_op(insn: &A64Instruction, address: u64) -> Option<Cons
                 A64Operand::ImmShift(imm, shift) => (imm as i64) << shift,
                 _ => return Some(ConstantOp::Kill { dest_reg: dest }),
             };
-            let imm = if matches!(insn.opcode, A64Opcode::SUB) { -imm_val } else { imm_val };
-            Some(ConstantOp::AddSubImm { dest_reg: dest, src_reg: src, imm })
+            let imm = if matches!(insn.opcode, A64Opcode::SUB) {
+                -imm_val
+            } else {
+                imm_val
+            };
+            Some(ConstantOp::AddSubImm {
+                dest_reg: dest,
+                src_reg: src,
+                imm,
+            })
         }
         A64Opcode::ADDS | A64Opcode::SUBS => {
             let dest = match insn.operands[0] {
                 A64Operand::Register(_, r) => r,
                 _ => return None,
             };
-            if dest == 31 { return None; }
+            if dest == 31 {
+                return None;
+            }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
         A64Opcode::EOR => {
@@ -914,7 +1131,10 @@ fn extract_arm64_constant_op(insn: &A64Instruction, address: u64) -> Option<Cons
             let is_self_xor = matches!(insn.operands[1], A64Operand::Register(_, r) if r == dest)
                 && matches!(insn.operands[2], A64Operand::Register(_, r) if r == dest);
             if is_self_xor {
-                return Some(ConstantOp::MovImm { dest_reg: dest, value: 0 });
+                return Some(ConstantOp::MovImm {
+                    dest_reg: dest,
+                    value: 0,
+                });
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
@@ -927,10 +1147,16 @@ fn extract_arm64_constant_op(insn: &A64Instruction, address: u64) -> Option<Cons
             if is_zr_src {
                 match insn.operands[2] {
                     A64Operand::Register(_, src) => {
-                        return Some(ConstantOp::MovReg { dest_reg: dest, src_reg: src });
+                        return Some(ConstantOp::MovReg {
+                            dest_reg: dest,
+                            src_reg: src,
+                        });
                     }
                     A64Operand::Imm64(imm) => {
-                        return Some(ConstantOp::MovImm { dest_reg: dest, value: imm });
+                        return Some(ConstantOp::MovImm {
+                            dest_reg: dest,
+                            value: imm,
+                        });
                     }
                     _ => {}
                 }
@@ -944,7 +1170,10 @@ fn extract_arm64_constant_op(insn: &A64Instruction, address: u64) -> Option<Cons
             };
             if let A64Operand::PCOffset(offset) = insn.operands[1] {
                 let page = (address as i64 + offset) as u64;
-                return Some(ConstantOp::Adrp { dest_reg: reg, page });
+                return Some(ConstantOp::Adrp {
+                    dest_reg: reg,
+                    page,
+                });
             }
             None
         }
@@ -958,30 +1187,52 @@ fn extract_arm64_constant_op(insn: &A64Instruction, address: u64) -> Option<Cons
                 _ => None,
             };
             if let Some(r2) = r2 {
-                Some(ConstantOp::KillPair { dest_reg1: r1, dest_reg2: r2 })
+                Some(ConstantOp::KillPair {
+                    dest_reg1: r1,
+                    dest_reg2: r2,
+                })
             } else {
                 Some(ConstantOp::Kill { dest_reg: r1 })
             }
         }
-        A64Opcode::STR | A64Opcode::STRB | A64Opcode::STRH
-        | A64Opcode::STUR | A64Opcode::STURB | A64Opcode::STURH
-        | A64Opcode::STLR | A64Opcode::STLRB | A64Opcode::STLRH
-        | A64Opcode::STP | A64Opcode::STNP
-        | A64Opcode::CCMP | A64Opcode::CCMN
-        | A64Opcode::B | A64Opcode::BR | A64Opcode::BL | A64Opcode::BLR | A64Opcode::RET
-        | A64Opcode::CBZ | A64Opcode::CBNZ | A64Opcode::TBZ | A64Opcode::TBNZ
-        | A64Opcode::ISB | A64Opcode::SB | A64Opcode::HINT | A64Opcode::CLREX
-        | A64Opcode::SVC | A64Opcode::HVC | A64Opcode::SMC | A64Opcode::BRK | A64Opcode::HLT
+        A64Opcode::STR
+        | A64Opcode::STRB
+        | A64Opcode::STRH
+        | A64Opcode::STUR
+        | A64Opcode::STURB
+        | A64Opcode::STURH
+        | A64Opcode::STLR
+        | A64Opcode::STLRB
+        | A64Opcode::STLRH
+        | A64Opcode::STP
+        | A64Opcode::STNP
+        | A64Opcode::CCMP
+        | A64Opcode::CCMN
+        | A64Opcode::B
+        | A64Opcode::BR
+        | A64Opcode::BL
+        | A64Opcode::BLR
+        | A64Opcode::RET
+        | A64Opcode::CBZ
+        | A64Opcode::CBNZ
+        | A64Opcode::TBZ
+        | A64Opcode::TBNZ
+        | A64Opcode::ISB
+        | A64Opcode::SB
+        | A64Opcode::HINT
+        | A64Opcode::CLREX
+        | A64Opcode::SVC
+        | A64Opcode::HVC
+        | A64Opcode::SMC
+        | A64Opcode::BRK
+        | A64Opcode::HLT
         | A64Opcode::MSR
-        | A64Opcode::UDF | A64Opcode::Invalid => None,
+        | A64Opcode::UDF
+        | A64Opcode::Invalid => None,
         A64Opcode::DMB(_) | A64Opcode::DSB(_) | A64Opcode::SYS(_) => None,
-        _ => {
-            match insn.operands[0] {
-                A64Operand::Register(_, r) if r != 31 => {
-                    Some(ConstantOp::Kill { dest_reg: r })
-                }
-                _ => None,
-            }
-        }
+        _ => match insn.operands[0] {
+            A64Operand::Register(_, r) if r != 31 => Some(ConstantOp::Kill { dest_reg: r }),
+            _ => None,
+        },
     }
 }

@@ -221,15 +221,21 @@ pub fn report() -> String {
     }
     let v = VALUES_UNIFIED.load(Ordering::Relaxed);
     if v > 0 {
-        s.push_str(&format!("[highvar] values unified with an earlier computation: {v}\n"));
+        s.push_str(&format!(
+            "[highvar] values unified with an earlier computation: {v}\n"
+        ));
     }
     let n = NAMES_MERGED.load(Ordering::Relaxed);
     if n > 0 {
-        s.push_str(&format!("[highvar] high-variable names merged (disjoint ranges): {n}\n"));
+        s.push_str(&format!(
+            "[highvar] high-variable names merged (disjoint ranges): {n}\n"
+        ));
     }
     let i = INCOMING_MARKED.load(Ordering::Relaxed);
     if i > 0 {
-        s.push_str(&format!("[highvar] incoming ABI entry versions marked: {i}\n"));
+        s.push_str(&format!(
+            "[highvar] incoming ABI entry versions marked: {i}\n"
+        ));
     }
     let u = UNDEFINED_LEFT.load(Ordering::Relaxed);
     if u > 0 {
@@ -304,6 +310,11 @@ struct Graph {
     phis: Vec<(usize, u32, Vec<Option<u32>>)>,
     /// instruction index → CFG block index, or `usize::MAX` when unplaced.
     block_of: Vec<usize>,
+    /// Versions defined by a CALL (`Op::Call`). Two call results are two
+    /// DISTINCT source values even when one register slot is reused for both;
+    /// merging their names made `Vector3` results render as the same variable
+    /// (`vector3.x - vector3.x`).
+    call_dests: HashSet<u32>,
 }
 
 impl Graph {
@@ -335,6 +346,9 @@ impl Graph {
                         // More than one definition: no longer "the" definition.
                         g.def_index.remove(d);
                     }
+                    if matches!(insn.op, Op::Call) {
+                        g.call_dests.insert(*d);
+                    }
                 }
             }
             for (k, op) in insn.operands.iter().enumerate() {
@@ -357,12 +371,7 @@ impl Graph {
                 }
                 Op::Phi => {
                     if let Some(Operand::Local(d)) = insn.operands.first() {
-                        let args = insn
-                            .operands
-                            .iter()
-                            .skip(1)
-                            .map(|o| o.as_local())
-                            .collect();
+                        let args = insn.operands.iter().skip(1).map(|o| o.as_local()).collect();
                         g.phis.push((i, *d, args));
                     }
                 }
@@ -520,8 +529,11 @@ fn seeded_versions(table: &LocalTable) -> HashSet<u32> {
     let mut seeded: HashSet<u32> = HashSet::new();
     let mut entry: HashMap<String, u32> = HashMap::new();
     for (v, idx) in &table.index_of {
-        let Some(info) = table.infos.get(*idx) else { continue };
-        if info.is_this || info.is_param.is_some() || info.is_return_buffer || info.is_incoming_arg {
+        let Some(info) = table.infos.get(*idx) else {
+            continue;
+        };
+        if info.is_this || info.is_param.is_some() || info.is_return_buffer || info.is_incoming_arg
+        {
             seeded.insert(*v);
         }
         // SSA seeds one ENTRY version per slot, allocating versions in
@@ -555,7 +567,9 @@ fn seeded_versions(table: &LocalTable) -> HashSet<u32> {
 fn entry_versions(table: &LocalTable) -> HashMap<u32, String> {
     let mut entry: HashMap<String, u32> = HashMap::new();
     for (v, idx) in &table.index_of {
-        let Some(info) = table.infos.get(*idx) else { continue };
+        let Some(info) = table.infos.get(*idx) else {
+            continue;
+        };
         entry
             .entry(info.slot_origin.clone())
             .and_modify(|e| {
@@ -602,12 +616,25 @@ fn is_incoming_register(origin: &str) -> bool {
     // `sN`/`dN`/`qN` and the 32-bit view `vsN`/`vdN`/`vqN`; x86-64 normalizes
     // XMM to `vfN`. v0..v7 are arguments, v8..v15 callee-saved, so the whole
     // 0..15 range is a register the ABI supplies a value in.
-    for pre in ["vf", "vq", "vd", "vs", "q", "d", "s"] {
+    for pre in ["vf", "vq", "vd", "q", "d", "s"] {
         if let Some(rest) = origin.strip_prefix(pre) {
             if let Ok(n) = rest.parse::<u32>() {
                 return n <= 15;
             }
         }
+    }
+    // AArch64's 32-bit SIMD names are flattened lane identities:
+    // `vs{4*reg + lane}`. v0-v7 are incoming argument registers; AAPCS64
+    // preserves only the low 64 bits (lanes 0 and 1) of v8-v15. The flattened
+    // names can therefore exceed 15 (`v9.s[1]` is `vs37`) while still being a
+    // valid incoming value. Higher lanes of v8-v15 remain caller-saved.
+    if let Some(n) = origin
+        .strip_prefix("vs")
+        .and_then(|d| d.parse::<u32>().ok())
+    {
+        let reg = n / 4;
+        let lane = n % 4;
+        return reg < 8 || ((8..16).contains(&reg) && lane < 2);
     }
     // ARM32 names its general-purpose registers `g0..g15` (`lift_arm32`), and
     // x86-64 uses the SAME spelling for the ordinals it does not rename
@@ -710,9 +737,7 @@ fn may_eliminate(g: &Graph, table: &LocalTable, v: u32) -> bool {
         return false;
     }
     match table.index_of.get(&v).and_then(|&i| table.infos.get(i)) {
-        Some(info) => {
-            !info.is_this && info.is_param.is_none() && !info.is_return_buffer
-        }
+        Some(info) => !info.is_this && info.is_param.is_none() && !info.is_return_buffer,
         // No table entry: an internal scratch slot. Nothing renders by name, so
         // there is nobody to break — but also no reason to touch it.
         None => false,
@@ -726,7 +751,10 @@ fn types_compatible(a: &ManagedType, b: &ManagedType) -> bool {
     if a == b {
         return true;
     }
-    matches!((a, b), (Unknown, _) | (_, Unknown) | (IntPtr, _) | (_, IntPtr))
+    matches!(
+        (a, b),
+        (Unknown, _) | (_, Unknown) | (IntPtr, _) | (_, IntPtr)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,7 +1092,6 @@ fn apply_aliases(insns: &mut [Insn], g: &Graph, alias: &Aliases, stats: &mut Hig
             rewrite_uses(op, &dead_set, alias);
         }
     }
-
 }
 
 /// Erase `Move(v, v)` — a pure identity, and never a statement worth printing.
@@ -1109,9 +1136,7 @@ fn rewrite_uses(op: &mut Operand, dead: &HashSet<u32>, alias: &Aliases) {
             }
         }
         Operand::InstanceField { base, .. } => rewrite_uses(base, dead, alias),
-        Operand::AddressOf(inner) | Operand::ArrayLength(inner) => {
-            rewrite_uses(inner, dead, alias)
-        }
+        Operand::AddressOf(inner) | Operand::ArrayLength(inner) => rewrite_uses(inner, dead, alias),
         Operand::ArrayAccess { array, index } => {
             rewrite_uses(array, dead, alias);
             rewrite_uses(index, dead, alias);
@@ -1138,7 +1163,8 @@ fn merge_names(g: &Graph, table: &mut LocalTable, stats: &mut HighVarStats) {
         let Some(info) = table.infos.get(*idx) else {
             continue;
         };
-        if info.is_this || info.is_param.is_some() || info.is_return_buffer || info.is_incoming_arg {
+        if info.is_this || info.is_param.is_some() || info.is_return_buffer || info.is_incoming_arg
+        {
             continue; // those render by name from their own identity
         }
         if !g.defs.contains_key(&v) || g.addr_taken.contains(&v) {
@@ -1154,6 +1180,11 @@ fn merge_names(g: &Graph, table: &mut LocalTable, stats: &mut HighVarStats) {
         let mut i = 0usize;
         while i < versions.len() {
             let rep = versions[i];
+            if g.call_dests.contains(&rep) {
+                // A call result is its own source value; see `call_dests`.
+                i += 1;
+                continue;
+            }
             let Some((_, mut end)) = g.span(rep) else {
                 i += 1;
                 continue;
@@ -1166,6 +1197,11 @@ fn merge_names(g: &Graph, table: &mut LocalTable, stats: &mut HighVarStats) {
             let mut j = i + 1;
             while j < versions.len() {
                 let cand = versions[j];
+                if g.call_dests.contains(&cand) {
+                    // Never fold a call result into another variable's name.
+                    j += 1;
+                    continue;
+                }
                 let Some((lo, hi)) = g.span(cand) else {
                     j += 1;
                     continue;
@@ -1192,6 +1228,117 @@ fn merge_names(g: &Graph, table: &mut LocalTable, stats: &mut HighVarStats) {
                 j += 1;
             }
             i = j;
+        }
+    }
+}
+
+fn merge_phi_names(g: &Graph, table: &mut LocalTable, stats: &mut HighVarStats) {
+    // Only x0 (the ARM64 result/argument-0 register) is merged. Its
+    // phi-connected versions are call results and scratch values, where one
+    // high variable is the honest reading and the naming win is large
+    // (0x151F34C: 341→171 vN). Stack spills and SIMD versions are long-lived
+    // struct/FP state: merging their names changed source names and typed
+    // locals (0x17F2380 +20 vN, 0x1530F2C +1 nint), so they are left alone.
+    fn mergeable_slot(slot: &str) -> bool {
+        slot == "x0"
+    }
+    // Unlike rule D, phi-connected versions of one slot usually have LINEARLY
+    // OVERLAPPING spans (a loop header's phi destination is live across the
+    // body while the back-edge argument is defined at its end). They are still
+    // one source variable: every edge hands that variable a value, and SSA
+    // splits it into versions only to keep definitions unique. Naming them
+    // together turns the phi edge copies into `x = x`, which the cleanup pass
+    // drops, instead of printing a rotation of vN names.
+    for _ in 0..3 {
+        let mut changed = false;
+        let mappings: Vec<(u32, usize, String)> = {
+            let mut out = Vec::new();
+            for &(_, d, ref args) in &g.phis {
+                let Some(&di) = table.index_of.get(&d) else {
+                    continue;
+                };
+                if !g.defs.contains_key(&d) || g.addr_taken.contains(&d) {
+                    continue;
+                }
+                if g.call_dests.contains(&d) {
+                    continue;
+                }
+                let d_info = &table.infos[di];
+                if d_info.is_this
+                    || d_info.is_param.is_some()
+                    || d_info.is_return_buffer
+                    || d_info.is_incoming_arg
+                {
+                    continue;
+                }
+                for a in args.iter().flatten() {
+                    let Some(&ai) = table.index_of.get(a) else {
+                        continue;
+                    };
+                    if ai == di {
+                        continue;
+                    }
+                    if g.call_dests.contains(a) {
+                        continue;
+                    }
+                    let a_info = &table.infos[ai];
+                    if a_info.is_this
+                        || a_info.is_param.is_some()
+                        || a_info.is_return_buffer
+                        || a_info.is_incoming_arg
+                    {
+                        continue;
+                    }
+                    if !g.defs.contains_key(a) || g.addr_taken.contains(a) {
+                        continue;
+                    }
+                    if a_info.slot_origin != d_info.slot_origin {
+                        continue;
+                    }
+                    if !mergeable_slot(&d_info.slot_origin) {
+                        continue;
+                    }
+                    // Merge only UNTYPED versions. A merge unifies the table
+                    // entry (hence the display name AND the type), so touching
+                    // a known field/array type loses the field-derived name
+                    // and regressed nint in 0x17FF3B0. Untyped phi groups are
+                    // where the huge naming win is (0x151F34C: 341→171 vN);
+                    // typed versions keep their own entries.
+                    if !matches!(
+                        (&d_info.ty, &a_info.ty),
+                        (ManagedType::Unknown, ManagedType::Unknown)
+                    ) {
+                        continue;
+                    }
+                    out.push((*a, di, d_info.slot_origin.clone()));
+                }
+            }
+            out
+        };
+        // Large phi groups are loop/merge state worth one high variable; a
+        // handful of scratch x0 reuses in one method is incidental and merging
+        // them changes local_naming's evidence (0x146F874 +9 vN, 0x1530F2C +1
+        // nint). Only slots whose group is big enough are unified.
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (_v, _idx, slot) in &mappings {
+            *counts.entry(slot.clone()).or_default() += 1;
+        }
+        for (v, idx, slot) in mappings {
+            if counts.get(&slot).copied().unwrap_or(0) < 8 {
+                continue;
+            }
+            if table.index_of.get(&v).copied() == Some(idx) {
+                continue;
+            }
+            if std::env::var("ILR_HVDBG").is_ok() {
+                eprintln!("[hvmerge] slot={slot} {v}->{idx}");
+            }
+            table.index_of.insert(v, idx);
+            stats.names_merged += 1;
+            changed = true;
+        }
+        if !changed {
+            break;
         }
     }
 }
@@ -1258,7 +1405,8 @@ fn mark_incoming_and_tally(
                 info.is_this
                     || info.is_param.is_some()
                     || info.is_return_buffer
-                    || info.is_incoming_arg,
+                    || info.is_incoming_arg
+                    || info.is_call_clobber,
             )
         };
         if excused {
@@ -1353,6 +1501,9 @@ pub fn recover(insns: &mut [Insn], table: &mut LocalTable) -> HighVarStats {
     let cfg = super::ssa::rebuild_cfg(insns);
     let g = Graph::build(insns, &cfg);
     merge_names(&g, table, &mut stats);
+    if std::env::var("ILR_NOPHIMERGE").is_err() {
+        merge_phi_names(&g, table, &mut stats);
+    }
     mark_incoming_and_tally(&g, table, &seeded, &mut stats);
     record(&stats);
     stats
@@ -1374,6 +1525,7 @@ mod tests {
             param_comp: None,
             is_return_buffer: false,
             is_incoming_arg: false,
+            is_call_clobber: false,
         }
     }
 
@@ -1431,7 +1583,8 @@ mod tests {
         assert_eq!(stats.copies_folded, 2, "both links of the chain must fold");
         assert!(nop_at(&insns, 0) && nop_at(&insns, 1));
         assert_eq!(
-            insns[2].operands[0], l(1),
+            insns[2].operands[0],
+            l(1),
             "the use reads the chain's root, not a name nothing defines"
         );
         assert_eq!(stats.undefined_remaining, 0);
@@ -1447,7 +1600,10 @@ mod tests {
         ];
         let mut t = table_of(&[("v", 1), ("v", 2)]);
         let stats = recover(&mut insns, &mut t);
-        assert_eq!(stats.copies_folded, 0, "the source is defined after the use");
+        assert_eq!(
+            stats.copies_folded, 0,
+            "the source is defined after the use"
+        );
         assert!(matches!(insns[0].op, Op::Move));
     }
 
@@ -1515,6 +1671,107 @@ mod tests {
     // ---- rule B: phi agreement -------------------------------------------
 
     #[test]
+    fn phi_versions_of_one_slot_share_the_name() {
+        let mut insns = Vec::new();
+        for v in 2..=9 {
+            insns.push(Insn::new(Op::Move, vec![l(v), l(1)], 0x1000 + v as u64 * 4));
+        }
+        let mut phi_ops = vec![l(10)];
+        for v in 2..=9 {
+            phi_ops.push(l(v));
+        }
+        insns.push(Insn::new(Op::Phi, phi_ops, 0x1010));
+        insns.push(ret(10));
+        let mut t = table_of(&[
+            ("x0", 1),
+            ("x0", 2),
+            ("x0", 3),
+            ("x0", 4),
+            ("x0", 5),
+            ("x0", 6),
+            ("x0", 7),
+            ("x0", 8),
+            ("x0", 9),
+            ("x0", 10),
+        ]);
+        // Unknown is the intended merge class; typed versions keep their own
+        // table entries to preserve field-derived names.
+        let cfg = crate::recovery::ssa::rebuild_cfg(&insns);
+        let g = Graph::build(&insns, &cfg);
+        let mut stats = HighVarStats::default();
+        merge_phi_names(&g, &mut t, &mut stats);
+        let rep = t.index_of[&10];
+        for v in 2..=9 {
+            assert_eq!(t.index_of[&v], rep, "phi arg {v} shares the name");
+        }
+        assert_eq!(stats.names_merged, 8);
+    }
+
+    #[test]
+    fn a_small_x0_phi_group_is_left_alone() {
+        // Three scratch reuses of x0 are incidental; merging them changes
+        // local_naming's evidence (0x146F874 +9 vN, 0x1530F2C +1 nint).
+        let mut insns = Vec::new();
+        for v in 2..=4 {
+            insns.push(Insn::new(Op::Move, vec![l(v), l(1)], 0x1000 + v as u64 * 4));
+        }
+        let mut phi_ops = vec![l(5)];
+        for v in 2..=4 {
+            phi_ops.push(l(v));
+        }
+        insns.push(Insn::new(Op::Phi, phi_ops, 0x1010));
+        insns.push(ret(5));
+        let mut t = table_of(&[
+            ("x0", 1),
+            ("x0", 2),
+            ("x0", 3),
+            ("x0", 4),
+            ("x0", 5),
+        ]);
+        let cfg = crate::recovery::ssa::rebuild_cfg(&insns);
+        let g = Graph::build(&insns, &cfg);
+        let mut stats = HighVarStats::default();
+        merge_phi_names(&g, &mut t, &mut stats);
+        assert_eq!(stats.names_merged, 0);
+        assert_ne!(t.index_of[&2], t.index_of[&5]);
+    }
+
+    #[test]
+    fn callee_saved_gpr_phi_versions_keep_separate_names() {
+        let mut insns = Vec::new();
+        for v in 2..=9 {
+            insns.push(Insn::new(Op::Move, vec![l(v), l(1)], 0x1000 + v as u64 * 4));
+        }
+        let mut phi_ops = vec![l(10)];
+        for v in 2..=9 {
+            phi_ops.push(l(v));
+        }
+        insns.push(Insn::new(Op::Phi, phi_ops, 0x1010));
+        insns.push(ret(10));
+        let mut t = table_of(&[
+            ("x22", 1),
+            ("x22", 2),
+            ("x22", 3),
+            ("x22", 4),
+            ("x22", 5),
+            ("x22", 6),
+            ("x22", 7),
+            ("x22", 8),
+            ("x22", 9),
+            ("x22", 10),
+        ]);
+        let cfg = crate::recovery::ssa::rebuild_cfg(&insns);
+        let g = Graph::build(&insns, &cfg);
+        let mut stats = HighVarStats::default();
+        merge_phi_names(&g, &mut t, &mut stats);
+        assert_eq!(
+            stats.names_merged, 0,
+            "pinned callee-saved state is left alone"
+        );
+        assert_ne!(t.index_of[&2], t.index_of[&10]);
+    }
+
+    #[test]
     fn phi_whose_arguments_agree_collapses_to_that_argument() {
         let mut insns = vec![
             Insn::new(Op::Move, vec![l(2), l(1)], 0x1000),
@@ -1547,10 +1804,7 @@ mod tests {
 
     #[test]
     fn phi_with_disagreeing_arguments_is_refused() {
-        let mut insns = vec![
-            Insn::new(Op::Phi, vec![l(3), l(1), l(2)], 0x1000),
-            ret(3),
-        ];
+        let mut insns = vec![Insn::new(Op::Phi, vec![l(3), l(1), l(2)], 0x1000), ret(3)];
         let mut t = table_of(&[("x1", 1), ("x2", 2), ("v", 3)]);
         as_param(&mut t, 0, 0);
         as_param(&mut t, 1, 1);
@@ -1571,7 +1825,10 @@ mod tests {
         let mut t = table_of(&[("x1", 1), ("v", 2), ("v", 3)]);
         as_param(&mut t, 0, 0);
         let stats = recover(&mut insns, &mut t);
-        assert_eq!(stats.values_unified, 1, "`v1 + 4` computed twice is one value");
+        assert_eq!(
+            stats.values_unified, 1,
+            "`v1 + 4` computed twice is one value"
+        );
         assert!(nop_at(&insns, 1));
         assert_eq!(insns[2].operands[0], l(2));
     }
@@ -1600,7 +1857,10 @@ mod tests {
         let mut t = table_of(&[("x1", 1), ("v", 2), ("v", 3)]);
         as_param(&mut t, 0, 0);
         let stats = recover(&mut insns, &mut t);
-        assert_eq!(stats.values_unified, 0, "a load's value is not a pure function");
+        assert_eq!(
+            stats.values_unified, 0,
+            "a load's value is not a pure function"
+        );
     }
 
     /// The later definition is in a SIBLING branch: it does not dominate the
@@ -1635,7 +1895,10 @@ mod tests {
         ];
         let mut t = table_of(&[("x1", 1), ("x1", 5)]);
         let stats = recover(&mut insns, &mut t);
-        assert_eq!(stats.names_merged, 1, "one storage, two non-overlapping ranges");
+        assert_eq!(
+            stats.names_merged, 1,
+            "one storage, two non-overlapping ranges"
+        );
         assert_eq!(
             t.index_of[&5], t.index_of[&1],
             "both versions must print the same name"
@@ -1687,7 +1950,10 @@ mod tests {
         let mut t = table_of(&[("x12", 9)]);
         as_param(&mut t, 0, 0);
         let stats = recover(&mut insns, &mut t);
-        assert_eq!(stats.undefined_remaining, 0, "a parameter is defined on entry");
+        assert_eq!(
+            stats.undefined_remaining, 0,
+            "a parameter is defined on entry"
+        );
     }
 
     #[test]
@@ -1695,7 +1961,10 @@ mod tests {
         let mut insns: Vec<Insn> = Vec::new();
         let mut t = LocalTable::default();
         let stats = recover(&mut insns, &mut t);
-        assert_eq!(stats.copies_folded + stats.phis_coalesced + stats.values_unified, 0);
+        assert_eq!(
+            stats.copies_folded + stats.phis_coalesced + stats.values_unified,
+            0
+        );
     }
 
     // ---- classification of what is left ----------------------------------
@@ -1711,7 +1980,10 @@ mod tests {
             let mut insns = vec![ret(9)];
             let mut t = table_of(&[(origin, 9)]);
             let stats = recover(&mut insns, &mut t);
-            assert_eq!(stats.undefined_remaining, 0, "`{origin}` is seeded: {stats:?}");
+            assert_eq!(
+                stats.undefined_remaining, 0,
+                "`{origin}` is seeded: {stats:?}"
+            );
             assert_eq!(stats.excused_on_entry, 1, "excused, not lost: {stats:?}");
             assert!(stats.undefined_origins.is_empty());
         }
@@ -1735,7 +2007,9 @@ mod tests {
     /// scratch register the body never wrote is a genuine loss on x86-64.
     #[test]
     fn g_register_classification_is_conservative() {
-        for o in ["g0", "g1", "g2", "g3", "g4", "g5", "g8", "g9", "g12", "g13", "g14", "g15"] {
+        for o in [
+            "g0", "g1", "g2", "g3", "g4", "g5", "g8", "g9", "g12", "g13", "g14", "g15",
+        ] {
             assert!(
                 is_incoming_register(o),
                 "{o} is ABI-supplied under both namings"
@@ -1761,6 +2035,35 @@ mod tests {
         assert_eq!(stats.undefined_unattributed, 1, "{stats:?}");
     }
 
+
+    /// Two CALL results in one register slot are distinct source values.
+    /// Rule D used to fold them into one name as soon as their spans did not
+    /// overlap, which made two `Vector3` results render as the same variable.
+    #[test]
+    fn call_results_of_one_slot_keep_distinct_names() {
+        let mut insns = vec![
+            Insn::new(
+                Op::Call,
+                vec![Operand::Immediate(0x1000), l(2)],
+                0x1000,
+            ),
+            Insn::new(Op::Move, vec![l(4), l(2)], 0x1004),
+            Insn::new(
+                Op::Call,
+                vec![Operand::Immediate(0x1000), l(3)],
+                0x1008,
+            ),
+            Insn::new(Op::Move, vec![l(5), l(3)], 0x100c),
+            ret(4),
+        ];
+        let mut t = table_of(&[("x0", 2), ("x0", 3), ("x0", 4), ("x0", 5)]);
+        let stats = recover(&mut insns, &mut t);
+        assert_ne!(
+            t.index_of[&2], t.index_of[&3],
+            "call results are different values, not one reused variable: {stats:?}"
+        );
+    }
+
     /// The genuinely lost family keeps being named by origin, so the report can
     /// say WHICH mechanism produced it.
     #[test]
@@ -1774,4 +2077,3 @@ mod tests {
         assert_eq!(stats.undefined_unattributed, 0);
     }
 }
-

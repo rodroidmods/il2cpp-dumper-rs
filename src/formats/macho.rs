@@ -1,6 +1,6 @@
-use crate::io::BinaryStream;
-use crate::search::{SectionHelper, SearchSection};
 use crate::error::{Error, Result};
+use crate::io::BinaryStream;
+use crate::search::{SearchSection, SectionHelper};
 use std::collections::HashMap;
 
 pub const MH_MAGIC: u32 = 0xFEEDFACE;
@@ -83,11 +83,36 @@ pub fn parse_fat(data: &[u8]) -> Result<Vec<FatArch>> {
         if offset + 20 > data.len() {
             break;
         }
-        let cputype = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-        let cpusubtype = u32::from_be_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
-        let arch_offset = u32::from_be_bytes([data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11]]);
-        let size = u32::from_be_bytes([data[offset + 12], data[offset + 13], data[offset + 14], data[offset + 15]]);
-        let align = u32::from_be_bytes([data[offset + 16], data[offset + 17], data[offset + 18], data[offset + 19]]);
+        let cputype = u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        let cpusubtype = u32::from_be_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]);
+        let arch_offset = u32::from_be_bytes([
+            data[offset + 8],
+            data[offset + 9],
+            data[offset + 10],
+            data[offset + 11],
+        ]);
+        let size = u32::from_be_bytes([
+            data[offset + 12],
+            data[offset + 13],
+            data[offset + 14],
+            data[offset + 15],
+        ]);
+        let align = u32::from_be_bytes([
+            data[offset + 16],
+            data[offset + 17],
+            data[offset + 18],
+            data[offset + 19],
+        ]);
 
         let slice_magic = if (arch_offset as usize) + 4 <= data.len() {
             u32::from_le_bytes([
@@ -256,8 +281,16 @@ impl MachO {
         let mut symtab: Option<SymtabCmd> = None;
         let mut cryptid = 0u32;
 
-        let lc_segment_cmd = if self.is_32bit { LC_SEGMENT } else { LC_SEGMENT_64 };
-        let lc_enc_cmd = if self.is_32bit { LC_ENCRYPTION_INFO } else { LC_ENCRYPTION_INFO_64 };
+        let lc_segment_cmd = if self.is_32bit {
+            LC_SEGMENT
+        } else {
+            LC_SEGMENT_64
+        };
+        let lc_enc_cmd = if self.is_32bit {
+            LC_ENCRYPTION_INFO
+        } else {
+            LC_ENCRYPTION_INFO_64
+        };
 
         for _ in 0..ncmds {
             let cmd_pos = self.stream.position();
@@ -423,7 +456,9 @@ impl MachO {
         if start >= self.string_table.len() {
             return String::new();
         }
-        let end = self.string_table[start..].iter().position(|&b| b == 0)
+        let end = self.string_table[start..]
+            .iter()
+            .position(|&b| b == 0)
             .map(|p| start + p)
             .unwrap_or(self.string_table.len());
         String::from_utf8_lossy(&self.string_table[start..end]).to_string()
@@ -520,17 +555,27 @@ impl MachO {
     pub fn list_exported_symbols(&self) -> Vec<(String, u64)> {
         let mut exports = Vec::new();
         for sym in &self.symbols {
-            if sym.n_value == 0 || sym.n_sect == 0 { continue; }
+            if sym.n_value == 0 || sym.n_sect == 0 {
+                continue;
+            }
             let name = self.get_symbol_name(sym);
-            if name.is_empty() { continue; }
-            let name = if name.starts_with('_') { name[1..].to_string() } else { name };
+            if name.is_empty() {
+                continue;
+            }
+            let name = if name.starts_with('_') {
+                name[1..].to_string()
+            } else {
+                name
+            };
             exports.push((name, sym.n_value));
         }
         exports
     }
 
     pub fn search_mod_init_func(&mut self, version: f64) -> Option<(u64, u64)> {
-        let mod_init = self.sections.iter()
+        let mod_init = self
+            .sections
+            .iter()
             .find(|s| s.sectname == "__mod_init_func")?
             .clone();
 
@@ -553,7 +598,9 @@ impl MachO {
         }
 
         for a in &addrs {
-            if *a == 0 { continue; }
+            if *a == 0 {
+                continue;
+            }
             let i = *a - 1; // ARM Thumb bit
             if let Ok(mapped) = self.map_vatr(i) {
                 self.stream.set_position(mapped + 4);
@@ -571,16 +618,19 @@ impl MachO {
                             let ptr = decode_mov_arm32(&mov_bytes2).wrapping_add(subaddr + 16);
                             if let Ok(ptr_offset) = self.map_vatr(ptr) {
                                 self.stream.set_position(ptr_offset);
-                                let metadata_registration = self.stream.read_u32().unwrap_or(0) as u64;
+                                let metadata_registration =
+                                    self.stream.read_u32().unwrap_or(0) as u64;
 
                                 self.stream.set_position(rsubaddr + 8);
                                 let buff3 = self.stream.read_bytes(4).unwrap_or_default();
                                 self.stream.set_position(rsubaddr + 14);
                                 let buff4 = self.stream.read_bytes(4).unwrap_or_default();
-                                let combined: Vec<u8> = buff3.iter().chain(buff4.iter()).cloned().collect();
+                                let combined: Vec<u8> =
+                                    buff3.iter().chain(buff4.iter()).cloned().collect();
 
                                 let code_extra = if version < 21.0 { 22u64 } else { 26u64 };
-                                let code_registration = decode_mov_arm32(&combined).wrapping_add(subaddr + code_extra);
+                                let code_registration =
+                                    decode_mov_arm32(&combined).wrapping_add(subaddr + code_extra);
 
                                 return Some((code_registration, metadata_registration));
                             }
@@ -607,7 +657,9 @@ impl MachO {
         let metadata_registration = 0u64;
 
         for i in &addrs {
-            if *i == 0 { continue; }
+            if *i == 0 {
+                continue;
+            }
             let mapped = match self.map_vatr(*i) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -700,7 +752,8 @@ impl MachO {
         self.stream.set_position(rsubaddr + 8);
         let adrp_bytes2 = self.stream.read_bytes(4).unwrap_or_default();
         let add_bytes2 = self.stream.read_bytes(4).unwrap_or_default();
-        let metadata_registration = decode_adrp(subaddr + 8, &adrp_bytes2) + decode_add(&add_bytes2);
+        let metadata_registration =
+            decode_adrp(subaddr + 8, &adrp_bytes2) + decode_add(&add_bytes2);
 
         if code_registration != 0 && metadata_registration != 0 {
             Some((code_registration, metadata_registration))
@@ -733,7 +786,14 @@ impl MachO {
         data_list
     }
 
-    pub fn get_section_helper(&self, method_count: usize, type_definitions_count: usize, metadata_usages_count: usize, image_count: usize, version: f64) -> SectionHelper<'_> {
+    pub fn get_section_helper(
+        &self,
+        method_count: usize,
+        type_definitions_count: usize,
+        metadata_usages_count: usize,
+        image_count: usize,
+        version: f64,
+    ) -> SectionHelper<'_> {
         let data_list = self.data_search_sections();
         let mut exec_list = Vec::new();
         let mut bss_list = Vec::new();
@@ -826,7 +886,10 @@ impl MachO {
         let end = base + table_size as u64;
         if end > self.stream.len() as u64 {
             if std::env::var("ILR_BIND_DEBUG").is_ok() {
-                eprintln!("[bind] table out of bounds: {base:#x}+{table_size:#x} > {:#x}", self.stream.len());
+                eprintln!(
+                    "[bind] table out of bounds: {base:#x}+{table_size:#x} > {:#x}",
+                    self.stream.len()
+                );
             }
             return Ok(());
         }
@@ -1001,8 +1064,7 @@ impl MachO {
                         &sym_inline,
                         &mut slot_name,
                     );
-                    seg_offset =
-                        seg_offset.wrapping_add(ptr_size * (1 + imm as u64));
+                    seg_offset = seg_offset.wrapping_add(ptr_size * (1 + imm as u64));
                 }
                 OP_DO_BIND_TIMES_SKIPPING => {
                     let count = read_uleb128(&mut self.stream)?;
@@ -1016,8 +1078,7 @@ impl MachO {
                                 &sym_inline,
                                 &mut slot_name,
                             );
-                            seg_offset =
-                                seg_offset.wrapping_add(ptr_size).wrapping_add(skip);
+                            seg_offset = seg_offset.wrapping_add(ptr_size).wrapping_add(skip);
                         }
                     }
                 }
@@ -1104,14 +1165,28 @@ impl MachO {
             page_starts.push(self.stream.read_u16()?);
         }
 
-        let seg_file_off = match self.segments.iter().find(|s| s.vmaddr == segment_offset || s.fileoff == segment_offset) {
+        let seg_file_off = match self
+            .segments
+            .iter()
+            .find(|s| s.vmaddr == segment_offset || s.fileoff == segment_offset)
+        {
             Some(s) => s.fileoff,
-            None => self.segments.iter()
-                .min_by_key(|s| if s.vmaddr >= segment_offset { s.vmaddr - segment_offset } else { u64::MAX })
+            None => self
+                .segments
+                .iter()
+                .min_by_key(|s| {
+                    if s.vmaddr >= segment_offset {
+                        s.vmaddr - segment_offset
+                    } else {
+                        u64::MAX
+                    }
+                })
                 .map(|s| s.fileoff)
                 .unwrap_or(0),
         };
-        let seg_vmaddr = self.segments.iter()
+        let seg_vmaddr = self
+            .segments
+            .iter()
             .find(|s| s.fileoff == seg_file_off)
             .map(|s| s.vmaddr)
             .unwrap_or(self.vmaddr);
@@ -1216,7 +1291,9 @@ impl MachO {
                 }
                 REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB => {
                     self.apply_rebase_at(seg_index, seg_offset, rebase_type, ptr_size)?;
-                    seg_offset = seg_offset.wrapping_add(ptr_size).wrapping_add(read_uleb128(&mut self.stream)?);
+                    seg_offset = seg_offset
+                        .wrapping_add(ptr_size)
+                        .wrapping_add(read_uleb128(&mut self.stream)?);
                 }
                 REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
                     let count = read_uleb128(&mut self.stream)?;
@@ -1234,7 +1311,13 @@ impl MachO {
         Ok(())
     }
 
-    fn apply_rebase_at(&mut self, seg_index: usize, seg_offset: u64, _rebase_type: u8, ptr_size: u64) -> Result<()> {
+    fn apply_rebase_at(
+        &mut self,
+        seg_index: usize,
+        seg_offset: u64,
+        _rebase_type: u8,
+        ptr_size: u64,
+    ) -> Result<()> {
         if seg_index >= self.segments.len() {
             return Ok(());
         }
@@ -1256,7 +1339,8 @@ impl MachO {
             let raw = self.stream.read_u32()? as u64;
             if raw != 0 && raw < self.vmaddr {
                 self.stream.set_position(file_off);
-                self.stream.write_u32(raw.wrapping_add(self.vmaddr) as u32)?;
+                self.stream
+                    .write_u32(raw.wrapping_add(self.vmaddr) as u32)?;
             }
         }
         self.stream.set_position(saved);
@@ -1280,13 +1364,17 @@ impl MachO {
 }
 
 fn is_adr(inst: &[u8]) -> bool {
-    if inst.len() < 4 { return false; }
+    if inst.len() < 4 {
+        return false;
+    }
     let value = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
     (value & 0x9F000000) == 0x10000000
 }
 
 fn decode_adr(pc: u64, inst: &[u8]) -> u64 {
-    if inst.len() < 4 { return 0; }
+    if inst.len() < 4 {
+        return 0;
+    }
     let value = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
     let immhi = ((value >> 5) & 0x7FFFF) as i64;
     let immlo = ((value >> 29) & 0x3) as i64;
@@ -1300,7 +1388,9 @@ fn decode_adr(pc: u64, inst: &[u8]) -> u64 {
 }
 
 fn decode_adrp(pc: u64, inst: &[u8]) -> u64 {
-    if inst.len() < 4 { return 0; }
+    if inst.len() < 4 {
+        return 0;
+    }
     let value = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
     let immhi = ((value >> 5) & 0x7FFFF) as i64;
     let immlo = ((value >> 29) & 0x3) as i64;
@@ -1314,7 +1404,9 @@ fn decode_adrp(pc: u64, inst: &[u8]) -> u64 {
 }
 
 fn decode_add(inst: &[u8]) -> u64 {
-    if inst.len() < 4 { return 0; }
+    if inst.len() < 4 {
+        return 0;
+    }
     let value = u32::from_le_bytes([inst[0], inst[1], inst[2], inst[3]]);
     let imm12 = (value >> 10) & 0xFFF;
     let shift = (value >> 22) & 0x3;
@@ -1394,7 +1486,9 @@ fn decode_chained_pointer(raw: u64, pointer_format: u16) -> (Option<u64>, u32, u
 }
 
 fn decode_mov_arm32(data: &[u8]) -> u64 {
-    if data.len() < 4 { return 0; }
+    if data.len() < 4 {
+        return 0;
+    }
     let low = u16::from_le_bytes([data[0], data[1]]);
     let high = if data.len() >= 4 {
         u16::from_le_bytes([data[2], data[3]])

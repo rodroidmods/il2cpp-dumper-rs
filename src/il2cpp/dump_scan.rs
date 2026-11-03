@@ -90,12 +90,7 @@ fn all_occurrences(data: &[u8], needle: &[u8], limit: usize) -> Vec<usize> {
 /// this is a module. Every real module in a live image has most entries filled;
 /// junk that happens to sit at the right offsets does not. The `Assembly-CSharp.dll`
 /// reference module measures 198/203.
-fn pointer_array_looks_real(
-    data: &[u8],
-    image_base: u64,
-    count: u64,
-    array_offset: usize,
-) -> bool {
+fn pointer_array_looks_real(data: &[u8], image_base: u64, count: u64, array_offset: usize) -> bool {
     let sample: u64 = count.min(32);
     if sample == 0 {
         return false;
@@ -157,19 +152,27 @@ pub fn locate_modules_by_name(
     let mut found: Vec<LocatedModule> = Vec::new();
     let mut taken: Vec<bool> = vec![false; names.len()];
     for (pos, addr) in sites {
-        let Some(&idx) = by_addr.get(&addr) else { continue };
+        let Some(&idx) = by_addr.get(&addr) else {
+            continue;
+        };
         if taken[idx] {
             continue;
         }
         // `methodPointerCount` is a `uint32_t` at +8 with padding after it, so
         // reading it as a `u64` sees the same value on a little-endian image.
-        let Some(count) = read_u64(data, pos + 8) else { continue };
+        let Some(count) = read_u64(data, pos + 8) else {
+            continue;
+        };
         let count = count & 0xffff_ffff;
-        let Some(pointers) = read_u64(data, pos + 16) else { continue };
+        let Some(pointers) = read_u64(data, pos + 16) else {
+            continue;
+        };
         if count == 0 || count > MAX_METHOD_POINTERS {
             continue;
         }
-        let Some(array_offset) = pointers.checked_sub(image_base) else { continue };
+        let Some(array_offset) = pointers.checked_sub(image_base) else {
+            continue;
+        };
         let array_offset = array_offset as usize;
         if array_offset + 8 > data.len() {
             continue;

@@ -1,15 +1,28 @@
-use std::collections::{HashMap, HashSet};
-use std::fmt::Write as FmtWrite;
 use super::cpp_type_dependency_graph::{
     CppCompilerLayout, CppTypeDependencyGraph, GraphField, GraphType, GraphTypeKind,
 };
 use super::cpp_type_model::{CppTypeGroup, CppTypeGroupRegistry};
 use crate::error::{Error, Result};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 
 static C_PRIMITIVE_TYPES: &[&str] = &[
-    "void", "bool", "char", "int8_t", "uint8_t", "int16_t", "uint16_t",
-    "int32_t", "uint32_t", "int64_t", "uint64_t", "float", "double",
-    "intptr_t", "uintptr_t", "Il2CppChar",
+    "void",
+    "bool",
+    "char",
+    "int8_t",
+    "uint8_t",
+    "int16_t",
+    "uint16_t",
+    "int32_t",
+    "uint32_t",
+    "int64_t",
+    "uint64_t",
+    "float",
+    "double",
+    "intptr_t",
+    "uintptr_t",
+    "Il2CppChar",
 ];
 
 fn needs_struct_prefix(type_name: &str) -> bool {
@@ -93,7 +106,10 @@ impl CppHeaderEmitter {
             } else if terminal_is_value {
                 (GraphTypeKind::ValueStruct, Some(GraphTypeKind::ValueStruct))
             } else {
-                (GraphTypeKind::ReferenceClass, Some(GraphTypeKind::ReferenceClass))
+                (
+                    GraphTypeKind::ReferenceClass,
+                    Some(GraphTypeKind::ReferenceClass),
+                )
             }
         } else if !is_custom {
             (GraphTypeKind::Primitive, None)
@@ -185,7 +201,10 @@ impl CppHeaderEmitter {
         let mut sorted_fwd: Vec<&String> = fwd_candidates.iter().collect();
         sorted_fwd.sort();
         if !sorted_fwd.is_empty() {
-            Self::write_section_banner(&mut buf, CppTypeGroup::RequiredForwardDefinitions.section_header());
+            Self::write_section_banner(
+                &mut buf,
+                CppTypeGroup::RequiredForwardDefinitions.section_header(),
+            );
             for fwd_name in sorted_fwd {
                 if !known_type_names.contains(fwd_name)
                     && self.forward_declared.insert(fwd_name.clone())
@@ -261,9 +280,17 @@ impl CppHeaderEmitter {
     }
 
     fn write_section_banner(buf: &mut String, name: &str) {
-        writeln!(buf, "// ******************************************************************************").ok();
+        writeln!(
+            buf,
+            "// ******************************************************************************"
+        )
+        .ok();
         writeln!(buf, "// * {name}").ok();
-        writeln!(buf, "// ******************************************************************************").ok();
+        writeln!(
+            buf,
+            "// ******************************************************************************"
+        )
+        .ok();
         writeln!(buf).ok();
     }
 

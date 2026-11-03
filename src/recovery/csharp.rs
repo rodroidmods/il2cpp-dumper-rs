@@ -19,7 +19,6 @@ use super::probe_dir;
 use super::types::{FieldRef, ManagedType, PrimKind};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-
 // ---------------------------------------------------------------------------
 // Expression trees
 // ---------------------------------------------------------------------------
@@ -102,6 +101,13 @@ const SHARED_EXPR_NODES: u64 = 64;
 /// `emit_if` exists to avoid; see the `FLAT GUARD` note there for the measured
 /// failure this cap used to hide.
 const MAX_NEST_DEPTH: usize = 32;
+/// Recursion cap for the structured (goto-free) emitter. It is a separate
+/// budget from `MAX_NEST_DEPTH`: that one bounds the address walker's nesting
+/// because it also bounds OUTPUT nesting, while this emitter flattens guard
+/// chains back into one condition (`if (!a && !b) { … }`), so its recursion
+/// depth is the CFG's branch depth, not the printed indentation.
+#[allow(dead_code)]
+const MAX_STRUCT_DEPTH: usize = 400;
 
 /// Process-wide count of nesting-cap truncations (see [`MAX_NEST_DEPTH`]).
 /// Global rather than per-thread because the run summary is printed once, after
@@ -113,13 +119,35 @@ pub(crate) fn nest_cap_count() -> u64 {
     NEST_CAPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A/B toggle for the misplaced-throw fix. When the env var
+/// `ILR_THROW_FIX_OFF` is set, `emit_if` reverts to the legacy behaviour:
+/// `body_terminates` refuses to treat a nested if-else as terminating, and a
+/// merge block is handed back as the continuation even when BOTH arms already
+/// threw/returned/got (which is exactly how a dead `throw` got re-emitted
+/// AFTER the if-else). Used only to measure the fix's impact.
+fn throw_fix_off() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| crate::recovery::env_flags::flag("ILR_THROW_FIX_OFF"))
+}
+
+/// How many dead-merge suppressions the fix performed in this process — each
+/// one is a misplaced throw (or return/goto) that is no longer emitted after
+/// its if-else. Reported in the run summary when `ILR_THROW_STAT` is set.
+static DEAD_MERGE_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[allow(dead_code)]
+pub(crate) fn dead_merge_suppressed() -> u64 {
+    DEAD_MERGE_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Operand index of the AAPCS64 indirect-result register slot on an `Op::Call`:
 /// `[target, dest, x0 … x7, x8]`. The arm64 `BL`/`BLR` arms build the list in
 /// that order and `lift::attach_sret_register` fills slot 10 when — and only
 /// when — the call site materialized the sret pointer (`add x8, sp, #imm`).
 const SRET_OPERAND: usize = 10;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Var(String),
     This,
@@ -188,8 +216,57 @@ pub enum Expr {
     NewObj(String, Vec<Expr>),
     /// Array allocation `new T[len]` (metadata-typed element).
     NewArr(String, Vec<Expr>),
+    /// Array initializer `new T { e0, e1, e2 }` (folded element stores).
+    ArrayInit { elem_type: String, items: Vec<Expr> },
+    /// Collection initializer `new List<T>(cap) { e0, e1, e2 }` (folded Add calls).
+    ///
+    /// Produced by `reconstruct::collection_init` when a `NewObj` allocation is
+    /// immediately followed by one-argument `Add()` calls on the same local.
+    /// Dictionary-style two-argument `Add(k, v)` calls render as `{ { k, v } }`.
+    CollectionInit {
+        type_name: String,
+        ctor_args: Vec<Expr>,
+        items: Vec<Expr>,
+    },
+    /// Object initializer `new T(args) { Field1 = e1, Field2 = e2 }`.
+    ///
+    /// Produced by the `object_init` reconstruction pass, which folds
+    /// consecutive field stores into a freshly-allocated object:
+    ///   `v = new T(args); v.F1 = e1; v.F2 = e2;`
+    /// becomes:
+    ///   `v = new T(args) { F1 = e1, F2 = e2 };`
+    ///
+    /// Safety conditions (enforced by the recognizer):
+    /// - No intervening reads of `v` between the allocation and field stores
+    /// - No calls between the allocation and field stores
+    /// - Field store values do not read `v`
+    /// - `v` is not read after the last field store
+    ObjInit {
+        type_name: String,
+        ctor_args: Vec<Expr>,
+        fields: Vec<(String, Expr)>,
+    },
     /// Explicit numeric conversion `(T)expr` (widening/narrowing kept visible).
     Cast(String, Box<Expr>),
+    /// Collection indexer access `collection[index]`.
+    ///
+    /// Produced by `reconstruct::indexer` from `get_Item` method calls:
+    ///   `v.get_Item(i)` → `v[i]`
+    Index {
+        collection: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// Null-conditional access: `receiver?.access`.
+    ///
+    /// Produced by `reconstruct::null_conditional` from `if (x != null) x.Method()`
+    /// or `if (x != null) { y = x.Field; }` patterns.
+    ///
+    /// `access` is the full member-access expression (Call or Field) including
+    /// the receiver; the renderer strips the receiver and emits `?.` instead.
+    NullConditional {
+        receiver: Box<Expr>,
+        access: Box<Expr>,
+    },
     /// A method used as a VALUE — the `MethodInfo*` operand of a delegate
     /// creation or a method-pointer store (IL2CPP materializes
     /// `<>c.<...>b__N_M` as a pointer and hands it to a delegate).
@@ -198,9 +275,122 @@ pub enum Expr {
     /// confused for a read of the value it belongs to, and a bare dotted name
     /// would be indistinguishable from a static field access.
     MethodGroup(String),
+    /// Pattern matching: `expr is Type binding`.
+    ///
+    /// Produced by `reconstruct::pattern_match` from the IL2CPP-lowered form:
+    ///   `if (x is T) { T t = (T)x; ... t ... }`
+    /// becomes:
+    ///   `if (x is T t) { ... t ... }`
+    ///
+    /// The `binding` variable is in scope inside the `then` branch of the
+    /// enclosing `if`. The renderer emits `expr is Type binding`.
+    PatternMatch {
+        expr: Box<Expr>,
+        type_name: String,
+        binding: String,
+    },
+    /// String interpolation: `$"literal {expr} literal {expr:fmt}"`.
+    ///
+    /// Produced by `reconstruct::string_interp` from `String.Format` calls:
+    ///   `String.Format("Hello {0}, you are {1:D2}", name, age)`
+    /// becomes:
+    ///   `$"Hello {name}, you are {age:D2}"`
+    ///
+    /// Parts alternate between literal text and interpolated expressions.
+    StringInterp {
+        parts: Vec<InterpPart>,
+    },
+    /// Tuple literal: `(e1, e2, e3)` or `(name1: e1, name2: e2)`.
+    ///
+    /// Produced by `reconstruct::tuple_recon` from `ValueTuple.Create(a, b, c)`
+    /// or `new ValueTuple<T1, T2, T3>(a, b, c)` calls, and from sequences of
+    /// `Item1`/`Item2`/... field reads that form a deconstruction pattern.
+    ///
+    /// Named tuples carry element names: `(name: expr, ...)`.
+    Tuple {
+        /// Optional element names (same length as `elements`; `None` = unnamed).
+        names: Vec<Option<String>>,
+        elements: Vec<Expr>,
+    },
+    /// LINQ-style method chain: `receiver.Where(pred).Select(transform).OrderBy(key)`.
+    ///
+    /// Produced by `reconstruct::linq_recon` from nested `System.Linq.Enumerable`
+    /// static extension-method calls:
+    ///   `Enumerable.Select(Enumerable.Where(source, pred), transform)`
+    /// becomes:
+    ///   `MethodChain { receiver: source, methods: [Where(pred), Select(transform)] }`
+    ///
+    /// Also recognizes instance-method chains:
+    ///   `source.Where(pred).Select(transform)` (nested `Call { recv }`)
+    ///
+    /// Rendered as fluent dot-chained method calls.
+    MethodChain {
+        receiver: Box<Expr>,
+        methods: Vec<ChainMethod>,
+    },
+    /// C# 8+ switch expression: `discrim switch { pattern => result, … }`.
+    ///
+    /// Produced by `reconstruct::switch_expr` from if-else chains that assign
+    /// to the same target variable:
+    ///   `target = if (discrim == val1) { expr1; } else if (discrim == val2) { expr2; } else { default_expr; }`
+    /// becomes:
+    ///   `target = discrim switch { val1 => expr1, val2 => expr2, _ => default_expr }`
+    ///
+    /// `arms` holds `(pattern, result)` pairs; `default_arm` is the fallback.
+    SwitchExpr {
+        discrim: Box<Expr>,
+        arms: Vec<(Expr, Expr)>,
+        default_arm: Option<Box<Expr>>,
+    },
+    /// C# 8+ range expression: `from..to`.
+    ///
+    /// Produced by `reconstruct::range_index` from `System.Range` constructor calls:
+    ///   `new System.Range(start, end)` -> `Range { from: Some(start), to: Some(end) }`
+    ///   `new System.Range(0, end)` -> `Range { from: None, to: Some(end) }` (renders as `..end`)
+    ///   Full range `..` when both are None.
+    Range {
+        from: Option<Box<Expr>>,
+        to: Option<Box<Expr>>,
+    },
+    /// C# 8+ index-from-end expression: `^n`.
+    ///
+    /// Produced by `reconstruct::range_index` from `System.Index` constructor calls:
+    ///   `new System.Index(n, true)` -> `IndexFromEnd(n)`
+    ///   Rendered as `^n`.
+    IndexFromEnd(Box<Expr>),
+    /// `typeof(T)` — runtime type reference.
+    ///
+    /// Produced by `il2cpp_cleanup` when stripping IL2CPP klass-pointer
+    /// accesses: `T.klass(T)` → `typeof(T)`.
+    TypeOf(String),
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A single method call within a [`Expr::MethodChain`].
+///
+/// Represents `.name(args)` in a fluent chain like `source.Where(pred).Select(transform)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainMethod {
+    /// Method name (e.g. "Where", "Select", "OrderBy").
+    pub name: String,
+    /// Arguments to the method (not including the receiver/source).
+    pub args: Vec<Expr>,
+}
+
+/// A part of a string interpolation `$"..."`.
+///
+/// Literal parts are emitted verbatim (with `"` and `\` escaped for
+/// interpolation context). Expression parts are rendered as `{expr}` or
+/// `{expr:format}` inside the interpolated string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InterpPart {
+    /// Literal text segment (no surrounding quotes).
+    Literal(String),
+    /// An interpolated expression, with an optional format specifier.
+    /// E.g. `{0:D2}` → `Expr(Expr::Var("age"), Some("D2"))`.
+    Expr(Box<Expr>, Option<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     Add,
     Sub,
@@ -219,9 +409,17 @@ pub enum BinOp {
     AndAlso,
     /// Short-circuit boolean disjunction (`||`) — see `AndAlso`.
     OrElse,
+    /// Null-coalescing assignment (`??=`). Produced by the
+    /// `null_coalesce` reconstruction pass when it detects
+    /// `if (x == null) x = value;` and rewrites it to `x ??= value;`.
+    NullCoalesceAssign,
+    /// Null-coalescing (`??`). Produced by the `nullable_ops` reconstruction
+    /// pass when it detects `Nullable<T>.GetValueOrDefault()` and rewrites
+    /// it to `x ?? default`.
+    NullCoalesce,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CmpKind {
     Eq,
     Ne,
@@ -232,7 +430,7 @@ pub enum CmpKind {
 }
 
 impl CmpKind {
-    fn invert(self) -> Self {
+    pub(crate) fn invert(self) -> Self {
         match self {
             Self::Eq => Self::Ne,
             Self::Ne => Self::Eq,
@@ -255,6 +453,132 @@ impl CmpKind {
     }
 }
 
+/// The shortest exact spelling of a chain of `!` operators.
+///
+/// `Expr::Not` nodes accumulate from several independent places (the lifter's
+/// `Op::Not`, select-arm inversion, and the structurer's guard inversion), and
+/// two of them routinely meet: `!(a == b)` from an inverted guard wrapped
+/// again by a jump table's arm swap produced `!(!(a == b))` in the text.
+/// A `!` chain therefore renders by its net parity, and a single net negation
+/// of a comparison renders as the complementary comparison when that is exact:
+///
+/// * `!!x` / `!!!!x` → `x` (exact for every type).
+/// * `!(a == b)` / `!(a != b)` → `a != b` / `a == b` (exact for every value,
+///   NaN included: `==` and `!=` are negations of each other).
+/// * `!(a < b)` → `a >= b` ONLY when both operands are provably non-float
+///   (ints / pointers). For NaN, `!(a < b)` is TRUE while `a >= b` is false,
+///   so the ordering rewrite is deliberately withheld from float operands.
+/// * anything else stays `!operand`, with minimal parentheses.
+enum NotSpelling<'a> {
+    /// Net zero negations (`!!x`): render the operand itself.
+    None(&'a Expr),
+    /// Net one negation of a comparison, rewritten to its complement.
+    Complement(CmpKind, &'a Expr, &'a Expr),
+    /// Net one negation that is not safely rewritable: render `!operand`.
+    Plain(&'a Expr),
+}
+
+/// Reduce a `Not` expression's `!` chain. `expr` must be `Expr::Not`.
+fn not_spelling(expr: &Expr) -> NotSpelling<'_> {
+    let Expr::Not(inner) = expr else {
+        // Defensive: only called for `Not`; a non-Not operand renders plainly.
+        return NotSpelling::Plain(expr);
+    };
+    let mut negations = 1u32;
+    let mut cur = inner.as_ref();
+    while let Expr::Not(next) = cur {
+        negations += 1;
+        cur = next;
+    }
+    if negations % 2 == 0 {
+        return NotSpelling::None(cur);
+    }
+    match cur {
+        // Equality negation is exact for every value, floats and pointers
+        // included (C# defines `!=` as the negation of `==`).
+        Expr::Cmp(CmpKind::Eq, a, b) => NotSpelling::Complement(CmpKind::Ne, a, b),
+        Expr::Cmp(CmpKind::Ne, a, b) => NotSpelling::Complement(CmpKind::Eq, a, b),
+        // Ordering negation is exact only away from NaN.
+        Expr::Cmp(kind, a, b)
+            if expr_is_non_float(a) && expr_is_non_float(b) =>
+        {
+            NotSpelling::Complement(kind.invert(), a, b)
+        }
+        other => NotSpelling::Plain(other),
+    }
+}
+
+/// Is this expression provably NOT a `float`/`double` value?
+///
+/// Used only to decide whether `!(a < b)` may print `a >= b`: IEEE NaN makes
+/// those differ for floating-point operands. The predicate is therefore
+/// deliberately one-sided — anything whose type is not provable is `false`
+/// and keeps the exact `!(…)` spelling. SSA temporaries (plain `vN`) and
+/// named locals are integers here: the lifter names every floating-point
+/// value after its vector register (`vs*`, `vd*`, `vq*`), and float literals
+/// are `Float`/`Double` nodes that this predicate rejects outright.
+fn expr_is_non_float(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::This
+        | Expr::TypeOf(_)
+        | Expr::RawDeref(..)
+        | Expr::RawAddr(..)
+        | Expr::AddressOf(_)
+        | Expr::Cmp(..)
+        | Expr::PatternMatch { .. }
+        | Expr::Range { .. }
+        | Expr::IndexFromEnd(_) => true,
+        // `!` always yields bool; `-` keeps its operand's type.
+        Expr::Not(_) => true,
+        Expr::Neg(inner) => expr_is_non_float(inner),
+        // A cast to a non-floating type is non-floating whatever it came from.
+        Expr::Cast(ty, _) => !type_name_is_float(ty),
+        Expr::Bin(_, a, b) => expr_is_non_float(a) && expr_is_non_float(b),
+        Expr::Cond(_, a, b) => expr_is_non_float(a) && expr_is_non_float(b),
+        // Register naming: only the vector-register families are floats.
+        Expr::Var(name) => !name_is_float_local(name),
+        Expr::Field(..)
+        | Expr::StaticField(..)
+        | Expr::Str(_)
+        | Expr::Index { .. }
+        | Expr::Call { .. }
+        | Expr::RawCall(..)
+        | Expr::NewObj(..)
+        | Expr::NewArr(..)
+        | Expr::ArrayInit { .. }
+        | Expr::CollectionInit { .. }
+        | Expr::ObjInit { .. }
+        | Expr::MethodChain { .. }
+        | Expr::Await(_)
+        | Expr::Lambda { .. }
+        | Expr::StringInterp { .. }
+        | Expr::Tuple { .. }
+        | Expr::SwitchExpr { .. } => false,
+        Expr::Float(_) | Expr::Double(_) | Expr::MissingAbiArg | Expr::Unknown => false,
+        Expr::NullConditional { .. } | Expr::MethodGroup(_) => false,
+    }
+}
+
+/// `float`/`double`/`Single`/`Double` type names (the only comparisons where
+/// NaN breaks `!(a < b) ⇔ a >= b`).
+fn type_name_is_float(ty: &str) -> bool {
+    let t = ty.to_ascii_lowercase();
+    t.contains("float") || t.contains("double") || t == "single"
+}
+
+/// Locals that came from a floating-point (vector) register. The lifter names
+/// them `vs{n}` (single), `vd{n}` (double), `vq{n}` (quad); metadata parameter
+/// names keep their source spelling, which is not float-detectable — those
+/// must stay conservative and are NOT matched here (the predicate above is
+/// one-sided: unknown means "could be float").
+fn name_is_float_local(name: &str) -> bool {
+    let n = name.strip_prefix("in_").unwrap_or(name);
+    n.starts_with("vs") || n.starts_with("vd") || n.starts_with("vq")
+}
+
 impl BinOp {
     fn token(self) -> &'static str {
         match self {
@@ -270,6 +594,8 @@ impl BinOp {
             Self::Shr => ">>",
             Self::AndAlso => "&&",
             Self::OrElse => "||",
+            Self::NullCoalesceAssign => "??=",
+            Self::NullCoalesce => "??",
         }
     }
 }
@@ -288,14 +614,30 @@ impl Expr {
             // so a compound condition renders `a == 0 || b == 0` unparenthesised.
             Expr::Bin(BinOp::AndAlso, ..) => 3,
             Expr::Bin(BinOp::OrElse, ..) => 2,
+            // `??=` is an assignment operator — lowest precedence alongside
+            // the ternary. It only ever appears as the RHS of a Stmt::Assign,
+            // so the precedence is mainly defensive.
+            Expr::Bin(BinOp::NullCoalesceAssign, ..) => 1,
+            // `??` binds just above assignment — `x ?? default` renders
+            // correctly inside most expression contexts.
+            Expr::Bin(BinOp::NullCoalesce, ..) => 1,
             Expr::Bin(BinOp::Shl | BinOp::Shr, ..) => 9,
             Expr::Bin(BinOp::Add | BinOp::Sub, ..) => 10,
             Expr::Bin(BinOp::Mul | BinOp::Div | BinOp::Rem, ..) => 11,
-            Expr::Not(_) | Expr::Neg(_) | Self::Cast(..) => 12,
+            // A `!` chain reports the precedence of what it actually prints:
+            // `!!x` prints `x` (recurse), `!cmp` prints the complement at
+            // comparison precedence, and only a true `!operand` is unary.
+            Expr::Not(_) => match not_spelling(self) {
+                NotSpelling::None(e) => e.precedence(),
+                NotSpelling::Complement(..) => 7,
+                NotSpelling::Plain(_) => 12,
+            },
+            Expr::Neg(_) | Self::Cast(..) => 12,
             Expr::RawDeref(..) => 13,
             Expr::RawAddr(..) => 13,
             Expr::AddressOf(_) => 12,
             Expr::RawCall(..) => 15,
+            Expr::ArrayInit { .. } | Expr::CollectionInit { .. } | Expr::ObjInit { .. } => 15,
             // The conditional operator binds LOOSER than everything else in
             // C# (below `||`), and reporting it as a tight leaf meant no
             // parent ever parenthesised it. `1f - c ? a : b` is
@@ -304,6 +646,21 @@ impl Expr {
             // silently attached to the wrong side of the enclosing operator,
             // in every expression that used a select as an operand.
             Expr::Cond(..) => 1,
+            // Null-conditional binds as tightly as a member access.
+            Expr::NullConditional { .. } => 15,
+            // `is T t` binds at comparison level — it appears as an `if`
+            // condition and should not need parenthesization there.
+            Expr::PatternMatch { .. } => 7,
+            // String interpolation is a leaf expression — no parenthesization needed.
+            Expr::StringInterp { .. } => 15,
+            // Tuple literals are leaf expressions — no parenthesization needed.
+            Expr::Tuple { .. } => 15,
+            // Method chains bind as tightly as member access — `source.Where(...).Select(...)`
+            // is a postfix chain, no parenthesization needed when used as a sub-expression.
+            Expr::MethodChain { .. } => 15,
+            // Range (..) and index-from-end (^) are postfix/prefix operators
+            // that bind tightly like member access.
+            Expr::Range { .. } | Expr::IndexFromEnd(_) => 15,
             _ => 15,
         }
     }
@@ -368,20 +725,24 @@ impl Expr {
                 out.push(' ');
                 out.push_str(op.token());
                 out.push(' ');
-                parenthesize(out, p, b.precedence(), |out| b.render(out));
+                parenthesize_rhs(out, self, b, |out| b.render(out));
             }
             Self::Cmp(op, a, b) => {
-                let p = self.precedence();
-                parenthesize(out, p, a.precedence(), |out| a.render(out));
-                out.push(' ');
-                out.push_str(op.token());
-                out.push(' ');
-                parenthesize(out, p, b.precedence(), |out| b.render(out));
+                render_cmp(*op, a, b, out);
             }
-            Self::Not(e) => {
-                out.push('!');
-                parenthesize(out, self.precedence(), e.precedence(), |out| e.render(out));
-            }
+            Self::Not(_) => match not_spelling(self) {
+                NotSpelling::None(e) => {
+                    // `!!x` → `x`. The parent already parenthesized this node
+                    // by its EFFECTIVE precedence (see `precedence`), which is
+                    // the operand's, so no extra wrapping is due here.
+                    e.render(out);
+                }
+                NotSpelling::Complement(kind, a, b) => render_cmp(kind, a, b, out),
+                NotSpelling::Plain(e) => {
+                    out.push('!');
+                    parenthesize(out, 12, e.precedence(), |out| e.render(out));
+                }
+            },
             Self::Neg(e) => {
                 out.push('-');
                 parenthesize(out, self.precedence(), e.precedence(), |out| e.render(out));
@@ -403,6 +764,11 @@ impl Expr {
                 out.push('.');
                 out.push_str(name);
             }
+            Self::TypeOf(ty) => {
+                out.push_str("typeof(");
+                out.push_str(ty);
+                out.push(')');
+            }
             Self::RawDeref(base, addend, width) => {
                 // The ACCESS WIDTH the native instruction performs. A `ldrb`
                 // reads ONE byte; rendering it as `*(nint*)` claims an
@@ -413,6 +779,10 @@ impl Expr {
                     1 => "byte",
                     2 => "short",
                     4 => "int",
+                    // A 4-byte FLOAT load (`ldr s0, …`), retyped from the int
+                    // lane by `reconstruct::float_locals` when the comparison
+                    // operand proves the local is single-precision.
+                    5 => "float",
                     _ => "nint",
                 };
                 out.push_str("*(");
@@ -426,6 +796,14 @@ impl Expr {
                 // folds normally through the ` addend` path.
                 if matches!(**base, Self::Int(0)) {
                     out.push_str(&format!("{:#x}", *addend as u64));
+                } else if *addend != 0 && matches!(**base, Self::AddressOf(_)) {
+                    // `addend` is a byte offset from the lifter, while C#
+                    // pointer addition scales by the pointed-to type. Convert
+                    // an address-of-local to nint before adding, or `&float +
+                    // 4` advances 16 bytes instead of 4.
+                    out.push_str("(nint)");
+                    base.render(out);
+                    out.push_str(&format!(" {addend:+}"));
                 } else {
                     base.render(out);
                     if *addend != 0 {
@@ -436,6 +814,9 @@ impl Expr {
             }
             Self::RawAddr(base, addend) => {
                 out.push_str("(nint*)(");
+                if *addend != 0 && matches!(**base, Self::AddressOf(_)) {
+                    out.push_str("(nint)");
+                }
                 base.render(out);
                 if *addend != 0 {
                     out.push_str(&format!(" {addend:+}"));
@@ -453,6 +834,19 @@ impl Expr {
                 // the call-site shape proves what it does, name it as a runtime
                 // call; otherwise fall back to `fn_<address>`.
                 let name = super::runtime_helpers::display_name(*addr);
+                // The lifter dumps every ABI register at an unresolved call.
+                // Trim trailing `__abi` placeholders always, and slice a proven
+                // runtime helper to its authoritative arity (array_new takes
+                // class+length; the rest were generic-context registers that
+                // inflated temp refs at ~10.4k helper sites).
+                let mut end = args.len();
+                while end > 0 && matches!(args[end - 1], Expr::MissingAbiArg) {
+                    end -= 1;
+                }
+                if let Some(n) = super::runtime_helpers::arg_arity(*addr) {
+                    end = end.min(n);
+                }
+                let args = &args[..end];
                 match ret {
                     // metadata-resolved return type: render a typed cast so
                     // the call site is self-describing
@@ -476,17 +870,20 @@ impl Expr {
                 parenthesize(out, 4, b.precedence(), |out| b.render(out));
             }
             Self::Call { recv, name, args } => {
+                // A typed constructor name (`RewardData..ctor`) is AST evidence
+                // for allocation typing; the reader still sees `recv..ctor`.
+                let disp = if name.ends_with("..ctor") { "..ctor" } else { name.as_str() };
                 match recv {
                     Some(r) => {
                         // receiver may need parens if not a simple leaf
                         let p = r.precedence();
                         parenthesize(out, 15, p, |out| r.render(out));
                     }
-                    None => out.push_str(name),
+                    None => out.push_str(disp),
                 }
                 if recv.is_some() {
                     out.push('.');
-                    out.push_str(name);
+                    out.push_str(disp);
                 }
                 out.push('(');
                 render_args(args, out);
@@ -515,9 +912,83 @@ impl Expr {
                 }
                 out.push(']');
             }
+            Self::ArrayInit { elem_type, items } => {
+                out.push_str("new ");
+                out.push_str(elem_type);
+                // An array initializer requires `new T[] { … }`; the old code
+                // emitted `new T { … }` whenever the initializer was non-empty
+                // (measured: `object[] v68 = new object { 2 };`).
+                if !elem_type.trim_end().ends_with("[]") {
+                    out.push_str("[]");
+                }
+                if items.is_empty() {
+                    out.push_str(" {}");
+                } else {
+                    out.push_str(" { ");
+                    render_args(items, out);
+                    out.push_str(" }");
+                }
+            }
+            Self::CollectionInit {
+                type_name,
+                ctor_args,
+                items,
+            } => {
+                out.push_str("new ");
+                out.push_str(type_name);
+                out.push('(');
+                render_args(ctor_args, out);
+                out.push_str(") { ");
+                render_args(items, out);
+                out.push_str(" }");
+            }
+            Self::ObjInit {
+                type_name,
+                ctor_args,
+                fields,
+            } => {
+                out.push_str("new ");
+                out.push_str(type_name);
+                out.push('(');
+                render_args(ctor_args, out);
+                out.push_str(") { ");
+                for (i, (fname, fval)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(fname);
+                    out.push_str(" = ");
+                    fval.render(out);
+                }
+                out.push_str(" }");
+            }
             Self::Cast(t, e) => {
+                // A float vector-component static is already single-
+                // precision: `(float)Vector3.zero.z` is noise. The Cast stays
+                // in the AST (it is what types the enclosing local as float)
+                // and only the redundant text is suppressed here.
+                if matches!(t.as_str(), "float" | "double") {
+                    if let Self::StaticField(_, field) = e.as_ref() {
+                        if field.ends_with(".x") || field.ends_with(".y") || field.ends_with(".z") {
+                            parenthesize(out, 12, e.precedence(), |out| e.render(out));
+                            return;
+                        }
+                    }
+                }
                 out.push_str(&format!("({t})"));
-                parenthesize(out, 14, e.precedence(), |out| e.render(out));
+                // Cast/unary operands group bare: `(int)(long)x`, `(int)-x` —
+                // a nested cast or unary needs no parentheses (Rudra
+                // printc.rs:10704-10738 applies the same rule against the
+                // unary precedence 62).
+                parenthesize(out, 12, e.precedence(), |out| e.render(out));
+            }
+            Self::Index { collection, index } => {
+                // Indexing binds tighter than field access: `a.b[0]` renders
+                // without parens around `a.b`, but a binary receiver needs them.
+                parenthesize(out, 15, collection.precedence(), |out| collection.render(out));
+                out.push('[');
+                index.render(out);
+                out.push(']');
             }
             Self::Await(e) => {
                 out.push_str("await ");
@@ -529,6 +1000,153 @@ impl Expr {
                 out.push_str(") => ");
                 body.render(out);
             }
+            Self::NullConditional { receiver, access } => {
+                // Render as `receiver?.access` — the receiver is rendered once,
+                // then `?.`, then the access expression with its own receiver stripped.
+                parenthesize(out, 15, receiver.precedence(), |out| receiver.render(out));
+                out.push_str("?.");
+                match access.as_ref() {
+                    Expr::Call { name, args, .. } => {
+                        out.push_str(name);
+                        out.push('(');
+                        render_args(args, out);
+                        out.push(')');
+                    }
+                    Expr::Field(_, name) => {
+                        out.push_str(name);
+                    }
+                    // `linq_recon` turns an instance call into a `MethodChain`
+                    // (`v159.Contains(x)` -> `MethodChain { v159, [Contains] }`)
+                    // even when the call is the access side of a null-
+                    // conditional. The chain repeats the receiver, which the
+                    // `?.` already rendered: strip it instead of falling back
+                    // to the full chain (`v159?.v159.Contains(x)`).
+                    Expr::MethodChain {
+                        receiver: chain_recv,
+                        methods,
+                    } if chain_recv.as_ref() == receiver.as_ref() => {
+                        for (i, m) in methods.iter().enumerate() {
+                            if i > 0 {
+                                out.push('.');
+                            }
+                            out.push_str(&m.name);
+                            out.push('(');
+                            render_args(&m.args, out);
+                            out.push(')');
+                        }
+                    }
+                    other => {
+                        // Fallback: render the full access (shouldn't normally happen).
+                        other.render(out);
+                    }
+                }
+            }
+            Self::PatternMatch { expr, type_name, binding } => {
+                parenthesize(out, self.precedence(), expr.precedence(), |out| expr.render(out));
+                out.push_str(" is ");
+                out.push_str(type_name);
+                out.push(' ');
+                out.push_str(binding);
+            }
+            Self::StringInterp { parts } => {
+                out.push_str("$\"");
+                for part in parts {
+                    match part {
+                        InterpPart::Literal(text) => {
+                            // In interpolated strings, `"` must be escaped as `""`
+                            // (double-quote escape) or `\"`, and `{` / `}` must be
+                            // doubled to appear literally.
+                            for c in text.chars() {
+                                match c {
+                                    '"' => out.push_str("\\\""),
+                                    '\\' => out.push_str("\\\\"),
+                                    '{' => out.push_str("{{"),
+                                    '}' => out.push_str("}}"),
+                                    '\n' => out.push_str("\\n"),
+                                    '\r' => out.push_str("\\r"),
+                                    '\t' => out.push_str("\\t"),
+                                    c if (c as u32) < 0x20 => {
+                                        out.push_str(&format!("\\u{:04x}", c as u32));
+                                    }
+                                    c => out.push(c),
+                                }
+                            }
+                        }
+                        InterpPart::Expr(e, fmt) => {
+                            out.push('{');
+                            e.render(out);
+                            if let Some(f) = fmt {
+                                out.push(':');
+                                out.push_str(f);
+                            }
+                            out.push('}');
+                        }
+                    }
+                }
+                out.push('"');
+            }
+            Self::Tuple { names, elements } => {
+                out.push('(');
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    if let Some(Some(name)) = names.get(i) {
+                        out.push_str(name);
+                        out.push_str(": ");
+                    }
+                    elem.render(out);
+                }
+                out.push(')');
+            }
+            Self::MethodChain { receiver, methods } => {
+                // Render as fluent chain: receiver.Method1(args).Method2(args)...
+                parenthesize(out, 15, receiver.precedence(), |out| receiver.render(out));
+                for m in methods {
+                    out.push('.');
+                    out.push_str(&m.name);
+                    out.push('(');
+                    render_args(&m.args, out);
+                    out.push(')');
+                }
+            }
+            Self::SwitchExpr {
+                discrim,
+                arms,
+                default_arm,
+            } => {
+                // Render as: discrim switch { pattern => result, …, _ => default }
+                parenthesize(out, 15, discrim.precedence(), |out| discrim.render(out));
+                out.push_str(" switch {\n");
+                for (pattern, result) in arms {
+                    out.push('\t');
+                    pattern.render(out);
+                    out.push_str(" => ");
+                    result.render(out);
+                    out.push_str(",\n");
+                }
+                if let Some(def) = default_arm {
+                    out.push_str("\t_ => ");
+                    def.render(out);
+                    out.push_str(",\n");
+                }
+                out.push('}');
+            }
+            Self::Range { from, to } => {
+                // Render as: from..to, ..to, from.., or ..
+                if let Some(f) = from {
+                    f.render(out);
+                }
+                out.push_str("..");
+                if let Some(t) = to {
+                    t.render(out);
+                }
+            }
+            Self::IndexFromEnd(e) => {
+                // Render as: ^n
+                out.push('^');
+                e.render(out);
+            }
         }
     }
 }
@@ -537,7 +1155,16 @@ impl Expr {
 /// GPRs x0–x30 → 0–30, xzr/sp → 31/32, FP v?N → 100+N.
 fn slot_index(name: &str) -> Option<u32> {
     if name.starts_with('v') && name.len() >= 3 {
-        return name[1..].parse::<u32>().ok().map(|n| 100 + n);
+        // FP register names can be plain (v0–v7) or typed with a lane letter:
+        //   vs0–vs7  (single), vd0–vd7 (double), vq0–vq7 (quad).
+        // Strip the optional type letter before parsing the numeric index.
+        let rest = &name[1..];
+        let digits = if rest.starts_with('s') || rest.starts_with('d') || rest.starts_with('q') {
+            &rest[1..]
+        } else {
+            rest
+        };
+        return digits.parse::<u32>().ok().map(|n| 100 + n);
     }
     if name.len() >= 2 && name.starts_with('x') {
         return name[1..].parse::<u32>().ok();
@@ -568,6 +1195,89 @@ fn parenthesize(out: &mut String, parent: u8, child: u8, f: impl FnOnce(&mut Str
     }
 }
 
+/// Render a comparison at comparison precedence. Shared by [`Expr::Cmp`] and
+/// by the `!(a < b)` → `a >= b` complement rewrite, so both spellings get the
+/// same minimal parentheses.
+fn render_cmp(kind: CmpKind, a: &Expr, b: &Expr, out: &mut String) {
+    const CMP_PRECEDENCE: u8 = 7;
+    parenthesize(out, CMP_PRECEDENCE, a.precedence(), |out| a.render(out));
+    out.push(' ');
+    out.push_str(kind.token());
+    out.push(' ');
+    // Comparisons are not associative: an equal-precedence right operand must
+    // keep its parentheses (`a == (b < c)`), which `same_associative_op` never
+    // grants a Cmp node.
+    parenthesize_rhs_at(out, CMP_PRECEDENCE, false, b, |out| b.render(out));
+}
+
+/// Parenthesize the RIGHT operand of a left-associative binary operator.
+///
+/// C# binary operators are left-associative, so a left child at equal
+/// precedence never needs parens (`(a - b) - c` prints `a - b - c`), but a
+/// RIGHT child at equal precedence does — unless the operator is associative
+/// AND the child uses the same operator. `Sub(a, Sub(b, c))` printed flat as
+/// `a - b - c`, which the C# compiler re-associates to `(a - b) - c`: a
+/// wrong-logic rewrite of the recovered AST (Ghidra enforces the same rule;
+/// see Rudra printc.cc:200-227, equal precedence → parens unless associative
+/// and the same token).
+fn parenthesize_rhs(out: &mut String, parent: &Expr, child: &Expr, f: impl FnOnce(&mut String)) {
+    parenthesize_rhs_at(
+        out,
+        parent.precedence(),
+        same_associative_op(parent, child),
+        child,
+        f,
+    );
+}
+
+/// [`parenthesize_rhs`] with the parent's precedence and associativity passed
+/// explicitly. Needed where the parent is not a distinct [`Expr`] node — the
+/// `!cmp` complement is rendered as a comparison without materializing one.
+fn parenthesize_rhs_at(
+    out: &mut String,
+    parent_precedence: u8,
+    same_assoc: bool,
+    child: &Expr,
+    f: impl FnOnce(&mut String),
+) {
+    let c = child.precedence();
+    let need = if c < parent_precedence {
+        true
+    } else if c == parent_precedence {
+        !same_assoc
+    } else {
+        false
+    };
+    if need {
+        out.push('(');
+        f(out);
+        out.push(')');
+    } else {
+        f(out);
+    }
+}
+
+/// Are `parent` and `child` the same associative binary operator? Only then
+/// may equal-precedence parentheses be dropped on the right side.
+fn same_associative_op(parent: &Expr, child: &Expr) -> bool {
+    let (Expr::Bin(x, _, _), Expr::Bin(y, _, _)) = (parent, child) else {
+        return false;
+    };
+    if x != y {
+        return false;
+    }
+    matches!(
+        x,
+        BinOp::Add
+            | BinOp::Mul
+            | BinOp::And
+            | BinOp::Or
+            | BinOp::Xor
+            | BinOp::AndAlso
+            | BinOp::OrElse
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------
@@ -576,7 +1286,34 @@ fn parenthesize(out: &mut String, parent: u8, child: u8, f: impl FnOnce(&mut Str
 pub enum Stmt {
     /// Expression evaluated for side effects (calls).
     Eval(Expr),
-    Assign(String, Option<String> /*type decl on first assign*/, Expr),
+    Assign(
+        String,
+        Option<String>, /*type decl on first assign*/
+        Expr,
+    ),
+    /// `ty name;` — a declaration with NO initializer, emitted by
+    /// `declare_locals` only for a local that is definitely assigned before
+    /// every read on every path. This is the alternative to the faithful but
+    /// noisy `ty name = default;` for a CIL zero-initialised local: C#'s own
+    /// definite-assignment rules prove the initializer can never be observed.
+    Declare(String, String),
+    /// Recovered C# event accessor operation. Keeping this distinct from a
+    /// normal assignment preserves the source-level `+=` / `-=` idiom.
+    EventAssign {
+        field: Expr,
+        value: Expr,
+        add: bool,
+    },
+    /// Recovered C# indexer write: `collection[index] = value`.
+    ///
+    /// Produced by `reconstruct::indexer` from `set_Item` method calls:
+    ///   `obj.set_Item(i, val)` → `obj[i] = val`
+    ///   `Type.set_Item(obj, i, val)` → `obj[i] = val`
+    IndexAssign {
+        collection: Expr,
+        index: Expr,
+        value: Expr,
+    },
     If {
         cond: Expr,
         then_body: Vec<Stmt>,
@@ -586,7 +1323,6 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
-    #[allow(dead_code)]
     ForEach {
         var_name: String,
         collection: String,
@@ -636,6 +1372,29 @@ pub enum Stmt {
         /// Labelled landing pads for shared / already-emitted case blocks,
         /// emitted after the switch body.
         tail: Vec<Stmt>,
+        /// The `default:` arm, when the dispatch has one.
+        ///
+        /// `cmp idx, #N; b.hi T` is the table's bounds check, and `T` is
+        /// exactly the source's `default:`. The structurer used to emit that
+        /// guard as a wrapping `if (idx <= N)` and then never render `T` at
+        /// all, so the arm was not merely mis-indented — it was DELETED.
+        /// `GetCharacterPower` @0x14A911C ends with `return null` on that
+        /// path and the dump fell off the end of the method instead.
+        default: Option<Vec<Stmt>>,
+    },
+    /// String-keyed switch: `switch (s) { case "foo": … case "bar": … default: … }`.
+    ///
+    /// Produced by `reconstruct::string_switch` when an if-else chain of
+    /// `String.Equals` / `s.Equals("literal")` calls with ≥ 3 arms is detected.
+    /// The existing `Switch` variant uses `u64` case values (integer dispatch);
+    /// this variant carries `String` case labels for string dispatch.
+    StringSwitch {
+        disc: Box<Expr>,
+        /// Each case: (string literal values, body). Multiple values per case
+        /// are rendered as stacked `case` labels (fall-through).
+        cases: Vec<(Vec<Expr>, Vec<Stmt>)>,
+        /// Default branch body (empty when there is no `default`).
+        tail: Option<Vec<Stmt>>,
     },
     Break,
     Continue,
@@ -648,6 +1407,16 @@ pub enum Stmt {
     GotoCase(u64),
     Label(String),
     Comment(String),
+    /// Recovered C# custom attribute (e.g. `[SerializeField]`, `[Header("X")]`).
+    ///
+    /// Produced by `reconstruct::attributes` from attribute constructor calls in
+    /// static initialisers. Rendered as `[AttrName(args)]` on the line before
+    /// the field/method declaration it annotates.
+    Attribute {
+        name: String,
+        args: Vec<Expr>,
+        target: Option<String>,
+    },
     /// Recovered exception region (from the binary's EH tables — exact data).
     /// `try_body` wraps the statements whose native range lies inside the
     /// try region; each catch clause carries its source name from the LSDA
@@ -669,6 +1438,9 @@ struct Renderer {
     /// `else if (…)` on the line that just closed the previous block instead
     /// of starting a fresh `if` line — C#'s own spelling for the same program.
     pending_else_if: bool,
+    /// The next `block()` puts `{` on the CURRENT line (`} else {`,
+    /// `} else if (…) {`) instead of a fresh one.
+    same_line_brace: bool,
 }
 
 /// Render a single statement in an INLINE (header) position.
@@ -699,7 +1471,12 @@ fn stmt_inline(s: &Stmt) -> Option<String> {
 
 impl Renderer {
     fn new() -> Self {
-        Self { out: String::new(), indent: 0, pending_else_if: false }
+        Self {
+            out: String::new(),
+            indent: 0,
+            pending_else_if: false,
+            same_line_brace: false,
+        }
     }
 
     /// Emit an `if (…)` header, honouring a pending `else`.
@@ -709,9 +1486,36 @@ impl Renderer {
     fn if_header(&mut self, text: &str) {
         if self.pending_else_if {
             self.pending_else_if = false;
-            self.out.push_str(&format!(" else {text}\n"));
+            self.out.push_str(" else ");
+            self.push_continuation(text);
+            self.out.push('\n');
+            self.same_line_brace = true;
         } else {
             self.line(text);
+        }
+    }
+
+    /// Append `s`, indenting every line after the first by the CURRENT indent.
+    ///
+    /// An expression renderer may emit embedded newlines (a switch expression
+    /// deliberately does). Those continuation lines used to be written with
+    /// only the expression's own fixed indentation, so a switch expression
+    /// nested in a method body showed its arms at column 2 while the surrounding
+    /// statements sat at the body indent. `line()` prefixes only the first line
+    /// of a rendered string, so re-indenting here is what keeps every embedded
+    /// line aligned with the line that introduced it.
+    fn push_continuation(&mut self, s: &str) {
+        for (i, part) in s.split('\n').enumerate() {
+            if i > 0 {
+                self.out.push('\n');
+                if part.is_empty() {
+                    continue;
+                }
+                for _ in 0..self.indent {
+                    self.out.push('\t');
+                }
+            }
+            self.out.push_str(part);
         }
     }
 
@@ -736,32 +1540,93 @@ impl Renderer {
                 // marker. Throw its output away and render the plain form.
                 self.pending_else_if = false;
                 self.out.truncate(mark);
-                self.out.push_str(" else\n");
+                self.out.push_str(" else");
+                self.same_line_brace = true;
                 self.block(body);
             }
             return;
         }
         self.out.truncate(self.out.trim_end().len());
-        self.out.push_str(" else\n");
+        self.out.push_str(" else");
+        self.same_line_brace = true;
         self.block(body);
     }
 
     fn line(&mut self, s: impl AsRef<str>) {
         for _ in 0..self.indent {
-            self.out.push_str("    ");
+            self.out.push('\t');
         }
-        self.out.push_str(s.as_ref());
+        self.push_continuation(s.as_ref());
         self.out.push('\n');
+    }
+
+    /// Render `if (cond) <one simple statement>` on a single braceless line.
+    ///
+    /// Only used for arms [`braceless_body`] accepts: one statement that cannot
+    /// capture a following `else` and (checked here) actually renders on one
+    /// line. Returns `false` without emitting anything when the statement turns
+    /// out to be multi-line (e.g. it holds a switch expression), so the caller
+    /// can fall back to the braced form.
+    fn if_braceless(&mut self, header: &str, body: &Stmt) -> bool {
+        let Some(text) = Renderer::single_line_stmt(body) else {
+            return false;
+        };
+        if self.pending_else_if {
+            // `} else if (c) return;` — continue on the closing brace's line,
+            // exactly like `if_header` does for a braced arm.
+            self.pending_else_if = false;
+            self.out.truncate(self.out.trim_end().len());
+            self.out.push_str(" else ");
+        } else {
+            for _ in 0..self.indent {
+                self.out.push('\t');
+            }
+        }
+        self.out.push_str(header);
+        self.out.push(' ');
+        self.out.push_str(&text);
+        self.out.push('\n');
+        true
+    }
+
+    /// Render one statement to text and return it only if it occupies a single
+    /// line. `None` means the braced form must be used.
+    fn single_line_stmt(s: &Stmt) -> Option<String> {
+        let mut r = Renderer::new();
+        r.stmt(s);
+        let text = r.out.strip_suffix('\n').unwrap_or(&r.out);
+        if text.is_empty() || text.contains('\n') {
+            None
+        } else {
+            Some(text.to_string())
+        }
     }
 
     fn stmt(&mut self, s: &Stmt) {
         match s {
+            Stmt::Declare(name, ty) => {
+                self.line(format!("{ty} {name};"));
+            }
             Stmt::Eval(e) => {
                 let mut buf = String::new();
                 e.render(&mut buf);
                 self.line(format!("{buf};"));
             }
             Stmt::Assign(name, ty, e) => {
+                // Null-coalescing assignment: `x ??= value` is stored as
+                // `Assign("x", None, Bin(NullCoalesceAssign, Var("x"), value))`.
+                // Detect this and render as `x ??= value;` instead of the
+                // redundant `x = x ??= value;`.
+                if let Expr::Bin(BinOp::NullCoalesceAssign, inner, val) = e {
+                    if let Expr::Var(inner_name) = inner.as_ref() {
+                        if inner_name == name && ty.is_none() {
+                            let mut buf = String::new();
+                            val.render(&mut buf);
+                            self.line(format!("{name} ??= {buf};"));
+                            return;
+                        }
+                    }
+                }
                 let mut buf = String::new();
                 e.render(&mut buf);
                 match ty {
@@ -769,7 +1634,31 @@ impl Renderer {
                     None => self.line(format!("{name} = {buf};")),
                 }
             }
-            Stmt::If { cond, then_body, else_body } => {
+            Stmt::EventAssign { field, value, add } => {
+                let mut lhs = String::new();
+                let mut rhs = String::new();
+                field.render(&mut lhs);
+                value.render(&mut rhs);
+                self.line(format!("{lhs} {}= {rhs};", if *add { "+" } else { "-" }));
+            }
+            Stmt::IndexAssign {
+                collection,
+                index,
+                value,
+            } => {
+                let mut coll_str = String::new();
+                let mut idx_str = String::new();
+                let mut val_str = String::new();
+                collection.render(&mut coll_str);
+                index.render(&mut idx_str);
+                value.render(&mut val_str);
+                self.line(format!("{coll_str}[{idx_str}] = {val_str};"));
+            }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
                 // constant-condition hygiene: never emit `if (true)` /
                 // `if (false)` / `if (!true)` wrappers — fold to the live
                 // arm. `Bool(true)` doubles as the branch-condition fallback
@@ -787,19 +1676,25 @@ impl Renderer {
                     },
                     _ => None,
                 };
-                if std::env::var("ILR_CONDBG").is_ok() {
-                    eprintln!("[cond] {:?} then={} else={} fold={:?}", cond, then_body.len(), else_body.len(), folded_bool);
+                if crate::recovery::env_flags::flag("ILR_CONDBG") {
+                    eprintln!(
+                        "[cond] {:?} then={} else={} fold={:?}",
+                        cond,
+                        then_body.len(),
+                        else_body.len(),
+                        folded_bool
+                    );
                 }
                 // an else-arm with nothing renderable (empty/label/comment
                 // only) carries no semantics — the renderer drops it here so
                 // the C# never shows `else { }` shells.
                 let else_renders = else_body
                     .iter()
-                    .any(|s| !matches!(s, Stmt::Comment(_) | Stmt::Label(_)));
+                    .any(|s| !matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. } | Stmt::Label(_)));
                 if !else_renders {
                     let then_renders = then_body
                         .iter()
-                        .any(|s| !matches!(s, Stmt::Comment(_) | Stmt::Label(_)));
+                        .any(|s| !matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. } | Stmt::Label(_)));
                     if !then_renders {
                         // Both arms are label/comment-only. The condition gates
                         // nothing renderable, so the `if` shell goes away — BUT
@@ -834,6 +1729,15 @@ impl Renderer {
                     }
                     let mut buf = String::new();
                     cond.render(&mut buf);
+                    // Single-statement arm with no else: `if (c) return;` is
+                    // unambiguous and reads as the guard it is. Anything that
+                    // renders multi-line falls back to braces.
+                    if braceless_body(then_body)
+                        && self.if_braceless(&format!("if ({buf})"), &then_body[0])
+                    {
+                        self.labels_only(else_body);
+                        return;
+                    }
                     self.if_header(&format!("if ({buf})"));
                     self.block(then_body);
                     // The else arm renders nothing, but it may still define
@@ -849,11 +1753,11 @@ impl Renderer {
                 // must render as `if (!c) { L1: … }`, not `if (c) {} else …`.
                 let then_content: Vec<&Stmt> = then_body
                     .iter()
-                    .filter(|s| !matches!(s, Stmt::Comment(_)))
+                    .filter(|s| !matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. }))
                     .collect();
                 let else_content: Vec<&Stmt> = else_body
                     .iter()
-                    .filter(|s| !matches!(s, Stmt::Comment(_)))
+                    .filter(|s| !matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. }))
                     .collect();
                 match folded_bool {
                     // `true` / `!true` → then arm; `false` / `!false` → else
@@ -874,18 +1778,59 @@ impl Renderer {
                     None => {
                         let mut buf = String::new();
                         cond.render(&mut buf);
-                        if std::env::var("ILR_IFDBG").is_ok() {
-                            eprintln!("[rend] cond={buf} then_raw={} else_raw={} then_content={} else_content={}", then_body.len(), else_body.len(), then_content.len(), else_content.len());
+                        if crate::recovery::env_flags::flag("ILR_IFDBG") {
+                            eprintln!(
+                                "[rend] cond={buf} then_raw={} else_raw={} then_content={} else_content={}",
+                                then_body.len(),
+                                else_body.len(),
+                                then_content.len(),
+                                else_content.len()
+                            );
                         }
                         if then_content.is_empty() && !else_content.is_empty() {
-                            self.if_header(&format!("if (!({buf}))"));
+                            // Invert the condition through the expression
+                            // renderer: `if (!(a > b))` becomes `if (a <= b)`
+                            // when the complement is exact, and a double
+                            // negation cancels instead of printing `!(!x)`.
+                            let mut neg = String::new();
+                            Expr::Not(Box::new(cond.clone())).render(&mut neg);
+                            self.if_header(&format!("if ({neg})"));
                             self.block(else_body);
-                        } else {
+                            // The then arm renders nothing, but its labels are
+                            // still goto targets.
+                            self.labels_only(then_body);
+                        } else if !else_content.is_empty() {
+                            // EARLY-EXIT STYLE: `if (c) { A } else { return; }`
+                            // is the same program as `if (!c) return; A` and the
+                            // latter is how the source almost always read. Only
+                            // taken when the inversion is provably shape-safe
+                            // (see `early_exit_condition`); and never while an
+                            // enclosing `else` is pending, because the flattened
+                            // `A` would then escape the else arm.
+                            if !self.pending_else_if {
+                                if let Some(neg) =
+                                    early_exit_condition(cond, then_body, else_body)
+                                {
+                                    self.line(format!("if ({neg}) return;"));
+                                    for s in then_body {
+                                        self.stmt(s);
+                                    }
+                                    return;
+                                }
+                            }
                             self.if_header(&format!("if ({buf})"));
                             self.block(then_body);
-                            if !else_content.is_empty() {
-                                self.else_block(else_body);
+                            self.else_block(else_body);
+                        } else {
+                            // No else arm: a lone simple statement can sit on
+                            // the `if` line without changing meaning.
+                            if braceless_body(then_body)
+                                && self.if_braceless(&format!("if ({buf})"), &then_body[0])
+                            {
+                                return;
                             }
+                            self.if_header(&format!("if ({buf})"));
+                            self.block(then_body);
                         }
                     }
                 }
@@ -905,7 +1850,11 @@ impl Renderer {
                 self.line(format!("while ({buf})"));
                 self.block(body);
             }
-            Stmt::ForEach { var_name, collection, body } => {
+            Stmt::ForEach {
+                var_name,
+                collection,
+                body,
+            } => {
                 self.line(format!("foreach (var {var_name} in {collection})"));
                 self.block(body);
             }
@@ -920,9 +1869,16 @@ impl Renderer {
                 // do-while in the corpus rendered as `}        while (…)`,
                 // the same defect `else_block` fixes for `else`.
                 self.out.truncate(self.out.trim_end().len());
-                self.out.push_str(&format!(" while ({buf});\n"));
+                self.out.push_str(" while (");
+                self.push_continuation(&buf);
+                self.out.push_str(");\n");
             }
-            Stmt::For { init, cond, incr, body } => {
+            Stmt::For {
+                init,
+                cond,
+                incr,
+                body,
+            } => {
                 let join = |list: &[Stmt]| -> String {
                     list.iter()
                         .filter_map(stmt_inline)
@@ -933,12 +1889,7 @@ impl Renderer {
                 if let Some(c) = cond {
                     c.render(&mut buf);
                 }
-                self.line(format!(
-                    "for ({}; {}; {})",
-                    join(init),
-                    buf,
-                    join(incr)
-                ));
+                self.line(format!("for ({}; {}; {})", join(init), buf, join(incr)));
                 self.block(body);
             }
             Stmt::Using { decl, body } => {
@@ -971,12 +1922,39 @@ impl Renderer {
                 e.render(&mut buf);
                 self.line(format!("throw {buf};"));
             }
-            Stmt::Switch { disc, cases, tail } => {
+            Stmt::Switch {
+                disc,
+                cases,
+                tail,
+                default,
+            } => {
                 self.line(format!("switch ({disc}) {{"));
                 self.indent += 1;
-                for (v, body) in cases {
-                    self.line(format!("case {v}:"));
+                // ADJACENT ARMS WITH IDENTICAL BODIES SHARE ONE LABEL RUN.
+                // The dispatch emitter creates one arm per table entry, so a
+                // table whose entries converge produced `case 2: return; case
+                // 3: return; case 4: return;` (and `case 9: break; case 10:
+                // break; default: break;`). C# spells that as stacked labels
+                // over one body; the semantics are identical because the
+                // bodies are byte-identical.
+                let reprs: Vec<String> = cases.iter().map(|(_, b)| format!("{b:?}")).collect();
+                let default_repr = default.as_ref().map(|b| format!("{b:?}"));
+                let default_merged =
+                    default_repr.is_some() && reprs.last() == default_repr.as_ref();
+                let mut i = 0usize;
+                while i < cases.len() {
+                    let mut j = i + 1;
+                    while j < cases.len() && reprs[j] == reprs[i] {
+                        j += 1;
+                    }
+                    for (v, _) in &cases[i..j] {
+                        self.line(format!("case {v}:"));
+                    }
+                    if default_merged && j == cases.len() {
+                        self.line("default:");
+                    }
                     self.indent += 1;
+                    let body = &cases[i].1;
                     for s in body {
                         self.stmt(s);
                     }
@@ -986,6 +1964,20 @@ impl Renderer {
                         self.line("break;");
                     }
                     self.indent -= 1;
+                    i = j;
+                }
+                if let Some(body) = default {
+                    if !default_merged {
+                        self.line("default:");
+                        self.indent += 1;
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        if !ends_with_terminator(body) {
+                            self.line("break;");
+                        }
+                        self.indent -= 1;
+                    }
                 }
                 self.indent -= 1;
                 self.line("}");
@@ -993,17 +1985,71 @@ impl Renderer {
                     self.stmt(s);
                 }
             }
+            Stmt::StringSwitch { disc, cases, tail } => {
+                let mut disc_buf = String::new();
+                disc.render(&mut disc_buf);
+                self.line(format!("switch ({disc_buf}) {{"));
+                self.indent += 1;
+                for (vals, body) in cases {
+                    for val in vals {
+                        let mut val_buf = String::new();
+                        val.render(&mut val_buf);
+                        self.line(format!("case {val_buf}:"));
+                    }
+                    self.indent += 1;
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    if !ends_with_terminator(body) {
+                        self.line("break;");
+                    }
+                    self.indent -= 1;
+                }
+                if let Some(default_body) = tail {
+                    self.line("default:");
+                    self.indent += 1;
+                    for s in default_body {
+                        self.stmt(s);
+                    }
+                    if !ends_with_terminator(default_body) {
+                        self.line("break;");
+                    }
+                    self.indent -= 1;
+                }
+                self.indent -= 1;
+                self.line("}");
+            }
             Stmt::Break => self.line("break;"),
             Stmt::Continue => self.line("continue;"),
             Stmt::Goto(l) => self.line(format!("goto {l};")),
             Stmt::GotoCase(v) => self.line(format!("goto case {v};")),
             Stmt::Label(l) => self.line(format!("{l}:")),
             Stmt::Comment(c) => self.line(format!("// {c}")),
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Attribute { name, args, .. } => {
+                if args.is_empty() {
+                    self.line(format!("[{name}]"));
+                } else {
+                    let rendered: Vec<String> = args.iter().map(|a| {
+                        let mut s = String::new();
+                        a.render(&mut s);
+                        s
+                    }).collect();
+                    self.line(format!("[{}({})]", name, rendered.join(", ")));
+                }
+            }
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 self.line("try");
                 self.block(try_body);
                 for (name, body) in catches {
-                    self.line(format!("catch ({name})"));
+                    if name.is_empty() {
+                        self.line("catch".to_string());
+                    } else {
+                        self.line(format!("catch ({name})"));
+                    }
                     self.block(body);
                 }
                 if let Some(f) = finally_body {
@@ -1017,7 +2063,14 @@ impl Renderer {
     fn block(&mut self, body: &[Stmt]) {
         // Braces are mandatory: without them only the first statement of a
         // multi-statement branch visually belongs to the `if`/`while`.
-        self.line("{");
+        if self.same_line_brace {
+            self.same_line_brace = false;
+            let len = self.out.trim_end().len();
+            self.out.truncate(len);
+            self.out.push_str(" {\n");
+        } else {
+            self.line("{");
+        }
         self.indent += 1;
         for s in body {
             self.stmt(s);
@@ -1044,12 +2097,20 @@ impl Renderer {
         for s in body {
             match s {
                 Stmt::Label(_) => self.stmt(s),
-                Stmt::If { then_body, else_body, .. } => {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     self.labels_only(then_body);
                     self.labels_only(else_body);
                 }
                 Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => self.labels_only(body),
-                Stmt::Try { try_body, catches, finally_body } => {
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
                     self.labels_only(try_body);
                     for (_, b) in catches {
                         self.labels_only(b);
@@ -1064,12 +2125,87 @@ impl Renderer {
     }
 }
 
+/// Can this arm render directly on the `if (…)` line, braceless?
+///
+/// Exactly one statement, and a kind that is self-delimiting: no nested `if`
+/// (a following `else` could re-bind to it), no loop, no block-bearing
+/// statement. A trailing `;` makes the arm's extent obvious, so the braced
+/// and braceless forms mean the same program. Anything else keeps braces —
+/// consistency matters less than never changing which statements are guarded.
+fn braceless_body(body: &[Stmt]) -> bool {
+    body.len()
+        == 1
+        && matches!(
+            body[0],
+            Stmt::Eval(_)
+                | Stmt::Assign(..)
+                | Stmt::EventAssign { .. }
+                | Stmt::IndexAssign { .. }
+                | Stmt::Return(_)
+                | Stmt::Throw(_)
+                | Stmt::Break
+                | Stmt::Continue
+                | Stmt::Goto(_)
+                | Stmt::GotoCase(_)
+                | Stmt::YieldReturn(_)
+                | Stmt::YieldBreak
+        )
+}
+
+/// The early-exit rewrite: `if (c) { A } else { return; }` → `if (!c) return; A`.
+///
+/// Returns the rendered negated condition when the rewrite is provably
+/// shape-safe, `None` otherwise. The gates are deliberately conservative:
+///
+/// * the else arm is EXACTLY one bare `return;` — no label, comment, or other
+///   statement whose position the inversion would move;
+/// * the then arm is non-empty, holds at least one renderable statement, and
+///   does not END in a terminator (inverting a branch that already exits only
+///   adds noise);
+/// * the then arm declares nothing at its top level — hoisting a declaration
+///   out of the arm's block could collide with a sibling block's local;
+/// * the then arm defines NO labels at any depth. A label is a `goto` target;
+///   keeping such arms in their block is the conservative choice (labels are
+///   method-scoped in C#, but an arm the structurer wired with gotos is not a
+///   shape this rewrite was validated against).
+///
+/// The negation itself is rendered through [`Expr::Not`], which collapses
+/// `!!x` and only flips an ordering when the operands are non-float.
+fn early_exit_condition(cond: &Expr, then_body: &[Stmt], else_body: &[Stmt]) -> Option<String> {
+    if else_body.len() != 1 || !matches!(else_body[0], Stmt::Return(None)) {
+        return None;
+    }
+    if then_body.is_empty() || ends_with_terminator(then_body) {
+        return None;
+    }
+    if then_body
+        .iter()
+        .any(|s| matches!(s, Stmt::Assign(_, Some(_), _)))
+    {
+        return None;
+    }
+    // Comments/attributes alone gate nothing renderable: leave the explicit
+    // `if/else` in place rather than hoisting a bare comment.
+    if !then_body.iter().any(|s| {
+        !matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. } | Stmt::Label(_))
+    }) {
+        return None;
+    }
+    let mut labels = HashSet::new();
+    collect_all_labels(then_body, &mut labels);
+    if !labels.is_empty() {
+        return None;
+    }
+    let mut neg = String::new();
+    Expr::Not(Box::new(cond.clone())).render(&mut neg);
+    Some(neg)
+}
 
 fn short_type(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
-fn csharp_type(t: &ManagedType) -> Option<String> {
+pub(crate) fn csharp_type(t: &ManagedType) -> Option<String> {
     Some(match t {
         ManagedType::Primitive(p) => match p {
             PrimKind::Void => return None,
@@ -1091,10 +2227,9 @@ fn csharp_type(t: &ManagedType) -> Option<String> {
         ManagedType::Opaque(name) => {
             // resolved generic display names (e.g. "List<int>") flow through
             let cleaned = name.replace('`', "");
-            let ok = cleaned
-                .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '<' | '>' | '.' | ',' | '[' | ']' | '_' | ' '))
-                && !cleaned.is_empty();
+            let ok = cleaned.chars().all(|c| {
+                c.is_alphanumeric() || matches!(c, '<' | '>' | '.' | ',' | '[' | ']' | '_' | ' ')
+            }) && !cleaned.is_empty();
             if ok {
                 cleaned.trim().to_string()
             } else {
@@ -1104,11 +2239,35 @@ fn csharp_type(t: &ManagedType) -> Option<String> {
         ManagedType::String => "string".into(),
         ManagedType::IntPtr => "nint".into(),
         ManagedType::Object => "object".into(),
-        ManagedType::Class(nt) => nt.name.clone(),
+        ManagedType::Class(nt) => expand_arity(&nt.name),
         ManagedType::SzArray(e) => format!("{}[]", csharp_type(e)?),
         ManagedType::ByRef(_) | ManagedType::Pointer(_) => "void*".into(),
         ManagedType::Unknown => "object".into(),
     })
+}
+
+/// `Dictionary`2` is metadata ARITY syntax, not C# — a backtick cannot appear
+/// in an identifier, so a type rendered from the bare definition is not
+/// compilable. When no instantiation is available the honest default is the
+/// metadata's own shared-generic argument, `object`, once per arity:
+/// `Dictionary`2` -> `Dictionary<object, object>`, `List`1` -> `List<object>`.
+/// A name that already carries arguments, or a suffix that is not a small
+/// number, is left alone.
+pub(crate) fn expand_arity(name: &str) -> String {
+    let Some((base, n)) = name.rsplit_once('`') else {
+        return name.to_string();
+    };
+    if base.is_empty() || base.contains('<') || n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+        return name.to_string();
+    }
+    let Ok(k) = n.parse::<usize>() else {
+        return name.to_string();
+    };
+    if k == 0 || k > 8 {
+        return name.to_string();
+    }
+    let args = vec!["object"; k].join(", ");
+    format!("{base}<{args}>")
 }
 
 fn bin_of(k: ArithKind) -> Option<BinOp> {
@@ -1142,8 +2301,12 @@ fn bin_of_float(k: FloatArithKind) -> BinOp {
         FloatArithKind::Neg => BinOp::Sub,
         // unary intrinsics — def_expr routes them before this helper ever
         // runs, so these arms are unreachable (kept only for totality)
-        FloatArithKind::Sqrt | FloatArithKind::Abs | FloatArithKind::Floor
-        | FloatArithKind::Ceiling | FloatArithKind::Truncate | FloatArithKind::Round => BinOp::Rem,
+        FloatArithKind::Sqrt
+        | FloatArithKind::Abs
+        | FloatArithKind::Floor
+        | FloatArithKind::Ceiling
+        | FloatArithKind::Truncate
+        | FloatArithKind::Round => BinOp::Rem,
     }
 }
 
@@ -1166,7 +2329,6 @@ fn invert(e: &Expr) -> Expr {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Method context: global def-map + lazy expression inlining
 // ---------------------------------------------------------------------------
@@ -1174,6 +2336,7 @@ fn invert(e: &Expr) -> Expr {
 /// After out-of-SSA most locals have exactly ONE definition, so expressions
 /// can be resolved lazily through the def chain (Cpp2IL/ILSpy style value
 /// inlining). Multi-def locals degrade to ordinary assigned variables.
+#[derive(Clone)]
 struct MethodCtx<'a> {
     insns: &'a [Insn],
     table: &'a LocalTable,
@@ -1210,6 +2373,16 @@ struct MethodCtx<'a> {
     /// all", which is what decides whether a call whose result is discarded
     /// must still be emitted as a statement.
     read_locals: HashSet<u32>,
+    /// Per-version display names for COALESCED table locals.
+    ///
+    /// One table local can carry several SSA versions with unrelated
+    /// producers (the compiler reuses a register); naming that local after
+    /// either producer is wrong for the other versions. Each version instead
+    /// gets the name of ITS producer (call result, field load, IsInst, copy
+    /// chain), allocated deterministically and collision-checked. `var_name`
+    /// returns this before the machine fallback, so every read follows the
+    /// version that reaches it. Empty when the env gate is off.
+    version_names: HashMap<u32, String>,
     /// Local version → how many times it is read. See [`compute_read_counts`].
     read_count: HashMap<u32, usize>,
     /// Single-def locals read more than once whose inlined expansion is large
@@ -1222,8 +2395,7 @@ struct MethodCtx<'a> {
     /// (`dst = callee(…)`). Populated as the walk emits statements, so a use
     /// site references the name only when the binding provably exists. See
     /// [`Self::note_call_bound`].
-    bound_calls: std::cell::RefCell<HashMap<usize, String>>,
-    /// Call def instruction → the name its result WILL be materialized to.
+    bound_calls: std::cell::RefCell<HashMap<usize, String>>,    /// Call def instruction → the name its result WILL be materialized to.
     ///
     /// Same meaning as `bound_calls`, but computed by a DISCOVERY walk that
     /// runs before the real one, so a use site rendered to the LEFT of its
@@ -1304,6 +2476,18 @@ struct MethodCtx<'a> {
     /// `dropped_claims`), so the concordance does not charge a faithfully
     /// presented call as a missing one.
     property_fold_sites: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// Locals whose storage is addressed anywhere (`&cell`, in particular an
+    /// `out` argument). A callee writes through that address, so the local's
+    /// textual definition is NOT its value at a later read. They render by
+    /// name and are never inlined: at 0x18A3A1C `TryGetValue(key, &cell)`
+    /// wrote the token, but inlining the `cell = 0` initialiser folded the
+    /// follow-up null check to constant true and made the update block — a
+    /// field store plus `UpdateProbability` — unreachable.
+    address_taken: HashSet<u32>,
+    /// Locals whose address is the hidden sret buffer of a value-returning
+    /// call. They are struct storage, NOT pointer cells: the `pointer_cell`
+    /// rule in [`Self::mem_base_expr`] must not print their VALUE as a base.
+    sret_buffers: HashSet<u32>,
 }
 
 impl<'a> MethodCtx<'a> {
@@ -1316,6 +2500,119 @@ impl<'a> MethodCtx<'a> {
             .get(&self.declaring_tdi)
             .is_some_and(|chain| chain.contains(&tdi))
     }
+
+    /// Is `tdi` a STRICT ancestor of the declaring type?
+    ///
+    /// Unlike [`in_declaring_chain`], this excludes the declaring type itself.
+    /// A callee declared on a strict ancestor is the exact condition for a
+    /// `base.Method()` call: the method lives on a type above us in the
+    /// inheritance chain, and the receiver is `this` (the same object, viewed
+    /// as the base). This is the ONLY information needed — the virtual flag is
+    /// not required because `base.NonVirtualMethod()` is also legal C#.
+    ///
+    /// Returns false when `parent_chain` has no entry for the declaring type
+    /// (no ancestry metadata) or when `tdi == declaring_tdi` (same type, not a
+    /// base call).
+    fn is_strict_ancestor(&self, tdi: i32) -> bool {
+        if tdi == self.declaring_tdi {
+            return false;
+        }
+        self.parent_chain
+            .get(&self.declaring_tdi)
+            .is_some_and(|chain| chain.contains(&tdi))
+    }
+}
+
+/// Result of tracing one definition back to a high-level producer.
+enum DefBase {
+    /// A null/zero definition: contributes no name and does not conflict
+    /// with a real producer (the usual `v = null; if (…) v = Get…();` phi).
+    Ignorable,
+    /// The definition's value has no derivable name.
+    Unknown,
+    Named(String),
+}
+
+fn ident_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(
+            name,
+            "this" | "base" | "null" | "true" | "false" | "new" | "default" | "class"
+                | "int" | "long" | "float" | "double" | "bool" | "byte" | "short" | "uint"
+                | "string" | "object" | "void" | "return" | "break" | "continue" | "if"
+                | "else" | "while" | "for" | "foreach" | "do" | "switch" | "case" | "try"
+                | "catch" | "finally" | "goto" | "in" | "out" | "ref" | "is" | "as"
+                | "params" | "readonly" | "static" | "const" | "using" | "lock"
+        )
+}
+
+fn strip_generic(s: &str) -> &str {
+    s.split('<').next().unwrap_or(s)
+}
+
+fn last_segment(s: &str) -> &str {
+    s.rsplit('.').next().unwrap_or(s)
+}
+
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => std::iter::once(f.to_ascii_lowercase()).chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+fn field_name_base(name: &str) -> Option<String> {
+    let mut s = name;
+    if let Some(rest) = s.strip_prefix('<') {
+        if let Some(end) = rest.find(">k__BackingField") {
+            s = &rest[..end];
+        }
+    }
+    let s = s.trim_start_matches('_');
+    let s = s.strip_prefix("m_").unwrap_or(s);
+    let s = strip_generic(s);
+    if !ident_ok(s) {
+        return None;
+    }
+    let out = lower_first(s);
+    (out.len() >= 2).then_some(out)
+}
+
+fn method_name_base(name: &str) -> Option<String> {
+    let last = last_segment(strip_generic(name));
+    if last.starts_with("fn_")
+        || last.starts_with("IL2CPP_")
+        || last.contains(".ctor")
+        || last.starts_with("set_")
+        || matches!(
+            last,
+            "Add" | "Remove" | "Clear" | "Dispose" | "Invoke" | "ToString"
+                | "GetHashCode" | "Equals"
+        )
+    {
+        return None;
+    }
+    let base = last
+        .strip_prefix("get_")
+        .or_else(|| last.strip_prefix("Get"))
+        .unwrap_or(last);
+    if !ident_ok(base) {
+        return None;
+    }
+    let out = lower_first(base);
+    (out.len() >= 3).then_some(out)
+}
+
+fn type_name_base(name: &str) -> Option<String> {
+    let last = last_segment(strip_generic(name));
+    if !ident_ok(last) {
+        return None;
+    }
+    let out = lower_first(last);
+    (out.len() >= 3).then_some(out)
 }
 
 impl<'a> MethodCtx<'a> {
@@ -1325,7 +2622,9 @@ impl<'a> MethodCtx<'a> {
         declaring_tdi: i32,
         parent_chain: &'a HashMap<i32, Vec<i32>>,
         ret_is_void: bool,
+        prebuilt: Option<(&[BlockInfo], &[Vec<usize>])>,
     ) -> Self {
+        let t_bdefs = std::time::Instant::now();
         let mut defs: HashMap<u32, usize> = HashMap::new();
         let mut multi_def: HashSet<u32> = HashSet::new();
         let mut def_sites: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -1337,12 +2636,12 @@ impl<'a> MethodCtx<'a> {
                 def_sites.entry(d).or_default().push(i);
             }
         }
-        let reaching = compute_reaching_definitions(insns);
-        let blocks_range: Vec<(usize, usize)> = reaching
-            .blocks
-            .iter()
-            .map(|b| (b.0, b.1))
-            .collect();
+        super::tm_add(&super::timing::B_DEFS, t_bdefs);
+        let t_breach = std::time::Instant::now();
+        let reaching = compute_reaching_definitions(insns, prebuilt);
+        super::tm_add(&super::timing::B_REACHING, t_breach);
+        let blocks_range: Vec<(usize, usize)> =
+            reaching.blocks.iter().map(|b| (b.0, b.1)).collect();
         let mut block_of_insn = vec![usize::MAX; insns.len()];
         for (bi, &(s, e)) in blocks_range.iter().enumerate() {
             for i in s..e {
@@ -1361,6 +2660,7 @@ impl<'a> MethodCtx<'a> {
                 count_address_escapes(op);
             }
         }
+        let t_bvr = std::time::Instant::now();
         let mut var_reads = compute_var_reads(
             insns,
             &multi_def,
@@ -1369,14 +2669,28 @@ impl<'a> MethodCtx<'a> {
             &block_of_insn,
             &def_sites,
         );
+        super::tm_add(&super::timing::B_VARREADS, t_bvr);
+        let t_brc = std::time::Instant::now();
         let read_count = compute_read_counts(insns);
+        super::tm_add(&super::timing::B_READCNT, t_brc);
+        let t_baddr = std::time::Instant::now();
+        let address_taken = collect_address_taken(insns);
+        super::tm_add(&super::timing::B_ADDR, t_baddr);
+        if crate::recovery::env_flags::flag("ILR_ADDRDBG") && !address_taken.is_empty() {
+            eprintln!("[addr] addressed locals: {address_taken:?}");
+        }
         let read_locals: HashSet<u32> = read_count.keys().copied().collect();
         // A shared large value must be MATERIALISED, so it joins `var_reads`
         // (the set every emission predicate keys on) as well as being tracked
         // separately for the inline refusal in `inline_local_inner`.
+        let t_bsh = std::time::Instant::now();
         let shared_large =
             compute_shared_large(insns, &defs, &multi_def, &read_count, SHARED_EXPR_NODES);
+        super::tm_add(&super::timing::B_SHARED, t_bsh);
         var_reads.extend(shared_large.iter().copied());
+        // An addressed cell is written through its address; its defs must be
+        // materialised so the writes that precede the escape are visible.
+        var_reads.extend(address_taken.iter().copied());
         let mut ctx = Self {
             insns,
             table,
@@ -1389,7 +2703,10 @@ impl<'a> MethodCtx<'a> {
             var_reads,
             read_locals,
             read_count,
+            version_names: HashMap::new(),
             shared_large,
+            address_taken,
+            sret_buffers: collect_sret_buffers(insns),
             bound_calls: std::cell::RefCell::new(HashMap::new()),
             preseed_bindings: std::cell::RefCell::new(HashMap::new()),
             block_of_insn: Some(block_of_insn),
@@ -1401,8 +2718,8 @@ impl<'a> MethodCtx<'a> {
             cur_insn: std::cell::Cell::new(usize::MAX),
             audit: std::cell::RefCell::new(std::collections::HashSet::new()),
             claim_log: std::cell::RefCell::new(Vec::new()),
-            audit_strict: std::env::var("ILR_AUDIT_STRICT").is_ok(),
-            rss_dbg: std::env::var("ILR_RSSDBG").is_ok(),
+            audit_strict: crate::recovery::env_flags::flag("ILR_AUDIT_STRICT"),
+            rss_dbg: crate::recovery::env_flags::flag("ILR_RSSDBG"),
             inline_in_progress: std::cell::RefCell::new(std::collections::HashSet::new()),
             inline_stack: std::cell::Cell::new(0),
             inline_budget: std::cell::Cell::new(MAX_INLINE_EXPR_NODES),
@@ -1414,8 +2731,465 @@ impl<'a> MethodCtx<'a> {
         // see those refusals (they depend on the use site and on the def's own
         // expression), so the set is completed here with the exact predicates
         // `inline_local_at` applies. This can only ADD locals, never remove one.
+        let t_bref = std::time::Instant::now();
         ctx.var_reads.extend(ctx.refused_inline_reads());
+        super::tm_add(&super::timing::B_REFUSED, t_bref);
+        if !crate::recovery::env_flags::flag("ILR_NO_VNAMES") {
+            let t_bn = std::time::Instant::now();
+            ctx.version_names = ctx.compute_version_names();
+            super::tm_add(&super::timing::B_NAMES, t_bn);
+        }
         ctx
+    }
+
+    /// Name each SSA version of a COALESCED table local from its producer.
+    ///
+    /// A table local whose versions have several definitions is one C#
+    /// storage slot that the compiler reused for unrelated source values.
+    /// Naming the local from one producer is wrong for the others; naming
+    /// each version from ITS producer recovers the source-level values
+    /// (`loadResource`, `transform`, `instance`, …) while every read keeps the
+    /// version that reaches it. Names are allocated in first-definition order
+    /// and never collide with a parameter, stack cell, field, method or type
+    /// spelling already present in the method.
+    fn compute_version_names(&self) -> HashMap<u32, String> {
+        let mut defs_per_li: HashMap<usize, usize> = HashMap::new();
+        for (&v, &li) in &self.table.index_of {
+            if let Some(sites) = self.def_sites.get(&v) {
+                if !sites.is_empty() {
+                    *defs_per_li.entry(li).or_default() += sites.len();
+                }
+            }
+        }
+        let mut used: HashSet<String> = HashSet::new();
+        for (&v, &li) in &self.table.index_of {
+            let info = &self.table.infos[li];
+            if info.is_this {
+                used.insert("this".to_string());
+            }
+            if let Some(pi) = info.is_param {
+                if let Some(n) = self.param_display(pi, info.param_comp) {
+                    used.insert(n);
+                } else {
+                    used.insert(format!("arg{pi}"));
+                }
+            }
+            if let Some(n) = Self::stack_cell_name(&info.slot_origin) {
+                used.insert(n);
+            }
+            if let Some(n) = self.entry_register_name(v, info) {
+                used.insert(n);
+            }
+        }
+        for insn in self.insns {
+            for op in &insn.operands {
+                match op {
+                    Operand::Method(m) => {
+                        used.insert(last_segment(strip_generic(&m.name)).to_string());
+                    }
+                    Operand::Field(f) => {
+                        used.insert(f.name.clone());
+                    }
+                    Operand::InstanceField { field, .. } => {
+                        used.insert(field.name.clone());
+                    }
+                    Operand::Type(t) => {
+                        used.insert(t.ty.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // (first def insn, version, local index, base name)
+        let mut versions_by_li: HashMap<usize, Vec<u32>> = HashMap::new();
+        for (&v, &li) in &self.table.index_of {
+            versions_by_li.entry(li).or_default().push(v);
+        }
+        let mut cands: Vec<(usize, u32, usize, String)> = Vec::new();
+        let mut cand_base: HashMap<u32, String> = HashMap::new();
+        for (&li, vers) in &versions_by_li {
+            if defs_per_li.get(&li).copied().unwrap_or(0) <= 1 {
+                continue;
+            }
+            let info = &self.table.infos[li];
+            if info.is_this
+                || info.is_param.is_some()
+                || Self::stack_cell_name(&info.slot_origin).is_some()
+            {
+                continue;
+            }
+            // Address-taken storage has ONE identity; renaming its versions
+            // apart would make `&a` and `b` name the same bytes. Never split it.
+            if vers
+                .iter()
+                .any(|v| self.address_taken.contains(v) || self.sret_buffers.contains(v))
+            {
+                continue;
+            }
+            // Sharing one role name across versions of a hub is safe except
+            // when a def READS a sibling version with the same name: it would
+            // render as `x = x` and lose its expression. That case is handled
+            // PER VERSION in the allocator below (the reader gets a distinct
+            // name); the whole hub no longer loses sharing because of it.
+            let default_role = if matches!(info.ty, super::types::ManagedType::Object) {
+                "instance"
+            } else {
+                // Only Object storage is the objN problem. Role-naming scalar
+                // temps here broke a core invariant (a def that reads a
+                // sibling version collapsed to a bare name), so non-Object
+                // locals keep the normal evidence/local_naming path.
+                ""
+            };
+            // Per-version naming. Both name paths (`var_name` and
+            // `entry_var_name`) consult this map, so a named version is
+            // spelled consistently at its def and every read, while an
+            // unnameable version keeps the table spelling at both. For an
+            // Object hub, a version with no producer still gets a ROLE name
+            // (`item`/`value`/`instance`) so one anonymous hub is not left as
+            // `objN`; non-Object locals are skipped.
+            for &v in vers {
+                let Some(sites) = self.def_sites.get(&v).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let mut seen = HashSet::new();
+                let base = match self.version_def_base(v, 0, &mut seen) {
+                    DefBase::Named(n) => n,
+                    DefBase::Ignorable if !default_role.is_empty() => "value".to_string(),
+                    DefBase::Unknown if !default_role.is_empty() => {
+                        let mut role = default_role;
+                        if let Some(sites) = self.def_sites.get(&v) {
+                            for &d in sites {
+                                if let Op::Move = &self.insns[d].op {
+                                    if matches!(
+                                        self.insns[d].operands.get(1),
+                                        Some(Operand::Memory { .. })
+                                            | Some(Operand::ArrayAccess { .. })
+                                            | Some(Operand::ArrayLength(_))
+                                    ) {
+                                        role = "item";
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        role.to_string()
+                    }
+                    _ => continue,
+                };
+                let first = *sites.iter().min().unwrap();
+                cand_base.insert(v, base.clone());
+                cands.push((first, v, li, base));
+            }
+        }
+        cands.sort_by_key(|(first, v, _, _)| (*first, *v));
+        let mut out: HashMap<u32, String> = HashMap::new();
+        let mut per_local: HashMap<(usize, String), String> = HashMap::new();
+        for (_, v, li, base) in cands {
+            // A def that reads a sibling version with the SAME intended name
+            // must not share it; give only that version a distinct name.
+            let share = !self.version_reads_same_base(v, li, &base, &cand_base);
+            let key = (li, base.clone());
+            let name = if share {
+                if let Some(n) = per_local.get(&key) {
+                    n.clone()
+                } else {
+                    let mut cand = base.clone();
+                    if !ident_ok(&cand) || used.contains(&cand) {
+                        let mut k = 2usize;
+                        loop {
+                            cand = format!("{base}{k}");
+                            if ident_ok(&cand) && !used.contains(&cand) {
+                                break;
+                            }
+                            k += 1;
+                        }
+                    }
+                    used.insert(cand.clone());
+                    per_local.insert(key, cand.clone());
+                    cand
+                }
+            } else {
+                let mut cand = base.clone();
+                if !ident_ok(&cand) || used.contains(&cand) {
+                    let mut k = 2usize;
+                    loop {
+                        cand = format!("{base}{k}");
+                        if ident_ok(&cand) && !used.contains(&cand) {
+                            break;
+                        }
+                        k += 1;
+                    }
+                }
+                used.insert(cand.clone());
+                cand
+            };
+            out.insert(v, name);
+        }
+        out
+    }
+
+    /// TYPE-DRIVEN VERSION SPLITTING (Ghidra/TIE/Retypd order: variable
+    /// recovery, then typing).
+    ///
+    /// A stack cell reused for values of different proven types cannot get a
+    /// name-wide type (the agreement fixpoint must reject it). Give each such
+    /// VERSION its own display name instead, so the existing name-level
+    /// inference can type each one independently. Only stack cells for now —
+    /// parameters and `this` keep their signature names, and address-taken
+    /// cells keep one identity.
+    fn split_versions_by_type(&mut self, tdis: &HashMap<u32, i32>) {
+        let mut by_li: HashMap<usize, Vec<u32>> = HashMap::new();
+        for (&v, &li) in &self.table.index_of {
+            by_li.entry(li).or_default().push(v);
+        }
+        let mut lis: Vec<usize> = by_li.keys().copied().collect();
+        lis.sort_unstable();
+        // Names this method can already spell: never collide with them.
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (&v, &li) in &self.table.index_of {
+            let info = &self.table.infos[li];
+            if info.is_this {
+                used.insert("this".into());
+            }
+            if let Some(pi) = info.is_param {
+                used.insert(
+                    self.param_display(pi, info.param_comp)
+                        .unwrap_or_else(|| format!("arg{pi}")),
+                );
+            }
+            if let Some(n) = Self::stack_cell_name(&info.slot_origin) {
+                used.insert(n);
+            }
+            if let Some(n) = self.entry_register_name(v, info) {
+                used.insert(n);
+            }
+            used.insert(format!("v{li}"));
+        }
+        used.extend(self.version_names.values().cloned());
+        for li in lis {
+            let info = &self.table.infos[li];
+            if info.is_this || info.is_param.is_some() {
+                continue;
+            }
+            if Self::stack_cell_name(&info.slot_origin).is_none() {
+                continue;
+            }
+            let vers = &by_li[&li];
+            if vers
+                .iter()
+                .any(|v| self.address_taken.contains(v) || self.sret_buffers.contains(v))
+            {
+                continue;
+            }
+            let mut known: Vec<(u32, i32)> = vers
+                .iter()
+                .filter_map(|v| tdis.get(v).map(|t| (*v, *t)))
+                .collect();
+            let mut distinct: Vec<i32> = known.iter().map(|(_, t)| *t).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() < 2 {
+                continue;
+            }
+            // Deterministic: first definition order, then version.
+            known.sort_by_key(|(v, _)| {
+                (
+                    self.def_sites
+                        .get(v)
+                        .and_then(|s| s.iter().min())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                    *v,
+                )
+            });
+            let mut k = 1usize;
+            for (v, _t) in known {
+                let cand = loop {
+                    let c = format!("v{li}_{k}");
+                    k += 1;
+                    if !used.contains(&c) {
+                        break c;
+                    }
+                };
+                used.insert(cand.clone());
+                self.version_names.insert(v, cand);
+            }
+        }
+    }
+
+    /// Does definition instruction `d` read a version of table local `li`
+    /// (other than its own destination)? Such a local must not share one
+    /// display name across versions, or the def would render as `x = x`.
+    fn version_reads_same_base(
+        &self,
+        v: u32,
+        li: usize,
+        base: &str,
+        bases: &HashMap<u32, String>,
+    ) -> bool {
+        let Some(sites) = self.def_sites.get(&v) else {
+            return false;
+        };
+        for &d in sites {
+            let insn = &self.insns[d];
+            let dst = insn.dest().and_then(|x| x.as_local());
+            let def_pos = match &insn.op {
+                Op::Move => Some(0),
+                Op::Call | Op::CallVoid => Some(1),
+                _ => None,
+            };
+            for (pos, op) in insn.operands.iter().enumerate() {
+                if Some(pos) == def_pos {
+                    continue;
+                }
+                if let (Some(dst), Operand::Local(v2)) = (dst, op) {
+                    if *v2 == dst {
+                        continue;
+                    }
+                }
+                if self.operand_reads_same_base(op, li, base, bases) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn operand_reads_same_base(
+        &self,
+        op: &Operand,
+        li: usize,
+        base: &str,
+        bases: &HashMap<u32, String>,
+    ) -> bool {
+        match op {
+            Operand::Local(src) => {
+                self.table.index_of.get(src) == Some(&li)
+                    && bases.get(src).is_some_and(|b| b == base)
+            }
+            Operand::Memory { base: b, index, .. } => {
+                self.operand_reads_same_base(b, li, base, bases)
+                    || index
+                        .as_deref()
+                        .is_some_and(|i| self.operand_reads_same_base(i, li, base, bases))
+            }
+            Operand::InstanceField { base: b, .. } => {
+                self.operand_reads_same_base(b, li, base, bases)
+            }
+            Operand::AddressOf(inner) => self.operand_reads_same_base(inner, li, base, bases),
+            Operand::ArrayAccess { array, index } => {
+                self.operand_reads_same_base(array, li, base, bases)
+                    || self.operand_reads_same_base(index, li, base, bases)
+            }
+            Operand::ArrayLength(a) => self.operand_reads_same_base(a, li, base, bases),
+            _ => false,
+        }
+    }
+
+    fn version_def_base(
+        &self,
+        v: u32,
+        depth: usize,
+        seen: &mut HashSet<u32>,
+    ) -> DefBase {        if depth > 4 || !seen.insert(v) {
+            return DefBase::Unknown;
+        }
+        let Some(sites) = self.def_sites.get(&v) else {
+            seen.remove(&v);
+            return DefBase::Unknown;
+        };
+        if sites.is_empty() {
+            seen.remove(&v);
+            return DefBase::Unknown;
+        }
+        let mut name: Option<String> = None;
+        for &d in sites {
+            match self.insn_def_base(d, v, depth, seen) {
+                DefBase::Unknown => {
+                    seen.remove(&v);
+                    return DefBase::Unknown;
+                }
+                DefBase::Ignorable => {}
+                DefBase::Named(n) => {
+                    if let Some(prev) = &name {
+                        if prev != &n {
+                            seen.remove(&v);
+                            return DefBase::Unknown;
+                        }
+                    } else {
+                        name = Some(n);
+                    }
+                }
+            }
+        }
+        seen.remove(&v);
+        match name {
+            Some(n) => DefBase::Named(n),
+            None => DefBase::Ignorable,
+        }
+    }
+
+    fn insn_def_base(
+        &self,
+        d: usize,
+        v: u32,
+        depth: usize,
+        seen: &mut HashSet<u32>,
+    ) -> DefBase {
+        let insn = &self.insns[d];
+        match &insn.op {
+            Op::Call | Op::CallVoid => match insn.operands.first() {
+                Some(Operand::Method(m)) => method_name_base(&m.name)
+                    .map(DefBase::Named)
+                    .unwrap_or(DefBase::Unknown),
+                Some(Operand::Immediate(a)) => match super::runtime_helpers::role_of(*a as u64)
+                {
+                    Some(super::runtime_helpers::RuntimeHelper::IsInst)
+                    | Some(super::runtime_helpers::RuntimeHelper::ObjectNew) => {
+                        DefBase::Named("instance".into())
+                    }
+                    Some(super::runtime_helpers::RuntimeHelper::ArrayNew) => {
+                        DefBase::Named("array".into())
+                    }
+                    Some(super::runtime_helpers::RuntimeHelper::Box) => {
+                        DefBase::Named("boxed".into())
+                    }
+                    Some(super::runtime_helpers::RuntimeHelper::ClassIsAssignable) => {
+                        DefBase::Named("isAssignable".into())
+                    }
+                    _ => DefBase::Unknown,
+                },
+                _ => DefBase::Unknown,
+            },
+            Op::Move => match insn.operands.get(1) {
+                Some(Operand::Local(src)) if *src != v => {
+                    if let Some(&li) = self.table.index_of.get(src) {
+                        let info = &self.table.infos[li];
+                        if info.is_this {
+                            return DefBase::Named("instance".into());
+                        }
+                        if info.is_param.is_some()
+                            || Self::stack_cell_name(&info.slot_origin).is_some()
+                        {
+                            return DefBase::Unknown;
+                        }
+                    }
+                    self.version_def_base(*src, depth + 1, seen)
+                }
+                Some(Operand::Field(f)) => field_name_base(&f.name)
+                    .map(DefBase::Named)
+                    .unwrap_or(DefBase::Unknown),
+                Some(Operand::InstanceField { field, .. }) => field_name_base(&field.name)
+                    .map(DefBase::Named)
+                    .unwrap_or(DefBase::Unknown),
+                Some(Operand::Immediate(0)) => DefBase::Ignorable,
+                _ => DefBase::Unknown,
+            },
+            Op::NewObj(Some(t)) => type_name_base(&t.ty.name)
+                .map(DefBase::Named)
+                .unwrap_or(DefBase::Unknown),
+            _ => DefBase::Unknown,
+        }
     }
 
     /// Display name for an INTERNAL local id that has no variable-table entry.
@@ -1523,7 +3297,7 @@ impl<'a> MethodCtx<'a> {
         }
         let n = self.table.param_names[pi].clone();
         let ok = !n.is_empty()
-            && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '<' || c == '>')
             && !n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true);
         if !ok {
             return None;
@@ -1539,8 +3313,7 @@ impl<'a> MethodCtx<'a> {
                     .cloned();
                 match f {
                     Some(f)
-                        if !f.is_empty()
-                            && f.chars().all(|c| c.is_alphanumeric() || c == '_') =>
+                        if !f.is_empty() && f.chars().all(|c| c.is_alphanumeric() || c == '_') =>
                     {
                         Some(format!("{n}.{f}"))
                     }
@@ -1575,6 +3348,12 @@ impl<'a> MethodCtx<'a> {
                         return n;
                     }
                     return format!("arg{pi}");
+                }
+                // A version whose TYPE forced a split name (see
+                // `split_versions_by_type`) must spell that name at its def
+                // and every read; otherwise the storage keeps its slot name.
+                if let Some(n) = self.version_names.get(&v) {
+                    return n.clone();
                 }
                 if let Some(n) = Self::stack_cell_name(&info.slot_origin) {
                     return n;
@@ -1627,7 +3406,37 @@ impl<'a> MethodCtx<'a> {
     /// is and once as a name nothing in the body defines.
     fn mem_base_expr(&self, base: &Operand, base_expr: Expr) -> Expr {
         match base {
-            Operand::Local(v) if self.is_stack_local(*v) => Expr::AddressOf(Box::new(base_expr)),
+            Operand::Local(v) if self.is_stack_local(*v) => {
+                // A stack cell whose address escapes (`ref`/`out`) and whose
+                // proven type is pointer-sized holds a REFERENCE: a callee
+                // wrote the object pointer through the address, and an access
+                // at `[cell + off]` is a field of that object, not a slot in
+                // the frame. 0x18A3A1C: `TryGetValue(key, &cell)` stores the
+                // token, then `str w0,[x22,#0x1c]` is `cell.TotalCost`.
+                let pointer_cell = self.address_taken.contains(v)
+                    && !self.sret_buffers.contains(v)
+                    && self
+                        .table
+                        .index_of
+                        .get(v)
+                        .map(|&li| &self.table.infos[li].ty)
+                        .is_some_and(|t| {
+                            matches!(
+                                t,
+                                ManagedType::Primitive(PrimKind::I8) | ManagedType::IntPtr
+                            )
+                        });
+                if pointer_cell {
+                    return base_expr;
+                }
+                // Otherwise a stack-cell base denotes the cell's address, not
+                // the current VALUE stored there. `base_expr` may have been
+                // inlined from the incoming component (e.g. `position.x`),
+                // which turned a later access at `sp+4` into `&position.x+4`.
+                // Keep the cell identity here, just as `Operand::AddressOf`
+                // does for direct stack-address operands.
+                Expr::AddressOf(Box::new(Expr::Var(self.var_name(*v))))
+            }
             // An ABSOLUTE address is one constant, not a variable plus an
             // offset. `mem_addr_expr` has already folded index*scale into the
             // expression, so this arm only fires for the un-indexed case, where
@@ -1819,7 +3628,11 @@ impl<'a> MethodCtx<'a> {
         if name.starts_with('v') && name != "this" {
             return Some(name);
         }
-        self.table.index_of.get(&d).copied().map(|li| format!("v{li}"))
+        self.table
+            .index_of
+            .get(&d)
+            .copied()
+            .map(|li| format!("v{li}"))
     }
 
     fn call_site_statement_emitted(&self, def_insn: usize) -> bool {
@@ -1898,7 +3711,11 @@ impl<'a> MethodCtx<'a> {
                 return None;
             }
             // absent key == no defs == entry value: this IS the root
-            let sites: &[usize] = self.def_sites.get(&cur).map(|v| v.as_slice()).unwrap_or(&[]);
+            let sites: &[usize] = self
+                .def_sites
+                .get(&cur)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             if sites.is_empty() {
                 return Some(cur);
             }
@@ -1934,6 +3751,13 @@ impl<'a> MethodCtx<'a> {
     /// sole assignment reaches the use inlines even inside a multi-def
     /// local, which is exactly how `v1` shells become real expressions.
     fn inline_local(&self, v: u32, depth: usize) -> Expr {
+        // An addressed cell is mutable behind the renderer's back (a callee
+        // receives `&cell`). Reading it by NAME is the only correct use; any
+        // inlined definition would be the value at the textual def, not the
+        // value the callee left there.
+        if self.address_taken.contains(&v) {
+            return Expr::Var(self.var_name(v));
+        }
         // Outermost resolution ⇒ a new expression ⇒ a fresh budget, so one
         // bloated statement can never starve the ones after it.
         if self.inline_stack.get() == 0 {
@@ -1997,9 +3821,7 @@ impl<'a> MethodCtx<'a> {
                 // which is where the corpus kept printing
                 // `do { … v = v - 1; } while (v - 1 != 0)` after the
                 // use-site-aware refusal stopped it on the branch path.
-                if self.def_rewrites_the_name_it_assigns(i)
-                    && !self.def_chain_has_call(i)
-                {
+                if self.def_rewrites_the_name_it_assigns(i) && !self.def_chain_has_call(i) {
                     Expr::Var(self.var_name(v))
                 } else {
                     self.def_expr(i, depth)
@@ -2025,10 +3847,8 @@ impl<'a> MethodCtx<'a> {
         let Some(block_of) = self.block_of_insn.as_deref() else {
             return false;
         };
-        let (Some(bi), Some(bu)) = (
-            block_of.get(i).copied(),
-            block_of.get(use_insn).copied(),
-        ) else {
+        let (Some(bi), Some(bu)) = (block_of.get(i).copied(), block_of.get(use_insn).copied())
+        else {
             return false;
         };
         if bi == usize::MAX || bu == usize::MAX || bi == bu {
@@ -2040,11 +3860,9 @@ impl<'a> MethodCtx<'a> {
         let mut locals: Vec<u32> = Vec::new();
         self.collect_def_locals(i, 0, &mut locals);
         locals.iter().any(|w| {
-            self.def_sites.get(w).is_some_and(|sites| {
-                sites
-                    .iter()
-                    .any(|&d| d >= i && d >= start && d < end)
-            })
+            self.def_sites
+                .get(w)
+                .is_some_and(|sites| sites.iter().any(|&d| d >= i && d >= start && d < end))
         })
     }
 
@@ -2120,8 +3938,7 @@ impl<'a> MethodCtx<'a> {
         reads.into_iter().any(|w| {
             // A read that is still an ENTRY value renders as `in_xN`, never as
             // a table name, so it cannot collide with what the def assigns.
-            self.def_sites.get(&w).is_some_and(|s| !s.is_empty())
-                && self.def_var_name(w) == name
+            self.def_sites.get(&w).is_some_and(|s| !s.is_empty()) && self.def_var_name(w) == name
         })
     }
 
@@ -2176,6 +3993,136 @@ impl<'a> MethodCtx<'a> {
         }
     }
 
+    /// Are all locals the def at `i` transitively reads VALUE-STABLE across
+    /// every block? This is the relaxed cross-block materialization test: if
+    /// no transitive input can change value in a different block, the def's
+    /// expression evaluates identically wherever it is inlined.
+    ///
+    /// A local is value-stable when either:
+    ///  * it is single-def (only assigned at one site, so no other block
+    ///    can change it after the def); or
+    ///  * every one of its def sites lives in the SAME block as def `i` and
+    ///    is ordered BEFORE `i` (the `def_moved_across_a_write` check
+    ///    already catches the write-AFTER case); or
+    ///  * it is not present in `def_sites` at all (entry/ABI value —
+    ///    immutable for our purposes).
+    ///
+    /// `collect_def_locals` is bounded to depth 3 / width 32, so the scan is
+    /// cheap even for chained defs.
+    fn def_inputs_stable(&self, i: usize) -> bool {
+        let mut locals: Vec<u32> = Vec::new();
+        self.collect_def_locals(i, 0, &mut locals);
+        let bd = self
+            .block_of_insn
+            .as_ref()
+            .and_then(|m| m.get(i).copied())
+            .unwrap_or(usize::MAX);
+        let Some(&(start, end)) = self.blocks_range.get(bd) else {
+            // No block map for the def — be conservative.
+            return false;
+        };
+        for &w in &locals {
+            // Entry / scratch locals with no def sites are stable by
+            // construction; the renderer uses the entry name and no block
+            // rewrites them.
+            let Some(sites) = self.def_sites.get(&w) else {
+                continue;
+            };
+            if sites.is_empty() {
+                continue;
+            }
+            if sites.len() == 1 {
+                // Single-def — the only risk is a def in a DIFFERENT block
+                // that dominates the use. When the single def is at `i`
+                // itself, or in another block that has already run before
+                // `i` in program order, the value cannot change after `i`.
+                let d1 = sites[0];
+                if d1 == i {
+                    continue;
+                }
+                let bu = self
+                    .block_of_insn
+                    .as_ref()
+                    .and_then(|m| m.get(d1).copied())
+                    .unwrap_or(usize::MAX);
+                if bu != bd && bu != usize::MAX {
+                    // A single-def input from a different block: that def
+                    // ran at most once, and there is no path back into it,
+                    // so its value is frozen. Treat as stable.
+                    continue;
+                }
+                continue;
+            }
+            // Multi-def: only stable when every def site is in the def's own
+            // block AND at or before `i`. Anything else can rewrite the input
+            // between `i` and a cross-block use.
+            if !sites.iter().all(|&d| d < start || d >= end || d > i) {
+                // Some def is at or before `i` in this block. The ones AFTER
+                // `i` in this block are the moved-across case (already
+                // refused). The ones BEFORE `i` are the current reaching def
+                // — safe. Mixed multi-def inside the block is fine as long as
+                // no def spills into another block.
+                if !sites.iter().all(|&d| d < end && d >= start) {
+                    return false;
+                }
+            } else {
+                // Every def in this block is after `i` — the reaching def
+                // must be in some other block or is entry. If any def is in
+                // another block, we cannot freeze it from `i`'s perspective.
+                if !sites.iter().all(|&d| d >= start && d < end) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Does the def at `i` bind a value that is CHEAP to duplicate at every
+    /// read site — a Move from a constant, a literal, or a single-def local
+    /// the renderer can re-expand for free? When this returns true we allow
+    /// multi-read inline (the `read_count > 1` refusal) even for a def that
+    /// the value-stability check would otherwise reject.
+    ///
+    /// Shapes accepted:
+    ///  * `Op::Move` whose RHS operand is a literal (Immediate/Const) — the
+    ///    renderer emits a constant expression, cost zero to duplicate.
+    ///  * `Op::Move` whose RHS is `Operand::Local(w)` and `w` is single-def
+    ///    (so re-inlining resolves to the same name or the def's own
+    ///    expression, never a fresh computation).
+    ///  * Direct literal-producing defs (`Op::LoadConst` and similar) — the
+    ///    expression itself is a literal and inlining at N reads emits the
+    ///    same literal N times, matching the native.
+    ///
+    /// Shapes deliberately EXCLUDED:
+    ///  * Field loads / dereferences — an intervening call may mutate the
+    ///    field, so re-evaluating the expression at a later site changes
+    ///    observable behavior.
+    ///  * Anything involving `Op::Call` — handled by `def_chain_has_call`.
+    fn def_is_trivially_duplicable(&self, i: usize) -> bool {
+        let insn = &self.insns[i];
+        match insn.op {
+            Op::Move => {
+                // The RHS operand is index 1 for a Move.
+                match insn.operands.get(1) {
+                    Some(Operand::Immediate(_))
+                    | Some(Operand::FloatLiteral(_))
+                    | Some(Operand::DoubleLiteral(_))
+                    // `typeof(T)` is a compile-time constant: duplicating it
+                    // at every read site is free and cannot observe a call.
+                    // Materialising it instead was the klass-temp regression
+                    // (`v = typeof(T); if (*(typeof(T)+224)==0) …`).
+                    | Some(Operand::Type(_)) => true,
+                    Some(Operand::Local(w)) => {
+                        // A copy from a single-def source is stable.
+                        !self.multi_def.contains(w)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Use-site-aware variant: `use_insn` is the index of the instruction
     /// whose operand we're rendering. The def that reaches THAT point (not
     /// the last linear def) is what the hardware would read.
@@ -2219,6 +4166,22 @@ impl<'a> MethodCtx<'a> {
                 return Expr::Var(name);
             }
         }
+        // ONE ALLOCATION, ONE EMITTED STATEMENT — the same rule as the call
+        // binding above, for the same reason, and it was missing.
+        //
+        // `Op::NewObj`/`Op::NewArr` are side-effecting: inlining the expression
+        // at a use site allocates a SECOND object and abandons the first. With
+        // the allocation now carrying its real type (`NewObj(Some(Token))`)
+        // every read of the local inlined it, so the body printed
+        // `if (new Token() != null)` and a fresh `new Token()` for each of the
+        // four field stores — five allocations where the native code performs
+        // one, and the described program is not the one the binary runs.
+        // A use site must reference the name the allocation statement bound.
+        if let Some(d) = def_at {
+            if matches!(self.insns[d].op, Op::NewObj(_) | Op::NewArr(_)) {
+                return Expr::Var(self.var_name(v));
+            }
+        }
         match def_at {
             Some(i) if i != use_insn => {
                 // A definition whose value expression reads (transitively) the
@@ -2247,8 +4210,7 @@ impl<'a> MethodCtx<'a> {
                 // `0xf65610` lost a real `InternedString.op_Equality` and two
                 // `get_Item` call sites and its loop test changed meaning.
                 if (self.def_rewrites_the_name_it_assigns(i) && !self.def_chain_has_call(i))
-                    || (self.def_moved_across_a_write(i, use_insn)
-                        && !self.def_chain_has_call(i))
+                    || (self.def_moved_across_a_write(i, use_insn) && !self.def_chain_has_call(i))
                 {
                     Expr::Var(self.var_name(v))
                 } else {
@@ -2315,6 +4277,12 @@ impl<'a> MethodCtx<'a> {
                         return n;
                     }
                     return format!("arg{pi}");
+                }
+                // A version whose TYPE forced a split name (see
+                // `split_versions_by_type`) must spell that name at its def
+                // and every read; otherwise the storage keeps its slot name.
+                if let Some(n) = self.version_names.get(&v) {
+                    return n.clone();
                 }
                 if let Some(n) = Self::stack_cell_name(&info.slot_origin) {
                     return n;
@@ -2394,7 +4362,7 @@ impl<'a> MethodCtx<'a> {
     /// opaque string in the output with a dozen possible producers, and every
     /// bug report about it degenerates into guessing which one fired.
     fn unk<T: std::fmt::Debug>(&self, site: &str, detail: T) -> Expr {
-        if std::env::var("ILR_UNK").is_ok() {
+        if crate::recovery::env_flags::flag("ILR_UNK") {
             eprintln!("[unk] {site} {detail:?}");
         }
         Expr::Unknown
@@ -2411,11 +4379,9 @@ impl<'a> MethodCtx<'a> {
             // (`recover_delegate_invokes`) only reads `Move(local, Method)`
             // operands directly; anything that reaches the renderer still has
             // to print something honest.
-            Operand::Method(m) => Expr::MethodGroup(format!(
-                "{}.{}",
-                short_type(&m.declaring_type_name),
-                m.name
-            )),
+            Operand::Method(m) => {
+                Expr::MethodGroup(format!("{}.{}", short_type(&m.declaring_type_name), m.name))
+            }
             // A genuine unresolved value. Kept as its own tag so a census can
             // tell "the lifter lost this" apart from "no arm handles this
             // operand kind" — they have completely different fixes.
@@ -2457,12 +4423,17 @@ impl<'a> MethodCtx<'a> {
             // A field on a DERIVED receiver: `base.field`. The base is rendered
             // through `operand_expr`, so a nested field chain
             // (`this.Motor._controller._state`) round-trips at any depth.
-            Operand::InstanceField { base, field } => self.field_expr(
-                Some(self.operand_expr(base, depth + 1)),
-                field,
-                depth,
-            ),
-            Operand::Memory { base, addend, index, scale, width, .. } => {
+            Operand::InstanceField { base, field } => {
+                self.field_expr(Some(self.operand_expr(base, depth + 1)), field, depth)
+            }
+            Operand::Memory {
+                base,
+                addend,
+                index,
+                scale,
+                width,
+                ..
+            } => {
                 let base_expr = self.mem_addr_expr(base, index.as_deref(), *scale, depth);
                 // `ldr xN, [usage-slot]`: the value stored in a member's own
                 // metadata usage slot IS that member, so a deref here is a
@@ -2525,7 +4496,10 @@ impl<'a> MethodCtx<'a> {
 
     fn field_expr(&self, recv: Option<Expr>, f: &FieldRef, depth: usize) -> Expr {
         if f.is_static {
-            Expr::StaticField(short_type(&f.declaring_type_name).to_string(), f.name.clone())
+            Expr::StaticField(
+                short_type(&f.declaring_type_name).to_string(),
+                f.name.clone(),
+            )
         } else {
             let recv = recv.unwrap_or_else(|| {
                 // Instance field: `this` when declared on the declaring type
@@ -2578,8 +4552,17 @@ impl<'a> MethodCtx<'a> {
             if !matches!(insn.op, Op::Move) {
                 continue;
             }
-            let Some(dest) = insn.operands.first() else { continue };
-            let Operand::Memory { base: db, addend: da, .. } = dest else { continue };
+            let Some(dest) = insn.operands.first() else {
+                continue;
+            };
+            let Operand::Memory {
+                base: db,
+                addend: da,
+                ..
+            } = dest
+            else {
+                continue;
+            };
             let dkey: Option<(u8, u64)> = match db.as_ref() {
                 Operand::Local(v) => Some((0, *v as u64)),
                 Operand::Register(n) => Some((1, slot_index(n)? as u64)),
@@ -2667,7 +4650,14 @@ impl<'a> MethodCtx<'a> {
                 Some(Operand::InstanceField { base, field }) => {
                     self.field_expr(Some(self.operand_expr(base, depth + 1)), field, depth)
                 }
-                Some(Operand::Memory { base, addend, index, scale, width, .. }) => {
+                Some(Operand::Memory {
+                    base,
+                    addend,
+                    index,
+                    scale,
+                    width,
+                    ..
+                }) => {
                     // Frame-slot spill forwarding: the compiler spills live
                     // values (esp. floats, which clobber at every call) to
                     // the stack and reloads them right before the tail-merged
@@ -2683,7 +4673,8 @@ impl<'a> MethodCtx<'a> {
                         // A load from a member's own metadata-usage slot IS
                         // that member (see `operand_expr`) — same collapse, so
                         // the two construction sites cannot drift apart.
-                        if *addend == 0 && index.is_none()
+                        if *addend == 0
+                            && index.is_none()
                             && matches!(base_expr, Expr::MethodGroup(_))
                         {
                             return base_expr;
@@ -2716,14 +4707,20 @@ impl<'a> MethodCtx<'a> {
             }
             Op::FloatArith(kind) => match kind {
                 FloatArithKind::Neg => {
-                    let a = self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
+                    let a =
+                        self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
                     Expr::Neg(Box::new(a))
                 }
                 // scalar sqrt/abs/round: no C# operator — named intrinsic call
                 // (same convention as CountLeadingZeros below), never a lie
-                FloatArithKind::Sqrt | FloatArithKind::Abs | FloatArithKind::Floor
-                | FloatArithKind::Ceiling | FloatArithKind::Truncate | FloatArithKind::Round => {
-                    let a = self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
+                FloatArithKind::Sqrt
+                | FloatArithKind::Abs
+                | FloatArithKind::Floor
+                | FloatArithKind::Ceiling
+                | FloatArithKind::Truncate
+                | FloatArithKind::Round => {
+                    let a =
+                        self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
                     let name = match kind {
                         FloatArithKind::Sqrt => "Sqrt",
                         FloatArithKind::Abs => "Abs",
@@ -2739,8 +4736,10 @@ impl<'a> MethodCtx<'a> {
                     }
                 }
                 k => {
-                    let a = self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
-                    let b = self.operand_expr(insn.operands.get(2).unwrap_or(&Operand::Unknown), depth);
+                    let a =
+                        self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
+                    let b =
+                        self.operand_expr(insn.operands.get(2).unwrap_or(&Operand::Unknown), depth);
                     Expr::Bin(bin_of_float(*k), Box::new(a), Box::new(b))
                 }
             },
@@ -2758,21 +4757,33 @@ impl<'a> MethodCtx<'a> {
                 Expr::Neg(Box::new(a))
             }
             Op::NewObj(ty) => {
-                let tname = ty.as_ref().map(|t| t.ty.name.clone()).unwrap_or_else(|| "object".into());
+                let tname = ty
+                    .as_ref()
+                    .map(|t| expand_arity(&t.ty.name))
+                    .unwrap_or_else(|| "object".into());
                 Expr::NewObj(tname, vec![])
             }
             Op::Box(ty) => {
-                let tname = ty.as_ref().map(|t| t.ty.name.clone()).unwrap_or_else(|| "object".into());
-                Expr::Call { recv: None, name: format!("Box<{tname}>"), args: vec![] }
+                let tname = ty
+                    .as_ref()
+                    .map(|t| expand_arity(&t.ty.name))
+                    .unwrap_or_else(|| "object".into());
+                Expr::Call {
+                    recv: None,
+                    name: format!("Box<{tname}>"),
+                    args: vec![],
+                }
             }
             Op::LoadLength => {
-                let arr = self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
+                let arr =
+                    self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
                 Expr::Field(Box::new(arr), "Length".into())
             }
             Op::NewArr(elem) => {
                 // [dest, len] — render `new T[len]` with the element type from
                 // metadata (was Expr::Unknown, hiding real allocations).
-                let len = self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
+                let len =
+                    self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
                 let elem_name = elem
                     .as_ref()
                     .map(|t| csharp_type(t).unwrap_or_else(|| "object".into()))
@@ -2782,7 +4793,8 @@ impl<'a> MethodCtx<'a> {
             Op::Convert(c) => {
                 // [dest, src] — explicit cast so widening/narrowing stays
                 // visible instead of silently becoming Unknown.
-                let src = self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
+                let src =
+                    self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), depth);
                 let target = match c {
                     Conversion::IntToFloat32 => "float",
                     Conversion::IntToFloat64 | Conversion::Float32ToFloat64 => "double",
@@ -2800,7 +4812,11 @@ impl<'a> MethodCtx<'a> {
                 let c = self.operand_expr(insn.operands.get(3).unwrap_or(&Operand::Unknown), depth);
                 let mul = Expr::Bin(BinOp::Mul, Box::new(a), Box::new(b));
                 Expr::Bin(
-                    if *negate_addend { BinOp::Sub } else { BinOp::Add },
+                    if *negate_addend {
+                        BinOp::Sub
+                    } else {
+                        BinOp::Add
+                    },
                     Box::new(mul),
                     Box::new(c),
                 )
@@ -2845,11 +4861,7 @@ impl<'a> MethodCtx<'a> {
                                 )),
                             )
                         };
-                        let product = Expr::Bin(
-                            BinOp::Mul,
-                            Box::new(widen(1)),
-                            Box::new(widen(2)),
-                        );
+                        let product = Expr::Bin(BinOp::Mul, Box::new(widen(1)), Box::new(widen(2)));
                         Some(Expr::Cast(
                             narrow.to_string(),
                             Box::new(Expr::Bin(
@@ -2860,22 +4872,67 @@ impl<'a> MethodCtx<'a> {
                         ))
                     }
                     // `movi` broadcasts a constant into every lane. The 64-bit
-                    // splat depends on the LANE WIDTH, and the decoder's printed
-                    // immediate does not always carry it (`movi d0, #0xffffffff`
-                    // is two 32-bit lanes, but a `4h, #0x0101` pattern would be
-                    // four 16-bit ones). Rather than emit a plausible-but-wrong
-                    // constant, only the WIDTH-INDEPENDENT immediates are
-                    // resolved here: ZERO, and the all-ones pattern — which
-                    // splat identically under every arrangement. Those are 311
-                    // of the 335 `movi` on the reference binary; anything else
-                    // keeps the stub below.
-                    "MOVI" => match insn.operands.get(1) {
-                        Some(Operand::Immediate(0)) => Some(Expr::Int(0)),
-                        Some(Operand::Immediate(v)) if *v == 0xFFFF_FFFF || *v == -1 => {
-                            Some(Expr::Int(-1))
+                    // splat depends on the LANE WIDTH. The lifting phase preserves
+                    // the element size as operand[1] (1/2/4/8 bytes), and the
+                    // immediate value as operand[2]. We expand the immediate to
+                    // fill 64 bits based on the lane size.
+                    "MOVI" => {
+                        // Extract lane size and immediate from operands
+                        let (lane_size, imm_op_idx) = match insn.operands.get(1) {
+                            Some(Operand::Immediate(lane_bytes)) if *lane_bytes > 0 => {
+                                (*lane_bytes as u8, 2)
+                            }
+                            _ => (0, 1), // Fallback for old format or missing lane size
+                        };
+                        
+                        match insn.operands.get(imm_op_idx) {
+                            Some(Operand::Immediate(0)) => Some(Expr::Int(0)),
+                            Some(Operand::Immediate(v)) if *v == -1 => Some(Expr::Int(-1)),
+                            Some(Operand::Immediate(v)) => {
+                                let imm = *v as u64;
+                                // Expand based on lane size
+                                if lane_size > 0 {
+                                    let expanded = match lane_size {
+                                        1 => {
+                                            // 8-bit lanes: replicate to 64 bits
+                                            let byte = (imm & 0xFF) as u64;
+                                            byte * 0x0101010101010101
+                                        }
+                                        2 => {
+                                            // 16-bit lanes: replicate to 64 bits
+                                            let half = imm & 0xFFFF;
+                                            half * 0x0001000100010001
+                                        }
+                                        4 => {
+                                            // 32-bit lanes: replicate to 64 bits
+                                            let word = imm & 0xFFFFFFFF;
+                                            (word << 32) | word
+                                        }
+                                        8 => {
+                                            // 64-bit lane: use as-is
+                                            imm
+                                        }
+                                        _ => imm,
+                                    };
+                                    Some(Expr::Int(expanded as i64))
+                                } else {
+                                    // Fallback: if lane size is unknown, check if
+                                    // the value is width-independent (all-ones pattern)
+                                    if imm == 0xFFFFFFFF {
+                                        Some(Expr::Int(-1))
+                                    } else {
+                                        // For ambiguous cases, emit Vector128.Create
+                                        Some(Expr::Call {
+                                            recv: None,
+                                            name: "Vector128.Create".into(),
+                                            args: vec![Expr::Int(*v)],
+                                        })
+                                    }
+                                }
+                            }
+                            _ => None,
                         }
-                        _ => None,
-                    },
+                    }
                     _ => None,
                 };
                 if let Some(e) = exact {
@@ -2911,10 +4968,11 @@ impl<'a> MethodCtx<'a> {
                 // makes, with the difference that here the operation is KNOWN
                 // (the lane table is checked by the lifter's tests) rather than
                 // missing.
-                let mut args: Vec<Expr> = vec![self.operand_expr(
-                    insn.operands.get(1).unwrap_or(&Operand::Unknown),
-                    depth + 1,
-                )];
+                let mut args: Vec<Expr> =
+                    vec![self.operand_expr(
+                        insn.operands.get(1).unwrap_or(&Operand::Unknown),
+                        depth + 1,
+                    )];
                 if op.reads_second_source() {
                     args.push(self.operand_expr(
                         insn.operands.get(2).unwrap_or(&Operand::Unknown),
@@ -2938,14 +4996,10 @@ impl<'a> MethodCtx<'a> {
                 // (`t4294967293`). Nothing else can produce a `t4294967…`
                 // identifier, so its presence in a body is proof of this leak.
                 let cond = self.condition_value_expr(i, 1, depth);
-                let a = self.operand_expr(
-                    insn.operands.get(2).unwrap_or(&Operand::Unknown),
-                    depth + 1,
-                );
-                let b = self.operand_expr(
-                    insn.operands.get(3).unwrap_or(&Operand::Unknown),
-                    depth + 1,
-                );
+                let a =
+                    self.operand_expr(insn.operands.get(2).unwrap_or(&Operand::Unknown), depth + 1);
+                let b =
+                    self.operand_expr(insn.operands.get(3).unwrap_or(&Operand::Unknown), depth + 1);
                 // The variant's transform stays on the false arm, so what the
                 // instruction actually computed is visible rather than being
                 // flattened into a plain `a : b`.
@@ -2975,7 +5029,11 @@ impl<'a> MethodCtx<'a> {
                     .iter()
                     .map(|o| self.operand_expr(o, depth + 1))
                     .collect();
-                Expr::Call { recv, name: fname, args }
+                Expr::Call {
+                    recv,
+                    name: fname,
+                    args,
+                }
             }
             _ => self.unk("def:unsupported-op", (i, insn.address, insn.op.clone())),
         }
@@ -3067,14 +5125,13 @@ impl<'a> MethodCtx<'a> {
                 // unique per-site ids; nearest-preceding for legacy ones)
                 if let Some(def) = (0..i).rev().find(|&j| {
                     matches!(self.insns[j].op, Op::Arith(ArithKind::And))
-                        && self.insns[j]
-                            .dest()
-                            .and_then(|d| d.as_local())
-                            == Some(v)
+                        && self.insns[j].dest().and_then(|d| d.as_local()) == Some(v)
                 }) {
                     let d = &self.insns[def];
-                    let a = self.operand_expr(d.operands.get(1).unwrap_or(&Operand::Unknown), depth + 1);
-                    let b = self.operand_expr(d.operands.get(2).unwrap_or(&Operand::Unknown), depth + 1);
+                    let a = self
+                        .operand_expr(d.operands.get(1).unwrap_or(&Operand::Unknown), depth + 1);
+                    let b = self
+                        .operand_expr(d.operands.get(2).unwrap_or(&Operand::Unknown), depth + 1);
                     return Expr::Bin(BinOp::And, Box::new(a), Box::new(b));
                 }
             }
@@ -3093,10 +5150,39 @@ impl<'a> MethodCtx<'a> {
         let (recv, arg_start) = if m.sig.is_static {
             (None, 2.min(ops.len()))
         } else {
-            let recv = ops
+            // The receiver slot of a direct call can hold garbage when the
+            // callee provably never reads it: the compiler is free to leave
+            // the previous call's integer result in x0 (0x18A3A1C calls
+            // `UpdateProbability` with the `GetTokensForCharacter` result
+            // there). Rendering `tokensForCharacter.UpdateProbability(...)`
+            // fabricates a receiver of a type that cannot be one. When the
+            // slot's proven type is a primitive AND the callee is declared on
+            // this type (or an ancestor), the only valid receiver in scope is
+            // `this`.
+            let mut recv = ops
                 .get(2)
                 .map(|o| self.operand_expr(o, depth + 1))
                 .map(Box::new);
+            let garbage_primitive = match ops.get(2) {
+                Some(Operand::Local(v)) => self
+                    .table
+                    .index_of
+                    .get(v)
+                    .map(|&li| &self.table.infos[li].ty)
+                    .is_some_and(|t| {
+                        matches!(
+                            t,
+                            ManagedType::Primitive(_) | ManagedType::IntPtr
+                        )
+                    }),
+                Some(Operand::FloatLiteral(_))
+                | Some(Operand::DoubleLiteral(_))
+                | Some(Operand::Immediate(_)) => true,
+                _ => false,
+            };
+            if garbage_primitive && self.in_declaring_chain(m.type_def_index) {
+                recv = Some(Box::new(Expr::This));
+            }
             (recv, 3.min(ops.len()))
         };
         let mut args: Vec<Expr> = Vec::with_capacity(m.sig.params.len() + 1);
@@ -3107,7 +5193,14 @@ impl<'a> MethodCtx<'a> {
                 .unwrap_or_else(|| {
                     self.unk(
                         "call:no-operand-for-param",
-                        (self.insns[i].address, k, m.sig.params.len(), ops.len(), arg_start, self.insns[i].op.clone()),
+                        (
+                            self.insns[i].address,
+                            k,
+                            m.sig.params.len(),
+                            ops.len(),
+                            arg_start,
+                            self.insns[i].op.clone(),
+                        ),
                     )
                 });
             args.push(e);
@@ -3157,8 +5250,53 @@ impl<'a> MethodCtx<'a> {
         // belongs.
         let name = if m.sig.is_static {
             format!("{}.{}", short_type(&m.declaring_type_name), m.name)
+        } else if m.name == ".ctor" {
+            // Carry the declaring type so `normalize_ctor_calls` can type the
+            // matching `new object()` allocation. The renderer strips the
+            // prefix back to `..ctor`; no output changes except the allocation
+            // becoming `new T(...)`.
+            format!("{}..ctor", short_type(&m.declaring_type_name))
         } else {
             m.name.clone()
+        };
+        // ---- base-call rewriting -----------------------------------------
+        //
+        // IL2CPP compiles `base.M(x)` to a direct call on the base
+        // implementation. In the recovered IR this surfaces as an instance
+        // call whose receiver is `this` (operand 2) — the same shape as
+        // `this.M(x)`. The ONLY way to tell them apart is the callee's
+        // declaring type: if it is a STRICT ANCESTOR of the current method's
+        // declaring type, the source wrote `base.M(x)`.
+        //
+        // This is provable, not guessed:
+        //   - `m.type_def_index` is the metadata TDI of the type that
+        //     DECLARES the callee (from the resolved `MethodRef`);
+        //   - `self.parent_chain[self.declaring_tdi]` is the ancestor chain
+        //     of the type that DECLARES the current method;
+        //   - `is_strict_ancestor` checks membership EXCLUDING the declaring
+        //     type itself (same-type calls stay `this.M(x)`).
+        //
+        // The virtual flag is deliberately NOT checked: `base.NonVirtual()`
+        // is legal C# and the ancestry alone is sufficient. When the parent
+        // chain is empty (no ancestry metadata), `is_strict_ancestor` returns
+        // false and the call is left untouched — conservative by construction.
+        //
+        // The receiver resolves to `Expr::Var("this")` through `inline_local`
+        // (the `this` parameter is a local whose `var_name` is `"this"`), not
+        // `Expr::This` (which is only produced for field-access receivers).
+        // Both are matched for robustness.
+        let recv_is_this = match recv.as_deref() {
+            Some(Expr::This) => true,
+            Some(Expr::Var(n)) if n == "this" => true,
+            _ => false,
+        };
+        let recv = if !m.sig.is_static
+            && recv_is_this
+            && self.is_strict_ancestor(m.type_def_index)
+        {
+            Some(Box::new(Expr::Var("base".to_string())))
+        } else {
+            recv
         };
         Some((recv, name, args))
     }
@@ -3174,7 +5312,13 @@ impl<'a> MethodCtx<'a> {
     /// is the method's ENTIRE 10-call deficit). The set is handed to the verify
     /// ledger at the end of rendering, so the checker subtracts exactly the
     /// folds that survived into the output.
-    fn prettify_call_at(&self, i: usize, recv: Option<Box<Expr>>, name: String, args: Vec<Expr>) -> Expr {
+    fn prettify_call_at(
+        &self,
+        i: usize,
+        recv: Option<Box<Expr>>,
+        name: String,
+        args: Vec<Expr>,
+    ) -> Expr {
         let e = self.prettify_call(recv, name, args);
         if !matches!(e, Expr::Call { .. }) {
             self.property_fold_sites.borrow_mut().insert(i);
@@ -3296,11 +5440,7 @@ impl<'a> MethodCtx<'a> {
 
     /// Statement form of setter calls: obj.set_X(v) → obj.X = v;
     /// Type.set_X(v) → Type.X = v.
-    fn prettify_setter_stmt(
-        &self,
-        m: &super::types::MethodRef,
-        ops: &[Operand],
-    ) -> Option<Stmt> {
+    fn prettify_setter_stmt(&self, m: &super::types::MethodRef, ops: &[Operand]) -> Option<Stmt> {
         let prop = m.name.strip_prefix("set_")?;
         if prop.is_empty() || m.sig.params.len() != 1 {
             return None;
@@ -3388,13 +5528,33 @@ impl<'a> MethodCtx<'a> {
             .into_iter()
             .map(|a| a.unwrap_or(Expr::MissingAbiArg))
             .collect();
+        
+        // If this is a raise helper call, extract the message string if present
+        if !indirect {
+            if let Some(role) = crate::recovery::runtime_helpers::role_of(target) {
+                if matches!(role, crate::recovery::runtime_helpers::RuntimeHelper::RaiseException) {
+                    // Look for a string literal in the args (typically the second arg)
+                    for arg in &args {
+                        if let Expr::Str(s) = arg {
+                            crate::recovery::runtime_helpers::note_raise_message(target, s.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
         let ret = insn
             .dest_type
             .as_ref()
             .and_then(csharp_type)
             .filter(|t| t != "void");
         let expr = if indirect {
-            Expr::Call { recv: None, name: format!("fnptr_{:#x}", insn.address), args }
+            Expr::Call {
+                recv: None,
+                name: format!("fnptr_{:#x}", insn.address),
+                args,
+            }
         } else {
             Expr::RawCall(target, args, ret)
         };
@@ -3434,6 +5594,12 @@ impl<'a> MethodCtx<'a> {
         let prev = self.cur_insn.replace(i);
         let out = self.boundary_stmts_inner(i);
         self.cur_insn.set(prev);
+        if crate::recovery::env_flags::flag("ILR_STMDBG") {
+            let b = self.block_of_insn.as_ref().and_then(|m| m.get(i).copied());
+            for s in &out {
+                eprintln!("[stm] b={:?} i={i} {:?}", b, s);
+            }
+        }
         if CALLTRACE.with(|c| c.get()) && Self::call_op(&self.insns[i]) {
             eprintln!(
                 "[calltrace] i={} {:#x} {:?} target={:?} stmts={} void={} dest_local={:?} reads={:?}",
@@ -3444,10 +5610,10 @@ impl<'a> MethodCtx<'a> {
                 out.len(),
                 Self::call_result_is_void(&self.insns[i]),
                 self.insns[i].dest().and_then(|d| d.as_local()),
-                self.insns[i]
-                    .dest()
-                    .and_then(|d| d.as_local())
-                    .map(|d| (self.is_multi(d), self.read_count.get(&d).copied().unwrap_or(0))),
+                self.insns[i].dest().and_then(|d| d.as_local()).map(|d| (
+                    self.is_multi(d),
+                    self.read_count.get(&d).copied().unwrap_or(0)
+                )),
             );
         }
         out
@@ -3488,7 +5654,11 @@ impl<'a> MethodCtx<'a> {
                     .iter()
                     .map(|o| self.operand_expr(o, 1))
                     .collect();
-                let expr = Expr::Call { recv, name: fname, args };
+                let expr = Expr::Call {
+                    recv,
+                    name: fname,
+                    args,
+                };
                 // The result must be bound whenever a use site will reference
                 // the name — multi-def OR read at more than one site (see
                 // `call_dest_binding`).
@@ -3593,14 +5763,47 @@ impl<'a> MethodCtx<'a> {
                 // (b): read, but not bindable. The use site expands the call.
                 vec![]
             }
+            Op::NewObj(ty) => {
+                // The allocation must exist as a STATEMENT. `inline_local_at`
+                // deliberately refuses to inline a `NewObj` at a use site (a
+                // second `new` would allocate a second object and abandon the
+                // first), so every reader references the name — and with no
+                // statement the name is undefined. That was the whole
+                // `def-dropped:NewObj` class: `return this.Set<object>(v62);`
+                // with no `v62 = new JSONObject();` anywhere.
+                //
+                // Emitting it here also feeds `normalize_ctor_calls`, which
+                // merges this allocation with the `v..ctor(args)` that follows
+                // it into the source's `v = new T(args)`.
+                let Some(d) = insn.dest().and_then(|d| d.as_local()) else {
+                    return vec![];
+                };
+                if !self.call_result_is_consumed(d) {
+                    // Nobody reads the object: a bare allocation is not a C#
+                    // statement, and an unread `new` has no observable effect
+                    // the text can express.
+                    return vec![];
+                }
+                let tname = ty
+                    .as_ref()
+                    .map(|t| expand_arity(&t.ty.name))
+                    .unwrap_or_else(|| "object".into());
+                vec![Stmt::Assign(
+                    self.var_name(d),
+                    None,
+                    Expr::NewObj(tname, vec![]),
+                )]
+            }
             Op::Return => {
-                if std::env::var("ILR_RETDBG").is_ok() {
+                if crate::recovery::env_flags::flag("ILR_RETDBG") {
                     if let Some(Operand::Local(v)) = insn.operands.first() {
-                        let bi = self.block_of_insn.as_deref().and_then(|m| m.get(i).copied());
+                        let bi = self
+                            .block_of_insn
+                            .as_deref()
+                            .and_then(|m| m.get(i).copied());
                         let brange = bi.and_then(|b| self.blocks_range.get(b).copied());
-                        let in_entry = bi.and_then(|b| {
-                            self.reaching.get(b).and_then(|m| m.get(v).copied())
-                        });
+                        let in_entry =
+                            bi.and_then(|b| self.reaching.get(b).and_then(|m| m.get(v).copied()));
                         eprintln!(
                             "[retdbg] i={} v={} multi={} varreads={} cur={} reach={:?} defsites={:?} blk={:?} range={:?} in={:?}",
                             i,
@@ -3617,11 +5820,13 @@ impl<'a> MethodCtx<'a> {
                     }
                 }
                 let e = match insn.operands.first() {
-                    Some(op @ (Operand::Local(_)
-                    | Operand::Immediate(_)
-                    | Operand::StringLiteral { .. }
-                    | Operand::FloatLiteral(_)
-                    | Operand::DoubleLiteral(_))) => self.operand_expr(op, 0),
+                    Some(
+                        op @ (Operand::Local(_)
+                        | Operand::Immediate(_)
+                        | Operand::StringLiteral { .. }
+                        | Operand::FloatLiteral(_)
+                        | Operand::DoubleLiteral(_)),
+                    ) => self.operand_expr(op, 0),
                     Some(Operand::Field(f)) => {
                         let recv = if self.in_declaring_chain(f.type_def_index) {
                             Some(Expr::This)
@@ -3702,12 +5907,16 @@ impl<'a> MethodCtx<'a> {
                     }
                     return vec![Stmt::Return(None)];
                 }
-                if std::env::var("ILR_RET").is_ok() {
+                if crate::recovery::env_flags::flag("ILR_RET") {
                     let mut s = String::new();
                     e.render(&mut s);
                     eprintln!("[ret] void={} expr={:?} text={}", self.ret_is_void, e, s);
                 }
-                vec![Stmt::Return(if matches!(e, Expr::Null) { None } else { Some(e) })]
+                vec![Stmt::Return(if matches!(e, Expr::Null) {
+                    None
+                } else {
+                    Some(e)
+                })]
             }
             Op::Throw => {
                 let e = insn
@@ -3723,10 +5932,15 @@ impl<'a> MethodCtx<'a> {
             // vanishes — loop bodies holding only arithmetic rendered empty
             // (`// loop body not recovered`) because no statement was ever
             // emitted for `v = v - 1`-class defs.
-            Op::Arith(_) | Op::FloatArith(_) | Op::Not | Op::Negate | Op::Convert(_)
-            | Op::MulAcc { .. } | Op::Clz | Op::LoadLength | Op::Select(_) => {
-                self.value_def_stmt(i)
-            }
+            Op::Arith(_)
+            | Op::FloatArith(_)
+            | Op::Not
+            | Op::Negate
+            | Op::Convert(_)
+            | Op::MulAcc { .. }
+            | Op::Clz
+            | Op::LoadLength
+            | Op::Select(_) => self.value_def_stmt(i),
             Op::Move => {
                 // stores: into multi-def locals, or into memory (field stores)
                 let d = insn.operands.first();
@@ -3766,7 +5980,11 @@ impl<'a> MethodCtx<'a> {
                             let needs_copy = d
                                 .as_ref()
                                 .and_then(|o| o.as_local())
-                                .map(|v| self.var_reads.contains(&v) && v < u32::MAX - 2)
+                                .map(|v| {
+                                    v < u32::MAX - 2
+                                        && (self.var_reads.contains(&v)
+                                            || self.stack_cell_address_is_used(v))
+                                })
                                 .unwrap_or(false);
 
                             if !needs_copy {
@@ -3786,7 +6004,9 @@ impl<'a> MethodCtx<'a> {
                     // rendered as an empty `do { } while (…)` — an infinite
                     // loop with the update thrown away.
                     Some(Operand::Local(v))
-                        if self.is_multi(*v) || self.var_reads.contains(v) =>
+                        if self.is_multi(*v)
+                            || self.var_reads.contains(v)
+                            || self.stack_cell_address_is_used(*v) =>
                     {
                         let e = match insn.operands.get(1) {
                             Some(Operand::Field(f)) => {
@@ -3881,36 +6101,81 @@ impl<'a> MethodCtx<'a> {
                         // body `result = new SafeStringMarshal(str, false)` —
                         // rendered as `return v11;`.
                         match insn.operands.first() {
-                            Some(Operand::Memory { base, addend, index, scale, width, .. }) => {
-                                // Typed managed-class store: name the member.
-                                let base_ty = base
-                                    .as_local()
-                                    .and_then(|v| self.table.index_of.get(&v))
-                                    .map(|&li| &self.table.infos[li].ty);
-                                if let Some(ManagedType::Class(nt)) = base_ty {
-                                    if nt.type_def_index >= 0 {
-                                        return vec![Stmt::Comment(format!(
-                                            "store to {}.{}+{addend:#x}",
-                                            nt.name,
-                                            ""
-                                        ))];
-                                    }
-                                }
+                            Some(Operand::Memory {
+                                base,
+                                addend,
+                                index,
+                                scale,
+                                width,
+                                ..
+                            }) => {
+                                // A typed managed-class base used to emit only a
+                                // `// store to Type.+0xNN` COMMENT and drop the
+                                // store. The comment held nothing: the value
+                                // chain was lost. Emit the real store; a later
+                                // metadata pass names it `base.Field`.
                                 // Frame spills are ABI plumbing, not source:
                                 // keep dropping stores whose base is `sp`.
-                                let base_expr = self.mem_addr_expr(base, index.as_deref(), *scale, 1);
+                                let base_expr =
+                                    self.mem_addr_expr(base, index.as_deref(), *scale, 1);
                                 let mut btxt = String::new();
                                 base_expr.render(&mut btxt);
-                                if btxt == "sp" || btxt.starts_with("sp ") || btxt.starts_with("sp+") {
+                                if btxt == "sp"
+                                    || btxt.starts_with("sp ")
+                                    || btxt.starts_with("sp+")
+                                {
                                     return vec![];
                                 }
-                                let value =
-                                    self.operand_expr(insn.operands.get(1).unwrap_or(&Operand::Unknown), 0);
+                                let value = self.operand_expr(
+                                    insn.operands.get(1).unwrap_or(&Operand::Unknown),
+                                    0,
+                                );
                                 if matches!(value, Expr::Unknown) {
                                     return vec![]; // dead default store — pure noise
                                 }
                                 let mut lhs = String::new();
-                                Expr::RawDeref(Box::new(base_expr), *addend, *width).render(&mut lhs);
+                                // A four-byte access is not necessarily an
+                                // integer access. HFA lanes (Vector2/3/4, etc.)
+                                // are stored with STR S and must render as
+                                // `float*`; using the width alone produced
+                                // `*(int*)&position + 4 = position.y`, which
+                                // obscured the actual aggregate copy.
+                                let rhs_ty = insn.operands.get(1).and_then(|src| match src {
+                                    Operand::Register(name) if name.starts_with("vs") => {
+                                        Some("float")
+                                    }
+                                    Operand::Local(v) => self
+                                        .table
+                                        .index_of
+                                        .get(v)
+                                        .map(|&li| &self.table.infos[li].ty)
+                                        .and_then(|ty| match ty {
+                                            ManagedType::Primitive(PrimKind::R4) => Some("float"),
+                                            _ => None,
+                                        }),
+                                    _ => None,
+                                });
+                                if *width == 4 && rhs_ty == Some("float") {
+                                    lhs.push_str("*(float*)(");
+                                    if matches!(&base_expr, Expr::Int(0)) {
+                                        lhs.push_str(&format!("{:#x}", *addend as u64));
+                                    } else if *addend != 0
+                                        && matches!(&base_expr, Expr::AddressOf(_))
+                                    {
+                                        lhs.push_str("(nint)");
+                                        base_expr.render(&mut lhs);
+                                        lhs.push_str(&format!(" {addend:+}"));
+                                    } else {
+                                        base_expr.render(&mut lhs);
+                                        if *addend != 0 {
+                                            lhs.push_str(&format!(" {addend:+}"));
+                                        }
+                                    }
+                                    lhs.push(')');
+                                } else {
+                                    Expr::RawDeref(Box::new(base_expr), *addend, *width)
+                                        .render(&mut lhs);
+                                }
                                 vec![Stmt::Assign(lhs, None, value)]
                             }
                             _ => vec![],
@@ -3984,10 +6249,55 @@ impl<'a> MethodCtx<'a> {
                             out.insert(v);
                             continue;
                         }
-                        if (self.def_rewrites_the_name_it_assigns(d)
-                            && !self.def_chain_has_call(d))
-                            || (self.def_moved_across_a_write(d, u)
-                                && !self.def_chain_has_call(d))
+                        if (self.def_rewrites_the_name_it_assigns(d) && !self.def_chain_has_call(d))
+                            || (self.def_moved_across_a_write(d, u) && !self.def_chain_has_call(d))
+                        {
+                            out.insert(v);
+                            continue;
+                        }
+                        // A def read cross-block does NOT automatically need
+                        // materialization: the old blanket refusal here (25% of
+                        // over-materialization) assumed other reads of the same
+                        // def would lose their assignment. That concern is already
+                        // handled by the read_count check below. What cross-block
+                        // actually adds is a STALENESS risk — an input local
+                        // rewritten in an intermediate block makes the expression
+                        // evaluate differently at the use. `def_moved_across_a_write`
+                        // only checks the def's own block; we extend the check to
+                        // any multi-def input that has a def OUTSIDE the def's own
+                        // block. If every local the def transitively reads is either
+                        // single-def or multi-def-only-within-the-def's-block, the
+                        // expression is stable everywhere and cross-block inline is
+                        // safe.
+                        let cross_block = self
+                            .block_of_insn
+                            .as_ref()
+                            .is_some_and(|m| {
+                                let bd = m.get(d).copied().unwrap_or(usize::MAX);
+                                let bu = m.get(u).copied().unwrap_or(usize::MAX);
+                                bd != bu && bd != usize::MAX && bu != usize::MAX
+                            });
+                        if cross_block && !self.def_chain_has_call(d) {
+                            if self.def_inputs_stable(d) {
+                                // Expression is value-stable across all reachable
+                                // paths; fall through to the read_count check.
+                            } else {
+                                out.insert(v);
+                                continue;
+                            }
+                        }
+                        // A def read by multiple sites must be materialized —
+                        // UNLESS the expression is stable everywhere (`def_inputs_stable`)
+                        // or cheap to duplicate (`def_is_trivially_duplicable`).
+                        // When every input local is value-stable, re-expanding
+                        // the def at each read site yields the same value every
+                        // time — the shared_large cap already protects against
+                        // pathological expression growth.
+                        let read_count = self.read_count.get(&v).copied().unwrap_or(0);
+                        if read_count > 1
+                            && !self.def_chain_has_call(d)
+                            && !self.def_is_trivially_duplicable(d)
+                            && !self.def_inputs_stable(d)
                         {
                             out.insert(v);
                         }
@@ -4003,9 +6313,13 @@ impl<'a> MethodCtx<'a> {
     /// (dead default store) or the local is never read as a bare variable
     /// (every use inlines the def, so a statement would duplicate it).
     fn value_def_stmt(&self, i: usize) -> Vec<Stmt> {
-        let Some(Operand::Local(v)) = self.insns[i].dest() else { return vec![] };
+        let Some(Operand::Local(v)) = self.insns[i].dest() else {
+            return vec![];
+        };
         let v = *v;
-        if v >= u32::MAX - 2 || !self.var_reads.contains(&v) {
+        if v >= u32::MAX - 2
+            || (!self.var_reads.contains(&v) && !self.stack_cell_address_is_used(v))
+        {
             return vec![];
         }
         let e = self.def_expr(i, 0);
@@ -4015,6 +6329,25 @@ impl<'a> MethodCtx<'a> {
         let name = self.def_var_name(v);
 
         vec![Stmt::Assign(name, None, e)]
+    }
+
+    /// A stack cell's initializer is observable when its address is taken or
+    /// when a later Memory operand uses it as the stack-base identity. Such a
+    /// use deliberately does not inline the cell's value, so the definition
+    /// must be emitted even if it is not otherwise read as a C# variable.
+    fn stack_cell_address_is_used(&self, v: u32) -> bool {
+        if !self.is_stack_local(v) {
+            return false;
+        }
+        self.insns.iter().any(|insn| {
+            insn.operands.iter().any(|op| match op {
+                Operand::AddressOf(inner) => matches!(inner.as_ref(), Operand::Local(n) if *n == v),
+                Operand::Memory { base, .. } => {
+                    matches!(base.as_ref(), Operand::Local(n) if *n == v)
+                }
+                _ => false,
+            })
+        })
     }
 }
 
@@ -4050,6 +6383,11 @@ struct StructuredCfg {
     /// Immediate post-dominator per block (None for exit / unreachable-to-exit).
     /// The ipdom of a branch header IS its merge point — exact, no step limits.
     ipdom: Vec<Option<usize>>,
+    /// Block predecessors (inverted `full_succ`), used by `emit_if` to tell a
+    /// genuinely-dead merge (every other path into it also terminates) from a
+    /// merge still reachable via a sibling/goto, so suppressing the trailing
+    /// continuation never drops live code.
+    preds: Vec<Vec<usize>>,
 }
 
 /// Reaching-definitions analysis over the lifted IR (Cytron-style,
@@ -4084,7 +6422,9 @@ fn reaching_def_at_free(
         return None;
     }
     let bi = cfg_blocks[use_insn];
-    let Some(&block) = blocks_range.get(bi) else { return None };
+    let Some(&block) = blocks_range.get(bi) else {
+        return None;
+    };
     // scan the block up to the use: a def between start and use wins
     let mut def: Option<usize> = in_sets.get(bi).and_then(|m| m.get(&v).copied());
     for i in block.0..block.1.min(use_insn + 1) {
@@ -4174,6 +6514,103 @@ fn count_address_escapes(op: &Operand) {
     }
 }
 
+/// Every local whose storage is addressed by an operand (`&local` or
+/// `&*(local)`), recursively. Mirrors `passes::collect_addressed_locals`:
+/// such a local is a mutable cell, never a pure value.
+/// Locals whose address is used as the hidden sret buffer of a call that
+/// returns a value. A struct returned through memory is a buffer, not a
+/// pointer cell: accesses like `[buffer + 16]` are fields of the struct, so
+/// they must keep their `&` (`&enumerator + 16`), not be printed as if the
+/// buffer's VALUE were an object pointer.
+fn collect_sret_buffers(insns: &[Insn]) -> HashSet<u32> {
+    let mut ptr_cells: HashMap<u32, u32> = HashMap::new();
+    for insn in insns {
+        if insn.op != Op::Move {
+            continue;
+        }
+        if let (Some(Operand::Local(p)), Some(Operand::AddressOf(inner))) =
+            (insn.operands.first(), insn.operands.get(1))
+        {
+            if let Operand::Local(c) = inner.as_ref() {
+                ptr_cells.insert(*p, *c);
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    for insn in insns {
+        if !matches!(insn.op, Op::Call) {
+            continue;
+        }
+        let Some(Operand::Method(m)) = insn.operands.first() else {
+            continue;
+        };
+        if matches!(
+            m.sig.ret,
+            ManagedType::Primitive(PrimKind::Void) | ManagedType::Unknown
+        ) {
+            continue;
+        }
+        let Some(last) = insn.operands.last() else {
+            continue;
+        };
+        match last {
+            Operand::Local(p) => {
+                if let Some(c) = ptr_cells.get(p) {
+                    out.insert(*c);
+                }
+            }
+            Operand::AddressOf(inner) => {
+                if let Operand::Local(c) = inner.as_ref() {
+                    out.insert(*c);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn collect_address_taken(insns: &[Insn]) -> HashSet<u32> {
+    fn walk(op: &Operand, out: &mut HashSet<u32>) {
+        match op {
+            Operand::AddressOf(inner) => {
+                match inner.as_ref() {
+                    Operand::Local(v) => {
+                        out.insert(*v);
+                    }
+                    Operand::Memory { base, .. } => {
+                        if let Operand::Local(v) = base.as_ref() {
+                            out.insert(*v);
+                        }
+                    }
+                    _ => {}
+                }
+                walk(inner, out);
+            }
+            Operand::ArrayLength(inner) => walk(inner, out),
+            Operand::Memory { base, index, .. } => {
+                walk(base, out);
+                if let Some(i) = index {
+                    walk(i, out);
+                }
+            }
+            Operand::ArrayAccess { array, index } => {
+                walk(array, out);
+                walk(index, out);
+            }
+            Operand::InstanceField { base, .. } => walk(base, out),
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for insn in insns {
+        for op in &insn.operands {
+            walk(op, &mut out);
+        }
+    }
+    out
+}
+
 /// Locals that must be MATERIALISED rather than copied into every use: a
 /// single-def local read more than once whose inlined expansion reaches
 /// `limit` expression nodes. See [`SHARED_EXPR_NODES`] for the failure this
@@ -4219,8 +6656,8 @@ pub(crate) fn compute_shared_large(
             let mut ls: Vec<u32> = Vec::new();
             op.uses(&mut ls);
             for w in ls {
-                total = total
-                    .saturating_add(size_of(w, insns, defs, multi_def, memo, on_stack, limit));
+                total =
+                    total.saturating_add(size_of(w, insns, defs, multi_def, memo, on_stack, limit));
                 if total >= limit {
                     break 'outer;
                 }
@@ -4237,7 +6674,15 @@ pub(crate) fn compute_shared_large(
         if read_count.get(&v).copied().unwrap_or(0) < 2 {
             continue;
         }
-        let s = size_of(v, insns, defs, multi_def, &mut memo, &mut HashSet::new(), limit);
+        let s = size_of(
+            v,
+            insns,
+            defs,
+            multi_def,
+            &mut memo,
+            &mut HashSet::new(),
+            limit,
+        );
         if s >= limit {
             out.insert(v);
         }
@@ -4292,7 +6737,8 @@ fn compute_var_reads(
             if !multi_def.contains(&v) {
                 continue;
             }
-            if reaching_def_at_free(insns, in_sets, blocks_range, Some(block_of_insn), v, i).is_some()
+            if reaching_def_at_free(insns, in_sets, blocks_range, Some(block_of_insn), v, i)
+                .is_some()
             {
                 continue; // that use inlines its def — no bare-variable read
             }
@@ -4327,7 +6773,9 @@ fn pure_alias_root(insns: &[Insn], def_sites: &HashMap<u32, Vec<usize>>, v: u32)
             if !matches!(insn.op, Op::Move) {
                 return None;
             }
-            let Some(Operand::Local(w)) = insn.operands.get(1) else { return None };
+            let Some(Operand::Local(w)) = insn.operands.get(1) else {
+                return None;
+            };
             match src {
                 None => src = Some(*w),
                 Some(s) if s == *w => {}
@@ -4342,21 +6790,43 @@ fn pure_alias_root(insns: &[Insn], def_sites: &HashMap<u32, Vec<usize>>, v: u32)
     }
 }
 
-fn compute_reaching_definitions(insns: &[Insn]) -> ReachingResult {
-    let cfg = super::ssa::rebuild_cfg(insns);
-    let n_blocks = cfg.blocks.len();
-    let blocks_range: Vec<(usize, usize)> = cfg
-        .blocks
-        .iter()
-        .map(|b| (b.start, b.end))
-        .collect();
+fn compute_reaching_definitions(
+    insns: &[Insn],
+    pre: Option<(&[BlockInfo], &[Vec<usize>])>,
+) -> ReachingResult {
+    // `analyze_blocks` already built this exact CFG for the same listing; its
+    // `full_succ` is `rebuild_cfg().successors` filtered to real blocks (the
+    // filter is identity for a well-formed CFG, and preds[] indexing below
+    // requires that). Reusing it removes one CFG rebuild per method AND the
+    // second `block_of` pass — output identical, the sets are the same.
+    let owned_cfg = if pre.is_none() {
+        Some(super::ssa::rebuild_cfg(insns))
+    } else {
+        None
+    };
+    let (n_blocks, blocks_range, successors): (usize, Vec<(usize, usize)>, &[Vec<usize>]) =
+        match pre {
+            Some((blocks, succ)) => (
+                blocks.len(),
+                blocks.iter().map(|b| (b.start, b.end)).collect(),
+                succ,
+            ),
+            None => {
+                let c = owned_cfg.as_ref().unwrap();
+                (
+                    c.blocks.len(),
+                    c.blocks.iter().map(|b| (b.start, b.end)).collect(),
+                    &c.successors,
+                )
+            }
+        };
 
     // GEN/OUT per block: the LAST def per version inside the block. A block
     // that defines `v` kills every other def of `v` on exit.
     let mut out_sets: Vec<HashMap<u32, usize>> = vec![HashMap::new(); n_blocks];
     let mut has_def: Vec<HashSet<u32>> = vec![HashSet::new(); n_blocks];
-    for (bi, b) in cfg.blocks.iter().enumerate() {
-        for i in b.start..b.end {
+    for (bi, &(start, end)) in blocks_range.iter().enumerate() {
+        for i in start..end {
             if let Some(Some(d)) = insns[i].dest().map(|d| d.as_local()) {
                 out_sets[bi].insert(d, i);
                 has_def[bi].insert(d);
@@ -4366,7 +6836,7 @@ fn compute_reaching_definitions(insns: &[Insn]) -> ReachingResult {
 
     // predecessors from successor lists
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n_blocks];
-    for (bi, succs) in cfg.successors.iter().enumerate() {
+    for (bi, succs) in successors.iter().enumerate() {
         for &s in succs {
             if !preds[s].contains(&bi) {
                 preds[s].push(bi);
@@ -4394,6 +6864,14 @@ fn compute_reaching_definitions(insns: &[Insn]) -> ReachingResult {
     // the shared local was not even materialized as a variable.
     let gen_sets = out_sets.clone();
     let mut in_sets: Vec<HashMap<u32, usize>> = vec![HashMap::new(); n_blocks];
+    // Buffer reuse: the previous per-pass shape allocated one clone of every
+    // block's IN map plus one fresh map per IN recompute, every pass, for
+    // every method. `compute_reaching_definitions` measured as ~29 ms/method
+    // (the dominant part of MethodCtx::build). `clone_from` and the swap
+    // scratch keep the SAME states and merge order — only the allocations
+    // are reused.
+    let mut scratch: Vec<HashMap<u32, usize>> = vec![HashMap::new(); n_blocks];
+    let mut conflicted: Vec<u32> = Vec::new();
     let mut changed = true;
     let mut iter_budget = 64usize; // hard cap: CFGs are small, this never hits
     while changed && iter_budget > 0 {
@@ -4402,15 +6880,16 @@ fn compute_reaching_definitions(insns: &[Insn]) -> ReachingResult {
         // OUT is a pure function of IN — recompute it every pass so a pass
         // never meets over the previous pass's stale OUT.
         for bi in 0..n_blocks {
-            let mut out = in_sets[bi].clone();
+            let out = &mut out_sets[bi];
+            out.clone_from(&in_sets[bi]);
             for (&v, &d) in &gen_sets[bi] {
                 out.insert(v, d);
             }
-            out_sets[bi] = out;
         }
         for bi in 0..n_blocks {
-            let mut new_in: HashMap<u32, usize> = HashMap::new();
-            let mut conflicted: HashSet<u32> = HashSet::new();
+            let new_in = &mut scratch[bi];
+            new_in.clear();
+            conflicted.clear();
             for &p in &preds[bi] {
                 for (&v, &d) in &out_sets[p] {
                     if conflicted.contains(&v) {
@@ -4419,7 +6898,7 @@ fn compute_reaching_definitions(insns: &[Insn]) -> ReachingResult {
                     match new_in.get(&v) {
                         Some(&old) if old != d => {
                             new_in.remove(&v);
-                            conflicted.insert(v);
+                            conflicted.push(v);
                         }
                         Some(_) => {}
                         None => {
@@ -4432,14 +6911,17 @@ fn compute_reaching_definitions(insns: &[Insn]) -> ReachingResult {
             for &v in &has_def[bi] {
                 new_in.remove(&v);
             }
-            if new_in != in_sets[bi] {
-                in_sets[bi] = new_in;
+            if *new_in != in_sets[bi] {
+                std::mem::swap(&mut in_sets[bi], new_in);
                 changed = true;
             }
         }
     }
 
-    ReachingResult { blocks: blocks_range, gen_kill_in: in_sets }
+    ReachingResult {
+        blocks: blocks_range,
+        gen_kill_in: in_sets,
+    }
 }
 
 fn analyze_blocks(insns: &[Insn]) -> StructuredCfg {
@@ -4540,8 +7022,7 @@ fn analyze_blocks(insns: &[Insn]) -> StructuredCfg {
             // FULL n-way successor set — the old pair-based shape silently
             // truncated 3+ edges to the same target, skewing post-dominators
             // for switch-heavy methods.
-            let mut succs: Vec<usize> =
-                succs_of.iter().copied().filter(|&t| t < n).collect();
+            let mut succs: Vec<usize> = succs_of.iter().copied().filter(|&t| t < n).collect();
             if succs.is_empty() {
                 succs.push(n); // edge to virtual exit
             }
@@ -4552,7 +7033,12 @@ fn analyze_blocks(insns: &[Insn]) -> StructuredCfg {
         s
     };
     let rev_cfg = super::cfg::Cfg {
-        blocks: (0..=n).map(|i| super::cfg::Block { start: i, end: i + 1 }).collect(),
+        blocks: (0..=n)
+            .map(|i| super::cfg::Block {
+                start: i,
+                end: i + 1,
+            })
+            .collect(),
         successors: rev_succs,
     };
     // ipdom[b] = idom of b in the reversed graph whose ROOT is the virtual
@@ -4567,18 +7053,29 @@ fn analyze_blocks(insns: &[Insn]) -> StructuredCfg {
         ipdom[b] = rev_dom.idom.get(b).copied().flatten().filter(|&d| d < n);
     }
 
+    let full_succ: Vec<Vec<usize>> = cfg
+        .successors
+        .iter()
+        .map(|s| s.iter().copied().filter(|&t| t < n).collect())
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, ss) in full_succ.iter().enumerate() {
+        for &t in ss {
+            if !preds[t].contains(&i) {
+                preds[t].push(i);
+            }
+        }
+    }
+
     StructuredCfg {
         blocks,
         block_of,
-        full_succ: cfg
-            .successors
-            .iter()
-            .map(|s| s.iter().copied().filter(|&t| t < n).collect())
-            .collect(),
+        full_succ,
         labels,
         label_names,
         idom: dom_info.idom,
         ipdom,
+        preds,
     }
 }
 
@@ -4656,6 +7153,7 @@ fn find_loops(sc: &StructuredCfg) -> HashMap<usize, LoopInfo> {
     loops
 }
 
+#[derive(Clone)]
 struct LoopInfo {
     body: HashSet<usize>,
     latches: Vec<usize>,
@@ -4719,6 +7217,25 @@ fn pad_root(sc: &StructuredCfg, insns: &[Insn], mut b: usize) -> usize {
     b
 }
 
+/// A region whose chain is a single untyped catch is NOT a C# catch.
+///
+/// IL2CPP implements a managed `catch` as `catch (Il2CppExceptionWrapper)`
+/// plus a cleanup arm, so every real catch has a TYPED arm. A chain with no
+/// typed arm is the compiler's terminate guard: it wraps the calls inside a
+/// cleanup so an exception escaping them calls `std::terminate` instead of
+/// unwinding out of the frame. Folding such a row produced `catch { … }`
+/// around code that in fact terminates the process.
+///
+/// Measured on libil2cpp.so: 1,645 of the 9,233 handler rows have this chain,
+/// and every one of them names a pad whose only call is 0x116f18c
+/// (`__cxa_begin_catch; std::terminate`).
+fn is_terminate_guard(r: &super::exceptions::EhRegion) -> bool {
+    !r.chain.is_empty()
+        && r.chain
+            .iter()
+            .all(|c| matches!(c, super::exceptions::Clause::CatchAll))
+}
+
 /// Merge the per-call-site EH rows that describe ONE `try`.
 ///
 /// A `try` holding several throw-capable calls has one call-site table ROW PER
@@ -4731,10 +7248,16 @@ fn pad_root(sc: &StructuredCfg, insns: &[Insn], mut b: usize) -> usize {
 /// `GetExistingParameters` @0x12EA65C, where 5 rows fragmented the enumerator
 /// loop into 5 detached try blocks.
 ///
-/// Two rows merge when they name the same action, their ranges are disjoint and
-/// ordered (so no control flow is reordered), and their pads form ONE
-/// contiguous trampoline fan-in onto a single handler. Rows that merely sit near
-/// each other but land on different handlers are left alone.
+/// Two rows belong to the same try when they name the SAME action chain and
+/// their pads resolve to the SAME handler block. The rows of one try are not
+/// necessarily adjacent in the table (a compiler interleaves the terminate
+/// guard's rows with the catch's), so rows are GROUPED by that key first and
+/// only then merged in address order — merging adjacent-in-table rows left the
+/// interleaved rows as separate groups, which is why the first version of this
+/// fix raised the try count instead of lowering it.
+///
+/// The result is ordered by try start, so the structurer sees the regions in
+/// address order and `region_of_block`'s last-writer-wins keeps the innermost.
 fn merge_eh_regions(
     regions: &[super::exceptions::EhRegion],
     sc: &StructuredCfg,
@@ -4743,68 +7266,72 @@ fn merge_eh_regions(
     if regions.len() < 2 {
         return regions.to_vec();
     }
-    let mut out: Vec<super::exceptions::EhRegion> = Vec::with_capacity(regions.len());
+    // (chain, handler root) → the hull of the rows that share them.
+    let mut groups: Vec<(Vec<super::exceptions::Clause>, usize, super::exceptions::EhRegion)> =
+        Vec::new();
     for r in regions {
-        if let Some(prev) = out.last_mut() {
-            if let Some(merged) = merge_eh_pair(prev, r, sc, insns) {
-                *prev = merged;
-                continue;
-            }
+        let root = block_containing_addr(sc, insns, r.landing_pad)
+            .map(|b| pad_root(sc, insns, b))
+            // A pad outside every block cannot be shown to share a handler, so
+            // it is never merged.
+            .unwrap_or(usize::MAX);
+        // Rows of one try are address-ordered. Fusing an OVERLAPPING pair
+        // would reorder control flow (the hull would claim coverage the
+        // table does not give), so a row may only extend a group it starts
+        // at or after.
+        if let Some(g) = groups
+            .iter_mut()
+            .find(|g| g.0 == r.chain && g.1 == root && r.try_start >= g.2.try_end)
+        {
+            g.2.try_start = g.2.try_start.min(r.try_start);
+            g.2.try_end = g.2.try_end.max(r.try_end);
+            continue;
         }
-        out.push(r.clone());
+        groups.push((r.chain.clone(), root, r.clone()));
     }
+    let mut out: Vec<super::exceptions::EhRegion> = groups.into_iter().map(|g| g.2).collect();
+    out.sort_by_key(|r| (r.try_start, r.try_end));
     out
-}
-
-fn merge_eh_pair(
-    prev: &super::exceptions::EhRegion,
-    r: &super::exceptions::EhRegion,
-    sc: &StructuredCfg,
-    insns: &[Insn],
-) -> Option<super::exceptions::EhRegion> {
-    // Same action, and the ranges must not overlap or reorder control flow.
-    if prev.is_cleanup != r.is_cleanup || prev.catches != r.catches || prev.try_end > r.try_start {
-        return None;
-    }
-    let (Some(pb), Some(rb)) = (
-        block_containing_addr(sc, insns, prev.landing_pad),
-        block_containing_addr(sc, insns, r.landing_pad),
-    ) else {
-        return None;
-    };
-    if pb == rb {
-        // Two rows, one pad block: unambiguously one try.
-        return Some(super::exceptions::EhRegion {
-            try_start: prev.try_start,
-            try_end: r.try_end,
-            landing_pad: prev.landing_pad,
-            catches: prev.catches.clone(),
-            is_cleanup: prev.is_cleanup,
-        });
-    }
-    let (lo, hi) = (pb.min(rb), pb.max(rb));
-    // A pad fan-in is local; a large span means these are two independent tries.
-    if hi - lo > 64 {
-        return None;
-    }
-    let root = pad_root(sc, insns, lo);
-    for b in lo..=hi {
-        if !is_pad_trampoline(sc, insns, b) || pad_root(sc, insns, b) != root {
-            return None;
-        }
-    }
-    Some(super::exceptions::EhRegion {
-        try_start: prev.try_start,
-        try_end: r.try_end,
-        landing_pad: prev.landing_pad,
-        catches: prev.catches.clone(),
-        is_cleanup: prev.is_cleanup,
-    })
 }
 
 // ---------------------------------------------------------------------------
 // Region structurer
 // ---------------------------------------------------------------------------
+
+/// Region boundary for the structured (goto-free) emitter.
+///
+/// A region is the code between an entry block and a boundary: the block that
+/// control reaches when the region completes normally (`follow`), the innermost
+/// loop header an edge may close (`header`), and that loop's single exit
+/// (`exit`, rendered as `break`). The three are distinct because an edge to
+/// the follow ends the region silently, an edge to the header is a
+/// `continue`, and an edge to the exit is a `break` — collapsing them was
+/// how a back edge turned into a fall-through.
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+struct StructCtx {
+    follow: Option<usize>,
+    header: Option<usize>,
+    exit: Option<usize>,
+    /// The entry block may be the region boundary: a loop whose header
+    /// carries interior code is walked FROM the header, which is also its
+    /// own follow.
+    force_entry: bool,
+}
+
+#[allow(dead_code)]
+impl StructCtx {
+    /// A region nested in this one, ending at `follow`. The enclosing loop
+    /// stays in scope: an edge out of a nested `if` still closes the loop.
+    fn child(self, follow: Option<usize>) -> Self {
+        Self {
+            follow,
+            header: self.header,
+            exit: self.exit,
+            force_entry: false,
+        }
+    }
+}
 
 struct Structurer<'a> {
     sc: &'a StructuredCfg,
@@ -4831,6 +7358,15 @@ struct Structurer<'a> {
     /// `emitted` is removed/re-added around loop bodies, so it cannot answer
     /// "did anything ever look at this block".
     visited: std::cell::RefCell<HashSet<usize>>,
+    /// Blocks whose text was actually emitted at least once (insert-only).
+    ///
+    /// `emitted` is the walk's emit-once guard and is deliberately REMOVED
+    /// for loop bodies (and probed-then-undone for handler pads), so it is
+    /// the wrong answer to "does this block have text?". Using `emitted` as
+    /// the coverage-repair candidate set re-rendered loop bodies as duplicate
+    /// flat regions (a `do { … } while (…)` followed by the same block as a
+    /// labelled repair region). This set is never cleared.
+    rendered: std::cell::RefCell<HashSet<usize>>,
     /// LOOP-FIRST routing map: any block → its enclosing loop header when
     /// that block is a loop body member. The region walker consults this
     /// BEFORE consuming a block linearly; stepping into a loop body without
@@ -4850,6 +7386,11 @@ struct Structurer<'a> {
     /// a try, whose handler re-entered again — 50k+ duplicated `try` blocks
     /// per method (mutual recursion capped only by the emission budget).
     in_handler: std::cell::Cell<bool>,
+    /// Stack of protected-block sets for the try bodies the TREE emitter is
+    /// inside. A try body may only walk its own protected blocks (plus the
+    /// block right after the region); anything else is an edge the tree
+    /// cannot own, and the region is refused instead of emitting code in the
+    /// wrong place.
     /// Region ordinal whose BODY is currently being walked. If arms inside
     /// a region re-entered the fold for the SAME region the tail re-rendered
     /// recursively (33k tries in one method). Nested regions map blocks to
@@ -4860,10 +7401,21 @@ struct Structurer<'a> {
     /// range), so `folding` alone cannot stop ALTERNATING ordinals from
     /// re-folding each other — one fold per ordinal, ever.
     folded: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// Label NAMES already written into this method's text.
+    ///
+    /// A block can be entered twice by the walk — the loop header is emitted
+    /// before its loop statement and again when the body pass re-walks it — and
+    /// both entries used to write the label. Two definitions of one name is
+    /// CS0140, i.e. output that cannot compile, so the second write is
+    /// suppressed: a jump to the name reaches the FIRST definition, which is
+    /// the same block and the same meaning.
+    labels_written: std::cell::RefCell<std::collections::HashSet<String>>,
     /// True for the binding-discovery walk, whose output is thrown away. The
     /// process-wide [`NEST_CAPS`] tally must not count that walk's truncations
     /// — the run summary would then report double the real number.
     discovery: bool,
+    /// Block the structured emitter was on when it refused (diagnostics).
+    /// Why the structured emitter refused (ILR_STRUCTDBG).
     /// True while the walk in progress is the BODY pass of a loop.
     ///
     /// A `return (out, Some(next))` from [`Structurer::emit_region`] promises
@@ -4881,6 +7433,19 @@ struct Structurer<'a> {
     /// region's normal exit and needs no `goto`; falling into any other stop
     /// block is a secondary exit and does.
     loop_body_exit: std::cell::Cell<Option<usize>>,
+    /// Secondary loop exits carried by [`Structurer::bail_out_of_region`].
+    ///
+    /// Inside a loop body a fall into any stop block other than `exit_blk` is
+    /// emitted as a `goto` to that block. The goto alone left the target's
+    /// CODE owned by nobody: `emit_loop` resumed at its own exit, the target
+    /// was only "visited" (not emitted), and the coverage repair finally
+    /// rendered it FLAT after the method — reported as an entry-reachable
+    /// region "not structured". Each entry records the target block together
+    /// with the `goto` that jumps to it, in emission order. The owning
+    /// `emit_loop` drains the slice recorded during its body pass and
+    /// structures those targets (with the real loop map) right after the loop
+    /// statement, so the secondary arm renders where it belongs.
+    bailed_exits: std::cell::RefCell<Vec<(usize, Stmt)>>,
     /// While the BODY of a loop whose HEADER carries interior code (rather
     /// than the loop test) is being walked, this holds that header's block
     /// index. `emit_region` then declines the `loops` lookup for exactly
@@ -4917,6 +7482,7 @@ struct Structurer<'a> {
     normal_reachable: HashSet<usize>,
 }
 
+#[allow(dead_code)]
 impl<'a> Structurer<'a> {
     fn fold_linear(&self, bi: usize, out: &mut Vec<Stmt>) -> bool {
         // returns true when the block ends with a boundary handled here
@@ -4946,17 +7512,70 @@ impl<'a> Structurer<'a> {
         out
     }
 
+    /// The header's own statements that its CONDITION did not claim.
+    ///
+    /// `while (cond)` renders the compare and the input chain feeding it, so a
+    /// header whose whole body is that chain needs nothing emitted -- emitting
+    /// it again produced a dead binding (`v40 = this._pickupRoot;` beside
+    /// `if (this._pickupRoot == 0)`). But an instruction the condition never
+    /// claimed is not in the test: it is a store the hardware performs on the
+    /// way to the branch, and the loop emitter marks the header rendered, so
+    /// dropping it deletes the definition while its readers stay
+    /// (`ptr = v1339;` with v1339 defined nowhere, 0x14975C0). Claim status,
+    /// not op shape, decides.
+    fn unclaimed_header_prelude(&self, header: usize) -> Vec<Stmt> {
+        let b = &self.sc.blocks[header];
+        let term = b.end.saturating_sub(1);
+        // Snapshot first: emitting a statement claims its own instructions and
+        // `boundary_stmts` takes the audit set mutably.
+        let unclaimed: Vec<usize> = {
+            let claimed = self.ctx.audit.borrow();
+            (b.start..term).filter(|i| !claimed.contains(i)).collect()
+        };
+        let mut out = Vec::new();
+        for i in unclaimed {
+            out.extend(self.ctx.boundary_stmts(i));
+        }
+        out
+    }
+
+    /// The header's unclaimed instructions that run BEFORE its branch test.
+    ///
+    /// A `while (test) { body }` renders the test itself and re-runs it first
+    /// on every iteration, so the instructions after the test are emitted at
+    /// the TOP of the body by [`Self::fold_prelude_after_test`] — the hardware
+    /// runs them once per iteration, after the test. Emitting them here as well
+    /// printed the same statement twice (`v1 = v2; while (…) { v1 = v2; … }`),
+    /// which is not merely noise: the copy before the loop also ran once where
+    /// the native runs it every iteration. The two ranges must stay disjoint.
+    fn unclaimed_pre_test_prelude(&self, header: usize) -> Vec<Stmt> {
+        let after = self.header_after_test_range(header);
+        let b = &self.sc.blocks[header];
+        let term = b.end.saturating_sub(1);
+        let unclaimed: Vec<usize> = {
+            let claimed = self.ctx.audit.borrow();
+            (b.start..term)
+                .filter(|i| !claimed.contains(i) && !after.contains(i))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for i in unclaimed {
+            out.extend(self.ctx.boundary_stmts(i));
+        }
+        out
+    }
+
     /// Condition of the CondJump terminating block `bi`.
     fn branch_condition(&self, bi: usize) -> Expr {
         let b = &self.sc.blocks[bi];
         let term = b.end - 1;
-        if std::env::var("ILR_BCDBG").is_ok() {
-            eprintln!("[bc] bi={} term_insn={} term_op={:?}", bi, term, self.insns[term].op);
+        if crate::recovery::env_flags::flag("ILR_BCDBG") {
+            eprintln!(
+                "[bc] bi={} term_insn={} term_op={:?}",
+                bi, term, self.insns[term].op
+            );
         }
-        let cond_local = self.insns[term]
-            .operands
-            .first()
-            .and_then(|o| o.as_local());
+        let cond_local = self.insns[term].operands.first().and_then(|o| o.as_local());
         if let Some(v) = cond_local {
             // Branch tests read the lifter's scratch locals. The arm64 lifter
             // now assigns a UNIQUE id per Compare/And def, so the ordinary
@@ -4972,12 +7591,15 @@ impl<'a> Structurer<'a> {
             } else {
                 self.ctx.defs.get(&v).copied()
             };
-            if std::env::var("ILR_BCDBG").is_ok() {
+            if crate::recovery::env_flags::flag("ILR_BCDBG") {
                 eprintln!("[bc] v={} def={:?}", v, def);
             }
             if let Some(def) = def {
-                if std::env::var("ILR_BCDBG").is_ok() {
-                    eprintln!("[bc] def_insn={} op={:?} ops={:?}", def, self.insns[def].op, self.insns[def].operands);
+                if crate::recovery::env_flags::flag("ILR_BCDBG") {
+                    eprintln!(
+                        "[bc] def_insn={} op={:?} ops={:?}",
+                        def, self.insns[def].op, self.insns[def].operands
+                    );
                 }
                 // Fused compound condition (`cmp; ccmp; b.cc`) — the lifter
                 // emits `Arith(And|Or)` over two compare results. Resolve it
@@ -4991,7 +7613,36 @@ impl<'a> Structurer<'a> {
                 if matches!(self.insns[def].op, Op::Compare(_))
                     && (v >= u32::MAX - 1 || !self.ctx.is_multi(v))
                 {
-                    return self.ctx.def_expr(def, 0);
+                    let e = self.ctx.def_expr(def, 0);
+                    if crate::recovery::env_flags::flag("ILR_BCDBG") {
+                        eprintln!("[bc] built {e:?}");
+                    }
+                    return e;
+                }
+                // A branch whose operand is a CALL RESULT — `bl F; cbnz w0, L`
+                // — is `if (F(…))`. Falling through to `Bool(true)` here
+                // dropped BOTH the condition and the `bl`: `boundary_stmts`'
+                // three-way rule deliberately emits nothing for a call result
+                // the C# cannot name, leaving it to "the use site", and this is
+                // that use site. Only for a single-def value: with several
+                // definitions the name would denote whichever one the text
+                // reached last, not the one this branch tested.
+                if matches!(self.insns[def].op, Op::Call) && !self.ctx.is_multi(v) {
+                    // ...but ONLY when the result has no statement. When the
+                    // def site DID materialize `dst = callee(…)`, the branch
+                    // must test the name: inlining the call here ran the
+                    // callee a second time in the text for one native `bl`.
+                    // That duplicate was invisible while the tail-copy bug
+                    // suppressed the def site (the call appeared once, as
+                    // this condition, and `dst` was left undefined).
+                    if let Some(name) = self.ctx.call_binding_name(def) {
+                        return Expr::Var(name);
+                    }
+                    let e = self.ctx.def_expr(def, 0);
+                    if crate::recovery::env_flags::flag("ILR_BCDBG") {
+                        eprintln!("[bc] call-condition {e:?}");
+                    }
+                    return e;
                 }
             }
         }
@@ -5127,25 +7778,49 @@ impl<'a> Structurer<'a> {
             return (out, None);
         }
         let mut cur = cur;
-        if std::env::var("ILR_EMITDBG").is_ok() && depth == 0 {
-            eprintln!("[emit] start cur={} blocks={} stops={:?} eh={:?} region_of_block0={:?}", cur, self.sc.blocks.len(), stops, self.eh_regions.len(), self.region_of_block.get(&0));
+        if crate::recovery::env_flags::flag("ILR_EMITDBG") && depth == 0 {
+            eprintln!(
+                "[emit] start cur={} blocks={} stops={:?} eh={:?} region_of_block0={:?}",
+                cur,
+                self.sc.blocks.len(),
+                stops,
+                self.eh_regions.len(),
+                self.region_of_block.get(&0)
+            );
             for (bi, b) in self.sc.blocks.iter().enumerate() {
                 let ops: Vec<String> = (b.start..b.end)
                     .map(|i| format!("{:?}", self.insns[i].op))
                     .collect();
-                eprintln!("[emit] B{}: insns {}..{} succ_t={:?} succ_f={:?} | {}", bi, b.start, b.end, b.succ_taken, b.succ_fall, ops.join(" ; "));
+                eprintln!(
+                    "[emit] B{}: insns {}..{} succ_t={:?} succ_f={:?} | {}",
+                    bi,
+                    b.start,
+                    b.end,
+                    b.succ_taken,
+                    b.succ_fall,
+                    ops.join(" ; ")
+                );
             }
-            eprintln!("[emit] total_insns={} block_of58={:?}", self.insns.len(), self.sc.block_of.get(58));
+            eprintln!(
+                "[emit] total_insns={} block_of58={:?}",
+                self.insns.len(),
+                self.sc.block_of.get(58)
+            );
         }
 
         loop {
-            if std::env::var("ILR_IFDBG").is_ok() {
+            if crate::recovery::env_flags::flag("ILR_IFDBG") {
                 eprintln!("[visit] cur={} depth={}", cur, depth);
             }
-            if std::env::var("ILR_EMITDBG").is_ok()
-                && (depth == 0 || std::env::var("ILR_ARMDBG").is_ok())
+            if crate::recovery::env_flags::flag("ILR_EMITDBG")
+                && (depth == 0 || crate::recovery::env_flags::flag("ILR_ARMDBG"))
             {
-                eprintln!("[emit] iter cur={} depth={} emitted={}", cur, depth, self.emitted.borrow().len());
+                eprintln!(
+                    "[emit] iter cur={} depth={} emitted={}",
+                    cur,
+                    depth,
+                    self.emitted.borrow().len()
+                );
             }
             // Wall-clock cut-off — OPT-IN ONLY (`ILR_TIME_LIMIT=<ms>`), never
             // on by default. Where this fires, the body is truncated at
@@ -5174,10 +7849,17 @@ impl<'a> Structurer<'a> {
                 if loops.contains_key(&cur) {
                     out.push(Stmt::Continue);
                 } else {
-                    out.push(self.goto_stmt_reason(cur, GotoReason::AlreadyEmitted));
+                    // The block was emitted earlier in the text. If what it
+                    // starts is a small straight-line tail ending in
+                    // return/throw, the source had a copy of it HERE and the
+                    // shared block is a codegen artefact — duplicate instead of
+                    // jumping backwards to it (see `duplicable_tail`).
+                    let tail = self.goto_or_tail(cur, GotoReason::AlreadyEmitted);
+                    out.extend(tail);
                 }
                 return (out, None);
             }
+            self.rendered.borrow_mut().insert(cur);
             self.emission_log.borrow_mut().push(cur);
             let remaining = self.remaining.get();
             if remaining == 0 {
@@ -5200,6 +7882,7 @@ impl<'a> Structurer<'a> {
             let will_fold = !self.in_handler.get()
                 && self.folding.get() != self.region_of_block.get(&cur).copied()
                 && self.region_of_block.contains_key(&cur)
+                && !is_terminate_guard(&self.eh_regions[self.region_of_block[&cur]])
                 && self.folded.borrow_mut().insert(self.region_of_block[&cur]);
 
             // First visit of a labelled block: emit its label here so every
@@ -5207,16 +7890,21 @@ impl<'a> Structurer<'a> {
             // gotos referenced labels that were never rendered). Skipped when
             // a try region folds here — the folded walk emits it inside.
             if !will_fold
-                && (self.sc.labels.contains_key(&cur)
-                    || self.forced_labels.borrow().contains(&cur))
+                && (self.sc.labels.contains_key(&cur) || self.forced_labels.borrow().contains(&cur))
             {
-                out.push(Stmt::Label(label_name(self.sc, cur)));
+                if let Some(l) = label_once(
+                    &self.labels_written,
+                    self.sc,
+                    cur,
+                    !self.discovery && crate::recovery::env_flags::flag("ILR_TRACE"),
+                ) {
+                    out.push(l);
+                }
             }
 
             if will_fold {
                 let ri = self.region_of_block[&cur];
                 let region = &self.eh_regions[ri];
-                let handler_blk = self.handler_of.get(&ri).copied();
                 // The try body spans every block whose native address lies in
                 // the region's range. Walk from `cur`, stopping as soon as the
                 // walk leaves the protected range (or control exits). The
@@ -5231,15 +7919,55 @@ impl<'a> Structurer<'a> {
                 // already emitted (reached earlier by the outer walk through a
                 // path that crossed the region) are fenced by the emitted
                 // guard; the body still gets whatever remains reachable.
+                // E5: expand the raw LSDA row range to WHOLE blocks. A row is
+                // a per-call-site byte range, so it can start or end in the
+                // middle of a block; fencing by the raw range let a straddling
+                // block sit INSIDE the try while the resume search (which
+                // compares block starts) put it outside. The try then swallowed
+                // the statement after it and the handler's goto targeted code
+                // the try already contained. Membership is decided by whether
+                // any instruction of the block lies in the row range, which is
+                // exact and does not assume the block list is sorted.
+                //
+                // Still an ADDRESS test, not region_of_block: blocks of a
+                // NESTED region lie inside this region's range too, and
+                // region_of_block maps them to the inner region - fencing by
+                // that map made every outer try body walk stop at its first
+                // nested block and render empty.
+                let mut try_blocks: HashSet<usize> = HashSet::new();
+                for b in 0..self.sc.blocks.len() {
+                    let blk = &self.sc.blocks[b];
+                    for i in blk.start..blk.end {
+                        let a = self.insns[i].address;
+                        if a >= region.try_start && a < region.try_end {
+                            try_blocks.insert(b);
+                            break;
+                        }
+                    }
+                }
+                // A region that covers a loop HEADER protects the whole loop.
+                // The LSDA records a row per CALL SITE, so a loop body with no
+                // calls leaves a row around the header's call alone and the
+                // region ends mid-loop; fencing at that row emitted
+                // `try { while (c) { } }` followed by a second, body-only
+                // loop, which is how a `foreach` came out as an empty loop plus
+                // a stray one (GetPotionCountOfType @0x1990A38). The body runs
+                // under the same protection in the source, so it joins the
+                // region. Guarded on the HEADER being inside: a try nested in a
+                // body never covers it, so a per-iteration try is left alone.
+                let loop_expansion = !crate::recovery::env_flags::flag("ILR_NO_LOOPEXP");
+                for (h, info) in loops.iter() {
+                    if !loop_expansion || !try_blocks.contains(h) {
+                        continue;
+                    }
+                    for &b in info.body.iter() {
+                        try_blocks.insert(b);
+                    }
+                }
+                let last_try_block = try_blocks.iter().copied().max();
                 let mut region_stops: HashSet<usize> = HashSet::new();
                 for b in 0..self.sc.blocks.len() {
-                    let a = self.insns[self.sc.blocks[b].start].address;
-                    // Address-range fence, NOT region_of_block: blocks of a
-                    // NESTED region lie inside this region's range too, and
-                    // region_of_block maps them to the inner region — fencing
-                    // by that map made every outer try body walk stop at its
-                    // first nested block and render empty.
-                    if !(a >= region.try_start && a < region.try_end) {
+                    if !try_blocks.contains(&b) {
                         region_stops.insert(b);
                     }
                 }
@@ -5261,66 +7989,23 @@ impl<'a> Structurer<'a> {
                 // clauses sharing the same landing pad becomes the wrapper
                 // clause plus a single `catch (...)` fallback; `/* filter */`
                 // entries collapse into the preceding managed catch.
-                let mut catches: Vec<(String, Vec<Stmt>)> = Vec::new();
-                let mut finally_body: Option<Vec<Stmt>> = None;
-                if region.is_cleanup || region.catches.is_empty() {
-                    finally_body = handler_blk
-                        .map(|hb| self.emit_handler(hb, loops, loop_exits, stops, depth));
-                } else {
-                    // The Itanium action chain for ONE managed catch is
-                    // [wrapper catch(type) → filter → catch-all fallback].
-                    // The fallback is ABI control flow (rethrow when the
-                    // filter rejects), NOT a second C# handler — rendering it
-                    // produced duplicate `catch` clauses where the second one
-                    // only held a goto (the pad was already consumed). Collapse
-                    // the chain into a single clause; the pad's klass checks
-                    // inside the body are the real filter.
-                    let managed = region
-                        .catches
-                        .iter()
-                        .any(|c| c.as_ref().is_some_and(|t| t.contains("managed catch")));
-                    if managed {
-                        let body = handler_blk
-                            .map(|hb| self.emit_handler(hb, loops, loop_exits, stops, depth))
-                            .unwrap_or_default();
-                        catches.push(("Il2CppExceptionWrapper /* managed catch */".into(), body));
-                    } else {
-                        let mut seen_names: HashSet<String> = HashSet::new();
-                        for c in &region.catches {
-                            let Some(t) = c else { continue };
-                            if t.contains("/* filter */") {
-                                // the type check lives in the pad body; a
-                                // separate C# filter clause would be noise
-                                continue;
-                            }
-                            if !seen_names.insert(t.clone()) {
-                                continue;
-                            }
-                            let body = handler_blk
-                                .map(|hb| self.emit_handler(hb, loops, loop_exits, stops, depth))
-                                .unwrap_or_default();
-                            catches.push((t.clone(), body));
-                        }
-                        if catches.is_empty() {
-                            // chain of catch-alls only → one generic clause
-                            let body = handler_blk
-                                .map(|hb| self.emit_handler(hb, loops, loop_exits, stops, depth))
-                                .unwrap_or_default();
-                            catches.push(("...".into(), body));
-                        }
-                    }
-                }
-                out.push(Stmt::Try {
-                    try_body: try_stmts,
-                    catches,
-                    finally_body,
-                });
+                out.push(self.eh_try_stmt(
+                    ri,
+                    try_stmts,
+                    loops,
+                    loop_exits,
+                    &region_stops,
+                    depth,
+                ));
                 // Resume the outer walk at the first block AFTER the try
                 // range. Returning None here truncated every method that had
                 // code following its try statement.
-                let after = (0..self.sc.blocks.len()).find(|&b| {
-                    self.insns[self.sc.blocks[b].start].address >= region.try_end
-                });
+                // Resume after the LAST try block, not at the first block whose
+                // address reaches try_end: those two disagree exactly when a row
+                // ends mid-block, which is the E5 case the fence above fixed.
+                let after = last_try_block
+                    .map(|m| m + 1)
+                    .filter(|&n| n < self.sc.blocks.len());
                 match after {
                     Some(a) if !self.emitted.borrow().contains(&a) => {
                         cur = a;
@@ -5338,8 +8023,7 @@ impl<'a> Structurer<'a> {
                 // through to the block's normal prelude/terminator handling
                 // rather than recursing into `emit_loop` (infinite).
                 if self.skip_loop_header.get() != Some(cur) {
-                    let (stmt, next) =
-                        self.emit_loop(cur, info, stops, loops, loop_exits, depth);
+                    let (stmt, next) = self.emit_loop(cur, info, stops, loops, loop_exits, depth);
                     out.extend(stmt);
                     match next {
                         Some(n) => cur = n,
@@ -5433,7 +8117,13 @@ impl<'a> Structurer<'a> {
                     }
                 }
                 while let Some(x) = queue.pop() {
-                    for &s in self.sc.full_succ.get(x).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    for &s in self
+                        .sc
+                        .full_succ
+                        .get(x)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[])
+                    {
                         if s < self.sc.blocks.len()
                             && !arm_region.contains(&s)
                             && !loop_fence.contains(&s)
@@ -5454,7 +8144,9 @@ impl<'a> Structurer<'a> {
                 let mut arm_stmts: Vec<Stmt> = Vec::new();
                 let mut walked: usize = 0;
                 for &t in targets.iter() {
-                    let Some(&tb) = self.sc.block_of.get(t) else { continue };
+                    let Some(&tb) = self.sc.block_of.get(t) else {
+                        continue;
+                    };
                     if tb >= self.sc.blocks.len()
                         || loop_fence.contains(&tb)
                         || !claimed.insert(tb)
@@ -5463,11 +8155,14 @@ impl<'a> Structurer<'a> {
                         continue;
                     }
                     visited.insert(tb);
-                    let mut stops_arm = claimed.clone();
+                    // FIX: Don't include previously claimed blocks in stops.
+                    // Each arm should walk independently with only loop_fence as stops.
+                    // Including claimed blocks causes later arms to bail early when they
+                    // encounter blocks from earlier arms (37-target dispatch → 0 statements).
+                    let mut stops_arm = HashSet::new();
                     stops_arm.extend(loop_fence.iter().copied());
                     stops_arm.remove(&tb);
-                    let (mut s, _) =
-                        self.emit_region(tb, &stops_arm, loops, loop_exits, depth + 1);
+                    let (mut s, _) = self.emit_region(tb, &stops_arm, loops, loop_exits, depth + 1);
                     while matches!(s.last(), Some(Stmt::Goto(_))) {
                         s.pop();
                     }
@@ -5481,12 +8176,16 @@ impl<'a> Structurer<'a> {
                     )));
                     return (out, None);
                 }
-                // Case targets whose block was never visited (already emitted
-                // shared tail / dispatch default) still need a defined label
-                // or their `case k: goto Lx` dangles. Emit a stub landing
-                // pad: the block's real content was rendered elsewhere (before
-                // the switch, as shared code), so a bare terminating label is
-                // the honest placeholder.
+                // Case targets whose block the arm walk never visited. These
+                // used to become STUB landing pads ("shared tail / dispatch
+                // default" + break), on the assumption that the block's code
+                // had been rendered before the switch. For a dispatch whose
+                // arm target was FENCED (a loop header inside an arm) that is
+                // false: the block is real code owned by nobody, and the stub
+                // silently replaced it (the repair then rendered it flat).
+                // Emit the target's region here instead; a target that really
+                // was emitted elsewhere returns its guard's goto, which is the
+                // shared-tail case the stub was for.
                 let mut unvisited: Vec<usize> = Vec::new();
                 for &t in targets.iter() {
                     if let Some(&tb) = self.sc.block_of.get(t) {
@@ -5496,9 +8195,28 @@ impl<'a> Structurer<'a> {
                     }
                 }
                 for tb in unvisited {
-                    arm_stmts.push(Stmt::Label(label_name(self.sc, tb)));
-                    arm_stmts.push(Stmt::Comment("shared tail / dispatch default".into()));
-                    arm_stmts.push(Stmt::Break);
+                    let mut stops_u: HashSet<usize> = loop_fence.clone();
+                    stops_u.remove(&tb);
+                    let (code, _) = self.emit_region(tb, &stops_u, loops, loop_exits, depth + 1);
+                    if let Some(l) = label_once(
+                        &self.labels_written,
+                        self.sc,
+                        tb,
+                        !self.discovery && crate::recovery::env_flags::flag("ILR_TRACE"),
+                    ) {
+                        arm_stmts.push(l);
+                    }
+                    if code.is_empty() {
+                        // Nothing recoverable (or emitted elsewhere without a
+                        // jump): keep a terminating placeholder.
+                        arm_stmts.push(Stmt::Comment("shared tail / dispatch default".into()));
+                        arm_stmts.push(Stmt::Break);
+                    } else {
+                        arm_stmts.extend(code);
+                        if !ends_with_terminator(&arm_stmts) {
+                            arm_stmts.push(Stmt::Break);
+                        }
+                    }
                 }
                 let mut case_labels: Vec<(u64, String)> = Vec::new();
                 for (v, &t) in targets.iter().enumerate() {
@@ -5524,10 +8242,7 @@ impl<'a> Structurer<'a> {
                         if !matches!(self.insns[i].op, Op::Compare(_)) {
                             return None;
                         }
-                        match (
-                            self.insns[i].operands.get(1),
-                            self.insns[i].operands.get(2),
-                        ) {
+                        match (self.insns[i].operands.get(1), self.insns[i].operands.get(2)) {
                             (Some(Operand::Local(v)), Some(Operand::Immediate(_))) => {
                                 Some(self.ctx.var_name(*v))
                             }
@@ -5557,8 +8272,19 @@ impl<'a> Structurer<'a> {
                     let first = used.insert(label.clone());
                     if first {
                         if let Some((_, body)) = segs.iter().find(|(l, _)| *l == label) {
-                            // Keep the label: other gotos may target this arm.
+                            // The arm walk emitted this label into `arm_stmts`
+                            // and the split above CONSUMED it. Re-emit it here
+                            // unconditionally: `labels_written` already names
+                            // it, but nothing in the text does, so the shared
+                            // targets' `case v: goto Lx;` stubs pointed at a
+                            // label that never rendered ("target not emitted").
                             let mut b: Vec<Stmt> = Vec::with_capacity(body.len() + 1);
+                            if !self.discovery && crate::recovery::env_flags::flag("ILR_TRACE") {
+                                eprintln!(
+                                    "[labbirth] {:#x} {label}",
+                                    crate::recovery::reconstruct::trace_rva_pub()
+                                );
+                            }
                             b.push(Stmt::Label(label.clone()));
                             b.extend(body.iter().cloned());
                             cases.push((v, b));
@@ -5569,13 +8295,89 @@ impl<'a> Structurer<'a> {
                 }
                 let mut tail: Vec<Stmt> = stray;
                 for (label, body) in &segs {
+                    // Same split-consumed label as above; a seg label is never
+                    // emitted anywhere else, so this is the only copy.
                     if !used.contains(label) {
+                        if !self.discovery && crate::recovery::env_flags::flag("ILR_TRACE") {
+                            eprintln!(
+                                "[labbirth] {:#x} {label}",
+                                crate::recovery::reconstruct::trace_rva_pub()
+                            );
+                        }
                         tail.push(Stmt::Label(label.clone()));
                         tail.extend(body.iter().cloned());
                     }
                 }
-                out.push(Stmt::Switch { disc, cases, tail });
-                return (out, None);
+                // The guard's taken target IS this switch's `default` arm.
+                //
+                // `cmp idx, #N; b.hi T` is the table's bounds check, and `T` is
+                // exactly the source's `default:`. Emitting the guard as a
+                // wrapping `if (idx <= N)` and then never rendering `T` DELETED
+                // the arm: `GetCharacterPower` @0x14A911C returns null on that
+                // path and the dump fell off the end of the method instead.
+                // Claiming the block here also stops the enclosing `if` from
+                // rendering it a second time, which is what made the guard look
+                // like a real condition rather than the dispatch's bound.
+                let mut default_arm: Option<Vec<Stmt>> = None;
+                if let Some(Operand::Immediate(rva)) =
+                    self.insns[b.end - 1].operands.get(1).cloned()
+                {
+                    let di = self
+                        .insns
+                        .iter()
+                        .position(|n| n.address == rva as u64);
+                    if let Some(di) = di {
+                        if let Some(&db) = self.sc.block_of.get(di) {
+                            if db < self.sc.blocks.len() && !visited.contains(&db) {
+                                let mut stops_d = loop_fence.clone();
+                                stops_d.remove(&db);
+                                let (mut code, _) =
+                                    self.emit_region(db, &stops_d, loops, loop_exits, depth + 1);
+                                while matches!(code.last(), Some(Stmt::Goto(_))) {
+                                    code.pop();
+                                }
+                                if !code.is_empty() {
+                                    if !ends_with_terminator(&code) {
+                                        code.push(Stmt::Break);
+                                    }
+                                    self.emitted.borrow_mut().insert(db);
+                                    default_arm = Some(code);
+                                }
+                            }
+                        }
+                    }
+                }
+                out.push(Stmt::Switch {
+                    disc,
+                    cases,
+                    tail,
+                    default: default_arm,
+                });
+                // Resume the ENCLOSING walk at the dispatch's join instead of
+                // abandoning it. The old `return (out, None)` made every block
+                // after a jump table unreachable to the linear walk: inside a
+                // loop body that left the loop's shared tail (and often the
+                // whole remainder of the loop) to the flat coverage repair —
+                // measured on `MovementPanel.ProcessPanels` @0x1951D30, whose
+                // 51 reported entry-reachable regions all sit after one of
+                // these dispatches. `ipdom` is computed over the FULL n-way
+                // successor set, so it is the exact merge of the arms and of
+                // the dispatch itself.
+                let join = self
+                    .sc
+                    .ipdom
+                    .get(cur)
+                    .copied()
+                    .flatten()
+                    .filter(|&j| j < self.sc.blocks.len());
+                match join {
+                    Some(j) if stops.contains(&j) => return (out, Some(j)),
+                    Some(j) => {
+                        cur = j;
+                        continue;
+                    }
+                    None => return (out, None),
+                }
             }
 
             if let Op::CondJump(taken) = last_op {
@@ -5593,8 +8395,7 @@ impl<'a> Structurer<'a> {
                 // be revoked if the `if` ends up an empty shell.
                 let claim_mark = self.ctx.claim_log.borrow().len();
                 let cond = self.branch_condition(cur);
-                let cond_claims: Vec<usize> =
-                    self.ctx.claim_log.borrow()[claim_mark..].to_vec();
+                let cond_claims: Vec<usize> = self.ctx.claim_log.borrow()[claim_mark..].to_vec();
                 // IR branch targets are INSNS; the structurer works in BLOCKS
                 let taken_blk = self
                     .sc
@@ -5608,8 +8409,7 @@ impl<'a> Structurer<'a> {
                     let fall = b.succ_fall.filter(|f| *f < self.sc.blocks.len());
                     if let Some(f) = fall {
                         if !stops.contains(&f) {
-                            let (arm, _) =
-                                self.emit_region(f, stops, loops, loop_exits, depth + 1);
+                            let (arm, _) = self.emit_region(f, stops, loops, loop_exits, depth + 1);
                             out.extend(arm);
                         }
                     }
@@ -5656,12 +8456,16 @@ impl<'a> Structurer<'a> {
                         return (out, None); // exit edge
                     }
                     if stops.contains(&t_blk) {
-                        // The walker continues into t_blk afterwards; force its
-                        // label so this goto has a matching definition.
-                        if !loops.contains_key(&t_blk) {
+                        // A jump to a region stop normally needs a label there.
+                        // When the stop starts a small return tail the source had
+                        // a copy of it here, so the jump is replaced by the tail
+                        // (see `duplicable_tail`); `jump_or_tail` also keeps the
+                        // forced label for the cases that still jump.
+                        let s = self.jump_or_tail(t_blk, loops, loop_exits, GotoReason::NoMerge);
+                        if matches!(s.last(), Some(Stmt::Goto(_))) && !loops.contains_key(&t_blk) {
                             self.forced_labels.borrow_mut().insert(t_blk);
                         }
-                        out.push(self.jump_stmt(t_blk, loops, loop_exits));
+                        out.extend(s);
                         let next = stops.contains(&t_blk).then_some(t_blk);
                         return (out, next);
                     }
@@ -5683,7 +8487,8 @@ impl<'a> Structurer<'a> {
                         }
                     }
                     if t_blk <= cur {
-                        out.push(self.goto_stmt_reason(t_blk, GotoReason::Backward));
+                        let tail = self.goto_or_tail(t_blk, GotoReason::Backward);
+                        out.extend(tail);
                         return (out, None);
                     }
                     cur = t_blk;
@@ -5742,30 +8547,399 @@ impl<'a> Structurer<'a> {
             }
         }
     }
+    // ------------------------------------------------------------------
+    // Structured reconstruction (S4)
+    // ------------------------------------------------------------------
 
-    /// Emit every block the CFG can reach but the walk could not place.
+    /// Is the tree emitter allowed to own `try` statements?
     ///
-    /// The walk abandons regions for real structural reasons (a secondary loop
-    /// exit, a switch arm fenced by a construct already rendered, a landing pad
-    /// shared by clauses) — but "I could not fit this into a structured
-    /// statement" must not become silence: the reader would then see a method
-    /// that does not contain code the machine runs, and no IR-level check can
-    /// see the loss because the block IS in the CFG.
+    /// On by default with `ILR_STRUCT`; `ILR_NO_STRUCTEH` restores the old
+    /// behaviour, where any EH method went back to the address walker.
+#[allow(dead_code)]
+    fn struct_eh_enabled() -> bool {
+        !crate::recovery::env_flags::flag("ILR_NO_STRUCTEH")
+    }
+
+    /// The blocks a try region protects: every block with an instruction in
+    /// [try_start, try_end), plus the whole body of any loop whose header is
+    /// protected (a row is recorded per CALL SITE, so a loop body with no
+    /// calls leaves a row around the header alone).
+    fn struct_protected(&self, ri: usize, loops: &HashMap<usize, LoopInfo>) -> HashSet<usize> {
+        let region = &self.eh_regions[ri];
+        let mut set: HashSet<usize> = HashSet::new();
+        for b in 0..self.sc.blocks.len() {
+            let blk = &self.sc.blocks[b];
+            for i in blk.start..blk.end {
+                let a = self.insns[i].address;
+                if a >= region.try_start && a < region.try_end {
+                    set.insert(b);
+                    break;
+                }
+            }
+        }
+        if !crate::recovery::env_flags::flag("ILR_NO_LOOPEXP") {
+            for (h, info) in loops.iter() {
+                if set.contains(h) {
+                    for &b in info.body.iter() {
+                        set.insert(b);
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    /// The block a protected body flows INTO when the try ends.
     ///
-    /// So each reachable skipped block is emitted as a labelled region, linked
-    /// by the `goto`s the walk already emitted for it (a jump to a stop block
-    /// always renders one, and `bail_out_of_region` adds the fall-through ones).
+    /// Every successor of a protected block that is not protected is a
+    /// candidate. The normal continuation is the only one when the body has a
+    /// single exit; when a `return` epilogue or a `break` out of an enclosing
+    /// loop adds more, the exit of the LAST protected block is used, and a
+    /// genuinely ambiguous region yields `None` (the caller refuses instead
+    /// of placing code in the wrong arm).
+    fn struct_region_exit(&self, protect: &HashSet<usize>) -> Option<usize> {
+        let n = self.sc.blocks.len();
+        let mut outs: Vec<usize> = Vec::new();
+        for &b in protect.iter() {
+            let blk = &self.sc.blocks[b];
+            for s in [blk.succ_taken, blk.succ_fall].into_iter().flatten() {
+                if s < n && !protect.contains(&s) && !outs.contains(&s) {
+                    outs.push(s);
+                }
+            }
+        }
+        if outs.len() == 1 {
+            return Some(outs[0]);
+        }
+        let last = protect.iter().copied().max()?;
+        let blk = &self.sc.blocks[last];
+        let mut tail: Vec<usize> = [blk.succ_taken, blk.succ_fall]
+            .into_iter()
+            .flatten()
+            .filter(|s| *s < n && !protect.contains(s))
+            .collect();
+        tail.dedup();
+        match tail.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        }
+    }
+    /// Build the `try` statement for EH region `ri` around `try_stmts`.
     ///
-    /// Loops are deliberately NOT re-structured here: the region is reached only
-    /// through those gotos, so rendering it FLAT keeps exactly one copy of every
-    /// block and cannot duplicate a loop body or a call expression.
+    /// Shared by the address walker and the tree emitter. The two differ only
+    /// in how the PROTECTED body is produced (linear walk vs. tree walk); the
+    /// catch/finally clauses, the finally-wrapper span and the enumerator
+    /// fixup are identical, and keeping two copies of that logic is how the
+    /// two renderers drift apart.
+    fn eh_try_stmt(
+        &self,
+        ri: usize,
+        try_stmts: Vec<Stmt>,
+        loops: &HashMap<usize, LoopInfo>,
+        loop_exits: &[(usize, usize)],
+        stops: &HashSet<usize>,
+        depth: usize,
+    ) -> Stmt {
+        let region = &self.eh_regions[ri];
+        let handler_blk = self.handler_of.get(&ri).copied();
+        let mut catches: Vec<(String, Vec<Stmt>)> = Vec::new();
+        let mut finally_body: Option<Vec<Stmt>> = None;
+        // A real `catch (T)` is excluded inside the detector by the klass
+        // comparison its pad performs before the body; a catch-all-only region
+        // never folds here at all (`is_terminate_guard`).
+        let finally_span = if crate::recovery::env_flags::flag("ILR_NO_EHFIN") {
+            None
+        } else {
+            handler_blk.and_then(|hb| self.finally_body_span(hb))
+        };
+        if let Some((bs, be)) = finally_span {
+            // The compiler's finally wrapper. Emit ONLY the source body: the
+            // selector, __cxa wrapper, saved-exception check and rethrow are
+            // the ABI spelling of `finally`, not statements. The pad is
+            // claimed so the normal walk and coverage repair cannot render the
+            // wrapper again.
+            let mut pad_claimed = None;
+            if let Some(hb) = handler_blk {
+                let hb = pad_root(self.sc, self.insns, hb);
+                self.emitted.borrow_mut().insert(hb);
+                self.rendered.borrow_mut().insert(hb);
+                pad_claimed = Some(hb);
+            }
+            let mut body = Vec::new();
+            if let Some(hb) = pad_claimed {
+                // The manual finally body bypasses emit_region, so the pad's
+                // label was never written here. This body IS its placement.
+                let name = label_name(self.sc, hb);
+                if self.labels_written.borrow_mut().insert(name.clone()) {
+                    self.forced_labels.borrow_mut().insert(hb);
+                    body.push(Stmt::Label(name));
+                }
+            }
+            for i in bs..be {
+                body.extend(self.ctx.boundary_stmts(i));
+            }
+            // The pad is a separate SSA path, so a call-clobbered frame cell
+            // can carry a second display name there (`enumerator2`). The
+            // compiler's finally disposes THE enumerator the loop moves;
+            // binding the Dispose receiver to the loop's own receiver is
+            // exact, and keeps one declared variable instead of an undefined
+            // alias.
+            let mut loop_recv: Option<Expr> = None;
+            for s in &try_stmts {
+                crate::recovery::reconstruct::float_locals::for_each_expr(s, &mut |e| {
+                    if let Expr::Call {
+                        recv: Some(r),
+                        name,
+                        ..
+                    } = e
+                    {
+                        if name == "MoveNext" {
+                            loop_recv = Some((**r).clone());
+                        }
+                    }
+                });
+            }
+            if let Some(recv) = loop_recv {
+                for s in &mut body {
+                    crate::recovery::reconstruct::copy_prop::for_each_expr_mut(
+                        s,
+                        &mut |e| {
+                            if let Expr::Call {
+                                recv: Some(r),
+                                name,
+                                ..
+                            } = e
+                            {
+                                if name == "Dispose"
+                                    && matches!(
+                                        r.as_ref(),
+                                        Expr::AddressOf(inner)
+                                            if matches!(inner.as_ref(), Expr::Var(_))
+                                    )
+                                {
+                                    *r = Box::new(recv.clone());
+                                }
+                            }
+                        },
+                    );
+                }
+            }
+            finally_body = Some(body);
+        } else if region.is_cleanup || region.catches.is_empty() {
+            finally_body = handler_blk
+                .map(|hb| self.emit_handler(hb, loops, loop_exits, stops, depth));
+        } else {
+            // The Itanium action chain for ONE managed catch is
+            // [wrapper catch(type) → filter → catch-all fallback]. The
+            // fallback is ABI control flow (rethrow when the filter rejects),
+            // NOT a second C# handler, so collapse the chain into one clause.
+            let managed = region
+                .catches
+                .iter()
+                .any(|c| c.as_ref().is_some_and(|t| t.contains("managed catch")));
+            if managed {
+                let body = handler_blk
+                    .map(|hb| self.emit_handler(hb, loops, loop_exits, stops, depth))
+                    .unwrap_or_default();
+                // E9: the LSDA only ever names the runtime shim
+                // (Il2CppExceptionWrapper); the real managed type is tested
+                // inside the pad. Emit the base class the shim wraps so the
+                // clause is valid C# and the pad body keeps the discriminating
+                // klass check.
+                catches.push(("Exception /* managed catch */".into(), body));
+            } else {
+                let mut seen_names: HashSet<String> = HashSet::new();
+                for c in &region.catches {
+                    let Some(t) = c else { continue };
+                    if t.contains("/* filter */") {
+                        // the type check lives in the pad body; a separate C#
+                        // filter clause would be noise
+                        continue;
+                    }
+                    if !seen_names.insert(t.clone()) {
+                        continue;
+                    }
+                    let body = handler_blk
+                        .map(|hb| self.emit_handler(hb, loops, loop_exits, stops, depth))
+                        .unwrap_or_default();
+                    catches.push((t.clone(), body));
+                }
+                if catches.is_empty() {
+                    // chain of catch-alls only → one generic clause
+                    let body = handler_blk
+                        .map(|hb| self.emit_handler(hb, loops, loop_exits, stops, depth))
+                        .unwrap_or_default();
+                    // An untyped C# catch; "catch (...)" is not valid C#.
+                    catches.push((String::new(), body));
+                }
+            }
+        }
+        Stmt::Try {
+            try_body: try_stmts,
+            catches,
+            finally_body,
+        }
+    }
+    /// The join of a branch for the structured emitter.
+    ///
+    /// The exact answer is the header's immediate post-dominator. It is only
+    /// usable when it lies inside the current region: a join that IS a
+    /// boundary (the follow, the enclosing loop header or its exit) is not a
+    /// block this branch can continue at — the arms own that edge, and
+    /// continuing there would duplicate the boundary's code.
+    fn struct_join(
+        &self,
+        cur: usize,
+        taken: usize,
+        fall: Option<usize>,
+        ctx: StructCtx,
+    ) -> Option<usize> {
+        let n = self.sc.blocks.len();
+        let usable = |m: usize| {
+            m < n && Some(m) != ctx.follow && Some(m) != ctx.header && Some(m) != ctx.exit
+        };
+        let fall = fall?;
+        // EXACT ANSWER FIRST. The immediate post-dominator is the block every
+        // path from this branch converges on, i.e. the join the source had.
+        // The reachability fallback below answers "nearest block both arms can
+        // REACH", which is not the same question: it can name a block on only
+        // one arm's path (0x1530770: B18 -> {B21, B19} picked B21, because the
+        // taken arm starts there, so the fall arm's own join at B22 fell
+        // outside the region and the walk was refused). Only when the ipdom is
+        // the region boundary (or unreachable) does the heuristic run.
+        // A shared block that is not a post-dominator is still a valid join
+        // when every path that BYPASSES it terminates: the arms that do not
+        // reach it then end in `return`/`throw` and never fall through.
+        // Pick the nearest block reachable from both arms, without crossing
+        // the region boundary.
+        let dist = |from: usize| -> Vec<usize> {
+            let mut d = vec![usize::MAX; n];
+            let mut q = std::collections::VecDeque::new();
+            if from < n && usable(from) {
+                d[from] = 0;
+                q.push_back(from);
+            }
+            while let Some(x) = q.pop_front() {
+                let dx = d[x];
+                for &s in self.sc.full_succ.get(x).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    if s < n && usable(s) && d[s] == usize::MAX {
+                        d[s] = dx + 1;
+                        q.push_back(s);
+                    }
+                }
+            }
+            d
+        };
+        let dt = dist(taken);
+        let df = dist(fall);
+        // Exact answer: the branch's immediate post-dominator, when both arms
+        // reach it without crossing the region boundary. Checked against the
+        // same distances the heuristic uses, so it can never pick a block one
+        // arm cannot get to.
+        if let Some(Some(pd)) = self.sc.ipdom.get(cur) {
+            let pd = *pd;
+            if usable(pd) && dt[pd] != usize::MAX && df[pd] != usize::MAX {
+                return Some(pd);
+            }
+        }
+        let mut best: Option<(usize, u64, usize)> = None;
+        for m in 0..n {
+            if dt[m] == usize::MAX || df[m] == usize::MAX {
+                continue;
+            }
+            let key = (dt[m] + df[m], self.sc.blocks[m].start as u64, m);
+            if best.is_none_or(|b| key < b) {
+                best = Some(key);
+            }
+        }
+        best.map(|(_, _, m)| m)
+    }
+    /// The latch whose branch IS the loop test: one edge jumps back to `h`,
+    /// the other leaves to the loop's exit. `true` means the exit is the
+    /// taken edge, so the emitted condition must be inverted.
+    fn struct_latch_test(
+        &self,
+        h: usize,
+        info: &LoopInfo,
+        exit: Option<usize>,
+    ) -> Option<(usize, bool)> {
+        for &l in info.latches.iter() {
+            let lb = &self.sc.blocks[l];
+            if lb.end <= lb.start {
+                continue;
+            }
+            if !matches!(self.insns[lb.end - 1].op, Op::CondJump(_)) {
+                continue;
+            }
+            if lb.succ_taken == Some(h) && lb.succ_fall == exit {
+                return Some((l, false));
+            }
+            if lb.succ_fall == Some(h) && lb.succ_taken == exit {
+                return Some((l, true));
+            }
+        }
+        None
+    }
+
+    /// Does `h` dominate `b` (walk the idom chain)?
+    fn reloop_dominates(&self, h: usize, b: usize) -> bool {
+        let mut cur = b;
+        for _ in 0..=self.sc.blocks.len() {
+            if cur == h {
+                return true;
+            }
+            match self.sc.idom.get(cur).copied().flatten() {
+                Some(next) if next < self.sc.blocks.len() && next != cur => cur = next,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Does `join` post-dominate `b` (i.e. every path from `b` passes it)?
+    fn reloop_postdominates(&self, b: usize, join: usize) -> bool {
+        let mut cur = b;
+        for _ in 0..=self.sc.blocks.len() {
+            if cur == join {
+                return true;
+            }
+            match self.sc.ipdom.get(cur).copied().flatten() {
+                Some(next) if next < self.sc.blocks.len() && next != cur => cur = next,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn coverage_repair(&self, reachable: &[bool]) -> (Vec<Stmt>, usize) {
         let empty_loops: HashMap<usize, LoopInfo> = HashMap::new();
+        let entry_reachable = reachable_blocks_entry(self.sc, self.insns);
         let mut out: Vec<Stmt> = Vec::new();
+        // `attached` counts REGIONS THAT PRODUCED STATEMENTS (any kind, even a
+        // lone label/goto); the caller gates `body_stmts.extend(repaired)` on
+        // this. `regions` below counts only regions with real code and drives
+        // the marker text. They used to be one number, so making the marker
+        // honest (label-only regions are not failures) silently discarded the
+        // whole repair tail — including labels that resolve real gotos
+        // (measured: 0x17DF158 lost L30 and L26).
+        let mut attached = 0usize;
         let mut regions = 0usize;
+        let mut entry_regions = 0usize;
+        let mut cold_regions = 0usize;
         let mut guard = self.sc.blocks.len() + 8;
         loop {
-            let done: HashSet<usize> = self.visited.borrow().clone();
+            // CANDIDATES AND STOPS ARE THE EMITTED SET, not `visited`.
+            //
+            // `visited` is insert-only for the whole render, while
+            // `emit_loop` deliberately REMOVES its body blocks from `emitted`
+            // and re-walks them. A body block the re-walk then fails to place
+            // was therefore `visited` (so this repair skipped it as "already
+            // emitted") but had no text and no label — exactly the blocks
+            // whose incoming `goto` later dangled ("target not emitted").
+            // `emitted` is the set whose rendering actually happened, so it is
+            // both the right candidate set and the right stop-set: repair
+            // renders every labelled block that never made it into the text.
+            let done: HashSet<usize> = self.rendered.borrow().clone();
             let next = (0..self.sc.blocks.len())
                 .find(|b| reachable.get(*b).copied().unwrap_or(false) && !done.contains(b));
             let Some(b) = next else { break };
@@ -5776,10 +8950,104 @@ impl<'a> Structurer<'a> {
                 break;
             }
             guard -= 1;
-            regions += 1;
             self.forced_labels.borrow_mut().insert(b);
-            let (s, _) = self.emit_region(b, &done, &empty_loops, &[], 0);
+            // A block can carry a stale `emitted` mark without ever having
+            // text: switch-arm targets are marked to prevent duplicate arms
+            // (8137) and a probe-then-undo path exists for handler pads. The
+            // repair candidate set is `rendered`, so a block here is provably
+            // NOT in the text; clear the walk guard or emit_region refuses
+            // and the incoming goto stays dangling (measured: 4 × L10 in
+            // 0x19816D8).
+            self.emitted.borrow_mut().remove(&b);
+            let (s, next) = self.emit_region(b, &done, &empty_loops, &[], 0);
+            let is_entry = entry_reachable.get(b).copied().unwrap_or(false);
+            let addr = self
+                .insns
+                .get(self.sc.blocks[b].start)
+                .map(|i| i.address)
+                .unwrap_or(0);
+            if crate::recovery::env_flags::flag("ILR_COV") {
+                let bb = &self.sc.blocks[b];
+                let labels = s.iter().filter(|x| matches!(x, Stmt::Label(_))).count();
+                let code = s.len() - labels;
+                eprintln!(
+                    "[repair] b={b} addr={addr:#x} entry={is_entry} stmts={} labels={labels} code={code} next={next:?}",
+                    s.len()
+                );
+                let _ = bb;
+            }
+            // Count only regions that carry CODE, and tag them so the late
+            // cleanup can report what actually survived. Most repairs are
+            // folded by branch_repair/goto_fold a few passes later and their
+            // statements pruned; the old marker still counted them, claiming
+            // 190 unstructured regions where the final text had eight. The
+            // sentinel is removed by `finalize_recovery_markers`; a label-only
+            // region is not a structuring failure and keeps no sentinel.
+            let mut s = s;
+            let has_code = s.iter().any(|x| {
+                !matches!(
+                    x,
+                    Stmt::Label(_) | Stmt::Comment(_) | Stmt::Goto(_)
+                )
+            });
+            if has_code {
+                regions += 1;
+                if is_entry {
+                    entry_regions += 1;
+                } else {
+                    cold_regions += 1;
+                }
+                let tag = if is_entry {
+                    format!("[recovery-region] entry b={b} addr={addr:#x}")
+                } else {
+                    format!("[recovery-region] cold b={b} addr={addr:#x}")
+                };
+                let at = s
+                    .iter()
+                    .position(|x| matches!(x, Stmt::Label(_)))
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                s.insert(at, Stmt::Comment(tag.into()));
+            }
+            if !s.is_empty() {
+                attached += 1;
+            }
             out.extend(s);
+            // A repaired region may fall through into a block the main walk
+            // already emitted. `emit_region` reports that boundary as its
+            // continuation, but there is no parent walk here to resume it.
+            // Keep the edge explicit so the labelled repair code reaches the
+            // existing block (commonly a shared return epilogue).
+            if let Some(next) = next.filter(|next| done.contains(next)) {
+                let block = &self.sc.blocks[next];
+                let terminal = block.end > block.start
+                    && matches!(self.insns[block.end - 1].op, Op::Return | Op::Throw)
+                    && (block.start..block.end - 1)
+                        .all(|i| matches!(self.insns[i].op, Op::Nop));
+                if terminal {
+                    // A terminal join can be copied into this mutually
+                    // exclusive repair path. A goto cannot target a label
+                    // retroactively inserted before an already-rendered
+                    // return, while duplicating this terminal block preserves
+                    // the path without changing any other predecessor.
+                    // If no earlier emission wrote this block's label, the
+                    // copy is its single placement: label it (same rule as
+                    // `duplicable_tail`).
+                    let name = label_name(self.sc, next);
+                    if self.labels_written.borrow_mut().insert(name.clone()) {
+                        self.forced_labels.borrow_mut().insert(next);
+                        out.push(Stmt::Label(name));
+                    }
+                    self.fold_linear(next, &mut out);
+                } else {
+                    let target = label_name(self.sc, next);
+                    let already_jumps =
+                        matches!(out.last(), Some(Stmt::Goto(label)) if *label == target);
+                    if !already_jumps {
+                        out.push(self.goto_stmt_reason(next, GotoReason::AlreadyEmitted));
+                    }
+                }
+            }
         }
         if regions > 0 {
             // The marker is placed AFTER the first region's label on purpose:
@@ -5788,8 +9056,8 @@ impl<'a> Structurer<'a> {
             // `return` — so a marker emitted as the very first repair statement
             // was dropped in most methods. After the label it always survives.
             let marker = Stmt::Comment(format!(
-                "[recovery] {regions} reachable region(s) the walker could not place in a \
-                 structured statement — emitted as labelled regions"
+                "[recovery] emitted {regions} labelled region(s): {cold_regions} out-of-line cold, \
+                 {entry_regions} entry-reachable region(s) not structured"
             ));
             let at = out
                 .iter()
@@ -5798,7 +9066,7 @@ impl<'a> Structurer<'a> {
                 .unwrap_or(0);
             out.insert(at, marker);
         }
-        (out, regions)
+        (out, attached)
     }
 
     /// Carry a fall-through that LEAVES the region the walk is in.
@@ -5814,9 +9082,297 @@ impl<'a> Structurer<'a> {
     /// the edge AND the code. Falling into `exit_blk` itself is the loop's
     /// normal exit and needs nothing.
     fn bail_out_of_region(&self, out: &mut Vec<Stmt>, next: usize) {
-        if self.in_loop_body.get() && self.loop_body_exit.get() != Some(next) {
-            out.push(self.goto_stmt_reason(next, GotoReason::LoopExit));
+        if crate::recovery::env_flags::flag("ILR_DRAINDBG") {
+            eprintln!(
+                "[drain] bail next=B{next} in_loop={} loop_exit={:?}",
+                self.in_loop_body.get(),
+                self.loop_body_exit.get()
+            );
         }
+        if self.in_loop_body.get() && self.loop_body_exit.get() != Some(next) {
+            // A secondary exit whose target is a return tail is the source's
+            // own `return` inside the loop, not a jump: duplicate the tail.
+            if let Some(tail) = self.duplicable_tail(next) {
+                if !self.discovery {
+                    STRUCT_CENSUS
+                        .tail_duplications
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                out.extend(tail);
+                return;
+            }
+            let goto = self.goto_stmt_reason(next, GotoReason::LoopExit);
+            // The owning `emit_loop` drains this record after building the
+            // loop statement and structures the target's region there. The
+            // goto is still emitted in place: it is the edge inside the body.
+            self.bailed_exits.borrow_mut().push((next, goto.clone()));
+            out.push(goto);
+        }
+    }
+
+    /// Append the structured bodies of the secondary loop exits recorded
+    /// during one `emit_loop` body pass (`mark` = [`Structurer::bailed_exits`]
+    /// length before the pass).
+    ///
+    /// Control that leaves the loop through its PRIMARY exit must not run the
+    /// out-of-line secondary arms in text order, so a `goto exit_blk` is
+    /// emitted between the loop and the drained regions. Each drained region
+    /// is walked with the real `loops` map (so a target that is itself a loop
+    /// header is structured, not flattened) and fenced by the surrounding
+    /// stops plus the loop header and primary exit: nothing outside the
+    /// secondary arm is swallowed here. A trailing fall-through into a stop is
+    /// carried as an explicit goto for the same reason as
+    /// [`Structurer::bail_out_of_region`].
+    #[allow(clippy::too_many_arguments)]
+    fn drain_bailed_exits(
+        &self,
+        mark: usize,
+        stmts: &mut Vec<Stmt>,
+        header: usize,
+        exit_blk: Option<usize>,
+        outer_stops: &HashSet<usize>,
+        loops: &HashMap<usize, LoopInfo>,
+        loop_exits: &[(usize, usize)],
+        depth: usize,
+    ) {
+        // The drain was implemented from the secondary-loop-exit theory, but a
+        // full-dump A/B (R33 vs R34) showed it does NOT reduce the corpus:
+        // entry-reachable repair regions 1,112 → 1,147 methods and gotos
+        // 10,021 → 10,251. The remaining skipped blocks are dominated by
+        // switch-dispatch arms, not loop exits. Kept behind ILR_DRAIN for the
+        // switch-ownership work; off by default.
+        if !crate::recovery::env_flags::flag("ILR_DRAIN") {
+            return;
+        }
+        let pending = {
+            let mut q = self.bailed_exits.borrow_mut();
+            if q.len() <= mark {
+                return;
+            }
+            q.split_off(mark)
+        };
+        if crate::recovery::env_flags::flag("ILR_DRAINDBG") {
+            eprintln!("[drain] draining {} target(s) after loop B{header}", pending.len());
+        }
+        if pending.is_empty() {
+            return;
+        }
+        // The normal (primary) exit skips every secondary region below.
+        if let Some(e) = exit_blk {
+            stmts.push(self.goto_stmt_reason(e, GotoReason::LoopExit));
+        }
+        let mut stops: HashSet<usize> = outer_stops.clone();
+        stops.insert(header);
+        if let Some(e) = exit_blk {
+            stops.insert(e);
+        }
+        let mut seen: HashSet<usize> = HashSet::new();
+        for (target, _) in pending {
+            if target >= self.sc.blocks.len()
+                || target == header
+                || Some(target) == exit_blk
+                || !seen.insert(target)
+                || self.emitted.borrow().contains(&target)
+            {
+                continue;
+            }
+            stops.remove(&target);
+            let (mut s, next) = self.emit_region(target, &stops, loops, loop_exits, depth + 1);
+            stops.insert(target);
+            // The drained arm's own fall-through boundary is outside this
+            // loop, so keep the edge explicit. `emit_region` reports it but
+            // does not print it for a stop boundary.
+            if let Some(n) = next {
+                if n < self.sc.blocks.len() && !matches!(s.last(), Some(Stmt::Goto(_))) {
+                    s.push(self.goto_stmt_reason(n, GotoReason::LoopExit));
+                }
+            }
+            stmts.extend(s);
+        }
+    }
+
+    /// Longest instruction span a shared tail may have and still be
+    /// duplicated at a jump site instead of jumped to.
+    const MAX_TAIL_INSNS: usize = 24;
+    /// Longest BLOCK chain a shared tail may span.
+    const MAX_TAIL_BLOCKS: usize = 6;
+
+    /// Can `target` be rendered INLINE at a jump site instead of jumped to?
+    ///
+    /// The compiler merges every `return <x>;` of a method into ONE shared
+    /// epilogue (`mov w0, #0; b .Lret`). The structurer emits that epilogue
+    /// once — wherever the address-linear walk first reaches it — and every
+    /// other `return` site becomes `goto L`. That is backwards: the SOURCE had
+    /// one `return` per site, and the shared block is an artefact of code
+    /// generation (measured: 1,733 of 7,461 surviving gotos in the 1,200-method
+    /// sample target a chain that ends in return/throw).
+    ///
+    /// When the chain from `target` is straight-line, small, and ends in
+    /// Return/Throw, a copy at the jump site reproduces the source and removes
+    /// the goto. Each refusal below is a reason the copy would NOT be
+    /// equivalent, not a tuning knob:
+    ///
+    ///  * `in_handler` — a handler body is fenced by reachability, not by
+    ///    address; copying out of it moves code out of the catch/finally;
+    ///  * a different `region_of_block` than the target's — the copy would sit
+    ///    outside the `try` the original protects (exception semantics);
+    ///  * a loop header — the copy would duplicate a back-edge owner;
+    ///  * a CondJump/Switch/IndirectCall terminator — the chain needs structure
+    ///    of its own, it is not a tail;
+    ///  * a local DECLARATION (`Assign(_, Some(_), _)`) — the copy would
+    ///    declare the same name twice in one scope;
+    ///  * more than MAX_TAIL_INSNS / MAX_TAIL_BLOCKS — a big tail is real
+    ///    shared code, and duplicating it inflates the output for nothing.
+    fn duplicable_tail(&self, target: usize) -> Option<Vec<Stmt>> {
+        // Every refusal is decided BEFORE the block is emitted. That ordering
+        // is not cosmetic: `fold_linear` records the call bindings it makes,
+        // and a tail rejected afterwards is thrown away whole — the bindings
+        // would survive, the block's real visit would be suppressed as a
+        // duplicate, and the value it defines would never reach the body.
+        if self.in_handler.get() || target >= self.sc.blocks.len() {
+            return None;
+        }
+        let region = self.region_of_block.get(&target).copied();
+        let mut cur = target;
+        let mut stmts: Vec<Stmt> = Vec::new();
+        let mut insns = 0usize;
+        for _ in 0..Self::MAX_TAIL_BLOCKS {
+            let b = self.sc.blocks.get(cur)?;
+            if b.end <= b.start {
+                return None;
+            }
+            insns += b.end - b.start;
+            if insns > Self::MAX_TAIL_INSNS {
+                return None;
+            }
+            // The header of a loop owns a back edge: its body is not a tail.
+            if self.loop_of_block.get(&cur).copied() == Some(cur) {
+                return None;
+            }
+            // Never copy code across an exception boundary.
+            if self.region_of_block.get(&cur).copied() != region {
+                return None;
+            }
+            // Decide the SUCCESSOR before emitting. A tail rejected after
+            // `fold_linear` has already run is thrown away whole, but the
+            // call bindings its emission recorded are not: the block's real
+            // visit is then suppressed as a duplicate and the value it
+            // defines never reaches the body (11,953 undefined locals, 98%
+            // `x0` scratch — `if (v365)` with no `v365 =` anywhere).
+            // Every refusal below is decidable from the block itself, so the
+            // decision is made here and `fold_linear` only runs on a tail
+            // that is definitely kept.
+            let last = self.insns[b.end - 1].op.clone();
+            let next = match last {
+                Op::Return | Op::Throw => None,
+                Op::Jump(t) => {
+                    let n = self.sc.block_of.get(t).copied()?;
+                    if n >= self.sc.blocks.len() || n == cur {
+                        return None;
+                    }
+                    Some(n)
+                }
+                Op::CondJump(_) | Op::Switch(_) | Op::IndirectCall => return None,
+                _ => match b.succ_fall {
+                    Some(n) if n != cur && n < self.sc.blocks.len() => Some(n),
+                    _ => return None,
+                },
+            };
+            // A COPY MUST BE SELF-CONTAINED.
+            //
+            // The block was already emitted, so boundary_stmts suppressed the
+            // calls it bound there — one native bl stays one statement at its
+            // canonical site. The copy then read the NAME without its
+            // definition, and the definition lived on the other side of a
+            // branch: the text said 'return v226;' on a path where v226 was
+            // never assigned. Measured on 0x14014E4: one canonical
+            // 'v226 = fn_1302504(…)' inside 'if (v183 == 0)' and three
+            // duplicated 'return v226;' in a sibling arm — the whole
+            // def-dropped:Call class is this shape.
+            //
+            // Refusing the copy instead turns it into a goto, and that was
+            // measured: undefined 2510 -> 2330 but lines 719,971 -> 745,296,
+            // duplicate statements 9,421 -> 11,202. A shared return tail is
+            // what the SOURCE duplicated — identical 'return f(x);' blocks are
+            // merged by the compiler — so the copy is the faithful rendering
+            // and it must carry its own definitions. The flag makes the
+            // suppression not fire for the duration of the copy, so the copy
+            // emits 'v226 = f(x); return v226;' like the original site did.
+            let mark = stmts.len();
+            self.fold_linear(cur, &mut stmts);
+            // A label or a declaration inside the copy would be a duplicate
+            // definition in the destination scope. `boundary_stmts` never
+            // emits either (it only binds plain names), so this is a guard
+            // rather than a live rule — but it is the one rejection that can
+            // still fire after the emission, so it stays.
+            if stmts[mark..].iter().any(|s| {
+                matches!(s, Stmt::Label(_) | Stmt::Assign(_, Some(_), _))
+            }) {
+                return None;
+            }
+            match next {
+                Some(n) => cur = n,
+                None => {
+                    // ONE PLACEMENT: a jump here names `target`'s label. If no
+                    // earlier emission wrote it (the block's text exists only
+                    // as copies), THIS copy is the block's only placement —
+                    // label it, or the jump dangles forever. Traced origin of
+                    // 93.4 % of the remaining markers ("never born").
+                    let name = label_name(self.sc, target);
+                    if self.labels_written.borrow_mut().insert(name.clone()) {
+                        self.forced_labels.borrow_mut().insert(target);
+                        stmts.insert(0, Stmt::Label(name));
+                    }
+                    return Some(stmts);
+                }
+            }
+        }
+        None
+    }
+
+    /// Emit the shared tail `target` inline (see `duplicable_tail`) or the
+    /// `goto` that was emitted before it existed. Counts what it replaced so
+    /// the census keeps partitioning the goto total.
+    fn goto_or_tail(&self, blk: usize, reason: GotoReason) -> Vec<Stmt> {
+        if let Some(tail) = self.duplicable_tail(blk) {
+            if !self.discovery {
+                STRUCT_CENSUS
+                    .tail_duplications
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return tail;
+        }
+        vec![self.goto_stmt_reason(blk, reason)]
+    }
+
+    /// `jump_stmt` (which prefers `break`/`continue` for the innermost loop)
+    /// with the shared-tail duplication of `duplicable_tail` applied when the
+    /// result would be a plain `goto`.
+    ///
+    /// A `break`/`continue` is already the ideal rendering and is never
+    /// replaced. A `goto` to a loop HEADER is never replaced either — the
+    /// header owns a back edge and `duplicable_tail` refuses it.
+    fn jump_or_tail(
+        &self,
+        to_blk: usize,
+        loops: &HashMap<usize, LoopInfo>,
+        loop_exits: &[(usize, usize)],
+        _reason: GotoReason,
+    ) -> Vec<Stmt> {
+        let is_break_or_continue = loop_exits.last().is_some_and(|&(h, e)| {
+            loops.contains_key(&h) && (to_blk == h || to_blk == e)
+        });
+        if !is_break_or_continue {
+            if let Some(tail) = self.duplicable_tail(to_blk) {
+                if !self.discovery {
+                    STRUCT_CENSUS
+                        .tail_duplications
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return tail;
+            }
+        }
+        vec![self.jump_stmt(to_blk, loops, loop_exits)]
     }
 
     /// Emit a goto to a block, ensuring its label will render when (and only
@@ -5868,6 +9424,227 @@ impl<'a> Structurer<'a> {
         r
     }
 
+    /// Own the loop-body blocks the body walk never reached.
+    ///
+    /// A natural loop's body set is every block that can reach the back edge.
+    /// The structured body walk only follows the paths that fit the chosen
+    /// entry, so compiler-generated secondary back edges (a switch arm that
+    /// branches to a per-arm assignment block and then to the header) stay
+    /// unrendered. Coverage repair used to emit them AFTER the method, which
+    /// left `goto L59_1` leaving the loop and then jumping back into it, and
+    /// counted every one as an entry-reachable structuring failure.
+    ///
+    /// These blocks are inside the loop by construction (the header dominates
+    /// them), so render them flat at the end of the body. Their jump to the
+    /// header becomes `continue` through `jump_stmt`, and no label escapes the
+    /// loop scope. Blocks with an edge from OUTSIDE the loop keep repair
+    /// ownership: moving those inside would put a label out of scope for the
+    /// external goto.
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_orphan_loop_blocks(
+        &self,
+        header: usize,
+        info: &LoopInfo,
+        body: &mut Vec<Stmt>,
+        body_stops: &HashSet<usize>,
+        loops: &HashMap<usize, LoopInfo>,
+        loop_exits: &[(usize, usize)],
+        depth: usize,
+    ) -> usize {
+        let mut orphans: Vec<usize> = info
+            .body
+            .iter()
+            .copied()
+            .filter(|&b| b != header && !self.rendered.borrow().contains(&b))
+            .collect();
+        orphans.sort_unstable_by_key(|&b| self.sc.blocks[b].start);
+        let mut adopted = 0usize;
+        for b in orphans {
+            if self.rendered.borrow().contains(&b) {
+                continue;
+            }
+            let preds = self.sc.preds.get(b).cloned().unwrap_or_default();
+            // INDIRECT-ONLY blocks: no normal CFG predecessor means the only
+            // edge is the unresolved dispatch itself. Inside the loop they
+            // would have no `goto` pointing at their label; the late
+            // unreferenced-label sweep then drops the label and dead-code
+            // pruning deletes the code (measured: the stack-passed touch
+            // handlers of 0x1903FB4 vanished). Leave those to coverage repair,
+            // whose labelled tail is retained.
+            if preds.is_empty() {
+                if crate::recovery::env_flags::flag("ILR_COV") {
+                    eprintln!("[adopt] b={b} has no normal predecessor, left to repair");
+                }
+                continue;
+            }
+            let external_entry = preds
+                .iter()
+                .any(|p| *p != header && !info.body.contains(p));
+            if external_entry {
+                if crate::recovery::env_flags::flag("ILR_COV") {
+                    eprintln!("[adopt] b={b} external entry, left to repair");
+                }
+                continue;
+            }
+            self.forced_labels.borrow_mut().insert(b);
+            self.emitted.borrow_mut().remove(&b);
+            let (s, _) = self.emit_region(b, body_stops, loops, loop_exits, depth + 1);
+            if crate::recovery::env_flags::flag("ILR_COV") {
+                let addr = self
+                    .insns
+                    .get(self.sc.blocks[b].start)
+                    .map(|i| i.address)
+                    .unwrap_or(0);
+                eprintln!(
+                    "[adopt] b={b} addr={addr:#x} stmts={} header=L{}",
+                    s.len(),
+                    header
+                );
+            }
+            if s.is_empty() {
+                // A label-only join still terminates incoming jumps; unused
+                // labels are swept by the late label cleanup.
+                if !body.last().is_some_and(|x| matches!(x, Stmt::Label(l) if *l == label_name(self.sc, b)))
+                {
+                    if let Some(l) = label_once(
+                        &self.labels_written,
+                        self.sc,
+                        b,
+                        !self.discovery && crate::recovery::env_flags::flag("ILR_TRACE"),
+                    ) {
+                        body.push(l);
+                    }
+                }
+            } else {
+                body.extend(s);
+            }
+            adopted += 1;
+        }
+        adopted
+    }
+
+    /// If this handler is the compiler's `finally` wrapper, return the
+    /// instruction span of the SOURCE body (end exclusive).
+    ///
+    /// IL2CPP implements a managed `try/finally` as a catch-all clause whose
+    /// pad runs `__cxa_begin_catch; ldr xE,[x0]; __cxa_end_catch; <source
+    /// body>; cbz xE,<resume>; raise(xE)` on the catch path. The LSDA alone
+    /// cannot tell this from `catch (T)`; the difference is that a typed
+    /// catch tests the exception's class before running the body. So the
+    /// recognition is structural: both cxa calls in one straight-line pad
+    /// block, and no klass comparison (by Compare or by an IsInst-style
+    /// helper) between `__cxa_end_catch` and the block's first terminator.
+    fn finally_body_span(&self, hb: usize) -> Option<(usize, usize)> {
+        let hb = pad_root(self.sc, self.insns, hb);
+        let b = self.sc.blocks.get(hb)?;
+        // The wrapper is identified by NAME when the binary's symbol table
+        // names the PLT stubs, and by SHAPE when it does not: __cxa_end_catch
+        // is called with no real arguments, so its raw ABI dump carries the
+        // still-live result of __cxa_begin_catch in x0. "Second call's first
+        // argument is the first call's destination" is therefore the exact
+        // begin/end pair, independent of names.
+        // The pad block ends at the selector branch; the catch path (and the
+        // cxa pair) is a successor arm. Scan the handler's straight-line run
+        // instead of one block, bounded and stopped at the first exit.
+        let scan_end = (b.start + 96).min(self.insns.len());
+        let mut begin = None;
+        let mut end = None;
+        let mut last_call: Option<(usize, u32)> = None;
+        let mut pair: Option<(usize, usize)> = None;
+        for i in b.start..scan_end {
+            if matches!(self.insns[i].op, Op::Return | Op::Throw | Op::IndirectCall) {
+                break;
+            }
+            if !matches!(self.insns[i].op, Op::Call | Op::CallVoid) {
+                continue;
+            }
+            if let Some(Operand::Immediate(t)) = self.insns[i].operands.first() {
+                if let Some(sym) = crate::recovery::runtime_helpers::symbol_of(*t as u64) {
+                    if sym.contains("__cxa_begin_catch") {
+                        begin = Some(i);
+                    } else if sym.contains("__cxa_end_catch") {
+                        end = Some(i);
+                    }
+                }
+            }
+            let dest = self.insns[i].operands.get(1).and_then(|o| o.as_local());
+            if let Some((pi, pd)) = last_call {
+                let first_arg = self.insns[i].operands.get(2).and_then(|o| o.as_local());
+                if i - pi <= 8 && first_arg == Some(pd) {
+                    pair = Some((pi, i));
+                    break;
+                }
+            }
+            last_call = dest.map(|d| (i, d));
+        }
+        if begin.is_none() || end.is_none() {
+            if let Some((bc, ec)) = pair {
+                begin = Some(bc);
+                end = Some(ec);
+            }
+        }
+        let dbg = crate::recovery::env_flags::flag("ILR_FINDBG");
+        if dbg {
+            eprintln!(
+                "[findbg] pad B{hb} scan {}..{scan_end} begin={begin:?} end={end:?} pair={pair:?}",
+                b.start
+            );
+        }
+        let (bc, ec) = (begin?, end?);
+        if ec <= bc {
+            return None;
+        }
+        let term = (ec + 1..scan_end).find(|&i| self.insns[i].is_terminator())?;
+        if term <= ec + 1 {
+            return None;
+        }
+        // The wrapper ends with the saved-exception NULL test (Compare +
+        // CondJump). That compare is not a class filter: it tests the saved
+        // pointer against zero. A real `catch (T)` compares the exception's
+        // klass against a TypeInfo/MethodInfo operand instead, so any compare
+        // with a non-zero immediate or a metadata operand is the typed-catch
+        // proof that must keep the catch shape.
+        let mut body_end = term;
+        if term > ec + 1 && matches!(self.insns[term - 1].op, Op::Compare(_)) {
+            body_end = term - 1;
+        }
+        for i in ec + 1..term {
+            if matches!(self.insns[i].op, Op::Compare(_)) {
+                let class_test = self.insns[i].operands.iter().skip(1).any(|o| match o {
+                    Operand::Immediate(v) => *v != 0,
+                    Operand::Method(_) | Operand::Type(_) => true,
+                    _ => false,
+                });
+                if class_test {
+                    if dbg {
+                        eprintln!("[findbg] pad B{hb} refused: class compare at i{i}");
+                    }
+                    return None;
+                }
+            }
+        }
+        if body_end <= ec + 1 {
+            return None;
+        }
+        for i in ec + 1..term {
+            if let Some(Operand::Immediate(t)) = self.insns[i].operands.first() {
+                if matches!(
+                    crate::recovery::runtime_helpers::role_of(*t as u64),
+                    Some(crate::recovery::runtime_helpers::RuntimeHelper::IsInst)
+                        | Some(
+                            crate::recovery::runtime_helpers::RuntimeHelper::ClassIsAssignable
+                        )
+                ) {
+                    return None;
+                }
+            }
+        }
+        if crate::recovery::env_flags::flag("ILR_FINDBG") {
+            eprintln!("[finally] pad B{hb} body insns {}..{}", ec + 1, body_end);
+        }
+        Some((ec + 1, body_end))
+    }
+
     /// Render a catch/finally HANDLER body from the region's landing-pad
     /// block. The landing pad is real CFG code — its klass checks ARE the
     /// managed catch filter — so it gets the same structuring as any block.
@@ -5884,9 +9661,15 @@ impl<'a> Structurer<'a> {
         if hb >= self.sc.blocks.len() {
             return Vec::new();
         }
+        // Start at the handler PROPER, not at a trampoline. The pad the LSDA
+        // names is usually a `b <dispatcher>` stub, and walking the stub emits
+        // `finally { goto L<dispatcher>; }` while the real handler is left to
+        // the coverage repair pass (38 of the 45 finally bodies in R76 were
+        // exactly one goto).
+        let hb = pad_root(self.sc, self.insns, hb);
         if !self.emitted.borrow_mut().insert(hb) {
             // pad already rendered in another clause — reference it
-            if std::env::var("ILR_HANDLERDBG").is_ok() {
+            if crate::recovery::env_flags::flag("ILR_HANDLERDBG") {
                 eprintln!("[handler] pad B{hb} ALREADY emitted at depth {depth} -> goto");
             }
             return vec![self.goto_stmt_reason(hb, GotoReason::HandlerPad)];
@@ -5903,6 +9686,11 @@ impl<'a> Structurer<'a> {
         // (`self.emitted.borrow_mut().remove(&cur);`); the handler path simply
         // never got the same line.
         self.emitted.borrow_mut().remove(&hb);
+        // Force the handler pad's label to be emitted when emit_region visits it.
+        // Without this, the pad is emitted without its label (it's not in sc.labels
+        // because handler pads are exception-handling landing pads, not normal CFG
+        // branch targets), and later gotos to the pad dangle with "target not emitted".
+        self.forced_labels.borrow_mut().insert(hb);
         // The handler must structure its OWN control flow: the outer walk's
         // `stops` fence the try-region merge points, but a landing pad's
         // branches target resume blocks BEYOND those fences — structuring
@@ -5917,6 +9705,19 @@ impl<'a> Structurer<'a> {
         // `hb` is excluded so a pad that also has an ordinary predecessor
         // still renders its body.
         let mut handler_stops: HashSet<usize> = self.normal_reachable.clone();
+        // Stop at every OTHER handler's entry. Landing pads are not branch
+        // targets, so they are absent from `normal_reachable`, and a handler
+        // walk that only stops at normally-reachable blocks runs straight
+        // through the sibling handlers' pads: the FIRST clause then owns every
+        // handler body in the method and all the others render
+        // `catch { goto L<pad> }` (9 of 10 catch bodies in 0x15A07DC, 912 of
+        // 1,707 corpus-wide). A C# handler ends where the next one begins.
+        for &h in self.handler_of.values() {
+            let root = pad_root(self.sc, self.insns, h);
+            if root != hb {
+                handler_stops.insert(root);
+            }
+        }
         handler_stops.remove(&hb);
         // Re-entry into try-folded code from a pad resume edge must NOT fold
         // another try (pad → resume-in-body → try → pad → …). The handler
@@ -5924,8 +9725,12 @@ impl<'a> Structurer<'a> {
         let prev = self.in_handler.replace(true);
         let (mut stmts, _) = self.emit_region(hb, &handler_stops, loops, loop_exits, depth + 1);
         self.in_handler.set(prev);
-        if std::env::var("ILR_HANDLERDBG").is_ok() {
-            eprintln!("[handler] pad B{hb} at depth {depth} -> {} stmts: {:?}", stmts.len(), stmts);
+        if crate::recovery::env_flags::flag("ILR_HANDLERDBG") {
+            eprintln!(
+                "[handler] pad B{hb} at depth {depth} -> {} stmts: {:?}",
+                stmts.len(),
+                stmts
+            );
         }
         if stmts.is_empty() {
             // genuinely empty handler (pure unwinding): keep it explicit
@@ -5985,19 +9790,44 @@ impl<'a> Structurer<'a> {
         // is the target itself. Decided here (not in `find_merge`) because it
         // must be suppressed for loop headers: a back-edge target is reachable
         // from the header's arm without being a join.
-        let skip_merge = if !loops.contains_key(&taken)
-            && !fall.is_some_and(|f| loops.contains_key(&f))
+        let stop_successor = stops
+            .contains(&taken)
+            .then_some(taken)
+            .or_else(|| fall.filter(|f| stops.contains(f)));
+        let split_stop_edges =
+            fall.is_some_and(|f| f != taken && stops.contains(&taken) && stops.contains(&f));
+        let mut skip_merge =
+            if !loops.contains_key(&taken) && !fall.is_some_and(|f| loops.contains_key(&f)) {
+                match fall {
+                    Some(f) if reachable_block(self.sc, f, taken) => Some(taken),
+                    Some(f) if reachable_block(self.sc, taken, f) => Some(f),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        // A path from an enclosing stop to the branch target may exist only
+        // after a loop iteration. That reachability does not make the target
+        // this branch's skip-merge; the current edge must return to the stop.
+        if split_stop_edges
+            || stop_successor.is_some_and(|boundary| skip_merge.is_some_and(|m| m != boundary))
         {
-            match fall {
-                Some(f) if reachable_block(self.sc, f, taken) => Some(taken),
-                Some(f) if reachable_block(self.sc, taken, f) => Some(f),
-                _ => None,
-            }
-        } else {
-            None
-        };
+            skip_merge = None;
+        }
 
         let mut merge = skip_merge.or_else(|| find_merge(self.sc, blk, fall, Some(taken)));
+        // An arm that immediately enters an enclosing region's stop has
+        // already left this `if`'s structuring scope. Do not select a farther
+        // common-reachable block as this guard's join: a loop can make that
+        // block reachable from the stopped edge on a later iteration, even
+        // though the current path must resume at the enclosing stop first.
+        // For example, a type check inside a delegate CAS loop branches to a
+        // throw block on mismatch and falls into the loop's CAS block on
+        // match. The CAS path can reach the throw block on a future iteration,
+        // but that does not make the throw block the type check's merge.
+        if split_stop_edges || stop_successor.is_some_and(|boundary| merge != Some(boundary)) {
+            merge = None;
+        }
         // DETECTION: a merge must be reachable from BOTH arms — that is what
         // "merge" means, and `ipdom[header]` guarantees it. If a chosen merge
         // is reachable from only one arm (a stale answer from the reachability
@@ -6023,9 +9853,43 @@ impl<'a> Structurer<'a> {
             inner_stops.insert(m);
         }
 
-        let terminates = |body: &[Stmt]| {
-            body.last().is_some_and(|s| matches!(s, Stmt::Return(_) | Stmt::Throw(_)))
-        };
+        // RECURSIVE termination check: a body terminates when control can
+        // never fall through past it. That is true for Return/Throw/Goto
+        // directly, AND for an If whose both arms terminate (e.g.
+        // `if (c) { throw } else { goto L0; }` — every path leaves), AND for
+        // a body whose last statement is such an If (the body ends because
+        // the If ends). Without the recursive check the nested example
+        // `if (outer) { if (inner) { throw } else { goto L0 } } throw X;`
+        // kept handing `throw X` back as the outer merge continuation because
+        // the outer then-body's last stmt was an If, not a Throw.
+        fn body_terminates(body: &[Stmt]) -> bool {
+            match body.last() {
+                Some(Stmt::Return(_)) | Some(Stmt::Throw(_)) | Some(Stmt::Goto(_)) => true,
+                Some(Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                }) => {
+                    // A/B toggle: the legacy behaviour treats a nested If as
+                    // NOT terminating, which leaves `both_terminate` false for
+                    // `if (outer) { if (inner) {throw} else {goto} } throw`
+                    // and hands the trailing throw back as the merge
+                    // continuation (the misplaced-throw class).
+                    if throw_fix_off() {
+                        return false;
+                    }
+                    if then_body.is_empty() {
+                        return false;
+                    }
+                    if else_body.is_empty() {
+                        return false;
+                    }
+                    body_terminates(then_body) && body_terminates(else_body)
+                }
+                _ => false,
+            }
+        }
+        let terminates = body_terminates;
 
         // FLAT GUARD (`merge == taken`): `if (c) goto JOIN; <fall body>; JOIN:`.
         //
@@ -6081,14 +9945,13 @@ impl<'a> Structurer<'a> {
         // flat guards are lone/short chains where the fuse never fires (the
         // fall arm begins with assignments, not another guard shell), so the
         // flat form paid a goto and saved nothing.
-        let fall_is_guard = fall.is_some_and(|f| {
-            self.sc.blocks.get(f).and_then(|b| b.succ_taken) == Some(taken)
-        });
+        let fall_is_guard =
+            fall.is_some_and(|f| self.sc.blocks.get(f).and_then(|b| b.succ_taken) == Some(taken));
         let flat_chain = self.flat_chain_next.get() == Some(blk)
             || depth + LONE_GUARD_HEADROOM >= MAX_NEST_DEPTH
             || fall_is_guard;
         if merge == Some(taken) && flat_chain {
-            if std::env::var("ILR_IFDBG").is_ok() {
+            if crate::recovery::env_flags::flag("ILR_IFDBG") {
                 eprintln!(
                     "[flat-guard] blk={blk} join={taken} fall={fall:?} fall_in_stops={} cond={cond:?}",
                     fall.map(|f| inner_stops.contains(&f)).unwrap_or(true)
@@ -6104,8 +9967,7 @@ impl<'a> Structurer<'a> {
             } else {
                 Vec::new()
             };
-            let emitted_fall_blocks: HashSet<usize> = self.emission_log.borrow()
-                [emitted_before..]
+            let emitted_fall_blocks: HashSet<usize> = self.emission_log.borrow()[emitted_before..]
                 .iter()
                 .copied()
                 .collect();
@@ -6168,7 +10030,11 @@ impl<'a> Structurer<'a> {
             let mut conds: Vec<Expr> = vec![cond.clone()];
             loop {
                 let mergeable = match else_body.first() {
-                    Some(Stmt::If { then_body, else_body: e, .. }) => {
+                    Some(Stmt::If {
+                        then_body,
+                        else_body: e,
+                        ..
+                    }) => {
                         e.is_empty()
                             && then_body.len() == 1
                             && matches!(&then_body[0], Stmt::Goto(l) if *l == target_label)
@@ -6240,22 +10106,15 @@ impl<'a> Structurer<'a> {
             // label jump per guard. Keep the flat goto form when nesting the
             // body would change the scope of a declared local or make a label
             // reachable only conditionally.
-            let labels_are_internal = flat_guard_labels_are_internal(
-                self.sc,
-                &else_body,
-                &emitted_fall_blocks,
-                blk,
-            );
-            if let Some(rewritten) = flat_guard_replacement(
-                &cond_acc,
-                &else_body,
-                depth,
-                labels_are_internal,
-            ) {
+            let labels_are_internal =
+                flat_guard_labels_are_internal(self.sc, &else_body, &emitted_fall_blocks, blk);
+            if let Some(rewritten) =
+                flat_guard_replacement(&cond_acc, &else_body, depth, labels_are_internal)
+            {
                 if !self.discovery {
-                    STRUCT_CENSUS.flat_guard_structured.fetch_add(
-                        1, std::sync::atomic::Ordering::Relaxed,
-                    );
+                    STRUCT_CENSUS
+                        .flat_guard_structured
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 return (vec![rewritten], Some(taken));
             }
@@ -6267,7 +10126,9 @@ impl<'a> Structurer<'a> {
                         STRUCT_CENSUS.flat_guard_refused_label.fetch_add(1, Relaxed);
                     }
                     Some(FlatGuardNestingRefusal::Declaration) => {
-                        STRUCT_CENSUS.flat_guard_refused_declaration.fetch_add(1, Relaxed);
+                        STRUCT_CENSUS
+                            .flat_guard_refused_declaration
+                            .fetch_add(1, Relaxed);
                     }
                     Some(FlatGuardNestingRefusal::Depth) => {
                         STRUCT_CENSUS.flat_guard_refused_depth.fetch_add(1, Relaxed);
@@ -6276,9 +10137,16 @@ impl<'a> Structurer<'a> {
                 }
             }
             let mut stmts = Vec::new();
+            // The join of a flat guard is normally a sibling, but inside a loop
+            // body it can be the loop HEADER — and a jump to the header is a
+            // continue, not a goto (measured on 0x18141F0: a do-while whose
+            // body ended with a self-loop goto to its own label). jump_stmt
+            // makes exactly that substitution for the innermost loop and never
+            // turns a cross-loop edge into a continue.
+            let jump = self.jump_or_tail(taken, loops, loop_exits, GotoReason::FlatGuard);
             stmts.push(Stmt::If {
                 cond: cond_acc,
-                then_body: vec![self.goto_stmt_reason(taken, GotoReason::FlatGuard)],
+                then_body: jump,
                 else_body: Vec::new(),
             });
             stmts.extend(else_body);
@@ -6294,9 +10162,102 @@ impl<'a> Structurer<'a> {
         // every null-guard inverted (`if (Motor == 0) { body }` where the
         // body runs only when Motor != 0) and produced the impossible
         // `if (x == 0) { if (x != 0) … }` nesting. Swap so `then` = taken.
-        let then_body = self.emit_arm(taken, &inner_stops, loops, loop_exits, depth, 1, merge);
-        let else_body =
-            self.emit_arm(fall.unwrap_or(blk + 1), &inner_stops, loops, loop_exits, depth, 1, merge);
+        let mut then_body = self.emit_arm(taken, &inner_stops, loops, loop_exits, depth, 1, merge);
+        let mut else_body = self.emit_arm(
+            fall.unwrap_or(blk + 1),
+            &inner_stops,
+            loops,
+            loop_exits,
+            depth,
+            1,
+            merge,
+        );
+
+        // During coverage repair, a successor already emitted by the main
+        // walk is also in `stops`. `emit_arm` correctly refuses to duplicate
+        // it, but an empty arm still needs to carry its edge to that existing
+        // block. Without this, a no-merge branch silently falls through into
+        // its sibling's repair code (or loses a shared return path).
+        if !split_stop_edges && merge.is_none() {
+            if stops.contains(&taken) && then_body.is_empty() {
+                then_body = self.jump_or_tail(taken, loops, loop_exits, GotoReason::NoMerge);
+            }
+            if let Some(fall) = fall {
+                if stops.contains(&fall) && else_body.is_empty() {
+                    else_body = self.jump_or_tail(fall, loops, loop_exits, GotoReason::NoMerge);
+                }
+            }
+        }
+
+        // Both successors are fenced by an enclosing construct, and they are
+        // different blocks. Keep both edges explicit. A terminal successor
+        // can still be safely inlined here: it cannot re-enter the enclosing
+        // construct, so doing so structures common exceptional exits instead
+        // of leaving them as entry-reachable labelled repair regions.
+        if split_stop_edges {
+            let fall = fall.expect("split stop edges require a fallthrough block");
+            let terminal_arm = |target: usize| {
+                let Some(block) = self.sc.blocks.get(target) else {
+                    return None;
+                };
+                let terminal = block.end > block.start
+                    && matches!(self.insns[block.end - 1].op, Op::Return | Op::Throw);
+                if terminal {
+                    let mut arm_stops = inner_stops.clone();
+                    arm_stops.remove(&target);
+                    return Some(
+                        self.emit_arm(target, &arm_stops, loops, loop_exits, depth, 1, None),
+                    );
+                }
+
+                // A branch may leave a loop through a synthetic NOP block
+                // whose only successor is the enclosing continuation. If
+                // this branch is that block's sole predecessor, redirect it
+                // to the continuation and account for the empty block here;
+                // otherwise coverage repair would strand a labelled NOP
+                // after the continuation had already been rendered.
+                let trivial_fallthrough = block.succ_taken.is_none()
+                    && block
+                        .succ_fall
+                        .is_some_and(|next| inner_stops.contains(&next))
+                    && block.start < block.end
+                    && (block.start..block.end).all(|i| matches!(self.insns[i].op, Op::Nop));
+                let sole_predecessor = self
+                    .sc
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, pred)| {
+                        pred.succ_taken == Some(target) || pred.succ_fall == Some(target)
+                    })
+                    .map(|(pred, _)| pred)
+                    .collect::<Vec<_>>();
+                if trivial_fallthrough && sole_predecessor.as_slice() == [blk] {
+                    let next = block.succ_fall.expect("checked above");
+                    self.visited.borrow_mut().insert(target);
+                    self.emitted.borrow_mut().insert(target);
+                    self.emission_log.borrow_mut().push(target);
+                    self.forced_labels.borrow_mut().insert(next);
+                    return Some(vec![self.goto_stmt_reason(next, GotoReason::SplitBoundary)]);
+                }
+                None
+            };
+            // A terminal successor is inlined above; a non-terminal one whose
+            // block starts a small return tail is inlined too — the tail is
+            // what the source had at this site. Anything else keeps its jump.
+            let then_body = terminal_arm(taken).unwrap_or_else(|| {
+                self.jump_or_tail(taken, loops, loop_exits, GotoReason::SplitBoundary)
+            });
+            let else_body = terminal_arm(fall).unwrap_or_else(|| {
+                self.jump_or_tail(fall, loops, loop_exits, GotoReason::SplitBoundary)
+            });
+            let stmts = vec![Stmt::If {
+                cond: cond.clone(),
+                then_body,
+                else_body,
+            }];
+            return (stmts, None);
+        }
 
         // SKIP pattern whose BODY arm is fenced: `if (c) goto J; BODY; J:` where
         // BODY is already fenced by an ANCESTOR's merge (the outer `if (a) goto
@@ -6317,8 +10278,24 @@ impl<'a> Structurer<'a> {
         // explicit as a jump to the join.
         if let Some(m) = skip_merge {
             if then_body.is_empty() && else_body.is_empty() {
-                if std::env::var("ILR_IFDBG").is_ok() {
+                if crate::recovery::env_flags::flag("ILR_IFDBG") {
                     eprintln!("[skip-empty] blk={blk} goto={m} cond={cond:?}");
+                }
+                // When the skip merge IS the taken block, both arms lead to
+                // the same place and the condition gates nothing. Drop the if
+                // entirely instead of emitting a vacuous branch.
+                if skip_merge == Some(taken) {
+                    // Both edges lead to the same block, so the branch gates
+                    // nothing — but the CONDITION still runs, and it is not
+                    // always free: a tested call (`bl F; cbnz w0, L`) is the
+                    // only place that `bl` is emitted (`boundary_stmts`' rule
+                    // (b) leaves an unnameable call result to its use site, and
+                    // the condition is that use site). Dropping the `if` then
+                    // deletes the call, not just the branch.
+                    if expr_has_call(cond) {
+                        return (vec![Stmt::Eval(cond.clone())], Some(m));
+                    }
+                    return (Vec::new(), Some(m));
                 }
                 let stmts = vec![Stmt::If {
                     cond: cond.clone(),
@@ -6339,7 +10316,8 @@ impl<'a> Structurer<'a> {
         // target was the then-arm's own label, and `branch_repair`'s inversion
         // then left the self-loop `L6: goto L6;`.
         let taken_arm_walked = self.emitted.borrow().contains(&taken);
-        let (mut cond_r, mut then_b, mut else_b) = if then_body.is_empty() && !else_body.is_empty() {
+        let (mut cond_r, mut then_b, mut else_b) = if then_body.is_empty() && !else_body.is_empty()
+        {
             (invert(cond), else_body, Vec::new())
         } else {
             (cond.clone(), then_body, else_body)
@@ -6356,13 +10334,22 @@ impl<'a> Structurer<'a> {
             std::mem::swap(&mut then_b, &mut else_b);
             else_b.clear();
         }
-        if std::env::var("ILR_IFDBG").is_ok() {
-            eprintln!("[if] blk={} merge={:?} skip={:?} taken={} fall={:?} then={} else={} cond={:?}", blk, merge, skip_merge, taken, fall, then_b.len(), else_b.len(), cond_r);
+        if crate::recovery::env_flags::flag("ILR_IFDBG") {
+            eprintln!(
+                "[if] blk={} merge={:?} skip={:?} taken={} fall={:?} then={} else={} cond={:?}",
+                blk,
+                merge,
+                skip_merge,
+                taken,
+                fall,
+                then_b.len(),
+                else_b.len(),
+                cond_r
+            );
         }
 
         // mergeless join: a goto is only needed when control can actually
-        let both_terminate =
-            !else_b.is_empty() && terminates(&then_b) && terminates(&else_b);
+        let both_terminate = !else_b.is_empty() && terminates(&then_b) && terminates(&else_b);
 
         // An `if` with no content on either side is a pure shell: the renderer
         // drops it, so nothing that went into its CONDITION reaches the
@@ -6378,23 +10365,61 @@ impl<'a> Structurer<'a> {
         // Verified to catch a real dropped chain (see the audit docs), but it
         // must not become the default until the predicate distinguishes
         // "shell dropped" from "arm already emitted".
-        if std::env::var("ILR_AUDIT_STRICT").is_ok()
-            && then_b.is_empty()
-            && else_b.is_empty()
-        {
+        if crate::recovery::env_flags::flag("ILR_AUDIT_STRICT") && then_b.is_empty() && else_b.is_empty() {
             let mut d = self.ctx.dropped_claims.borrow_mut();
             for i in cond_claims {
                 d.insert(*i);
             }
         }
 
+        if crate::recovery::env_flags::flag("ILR_THROWDBG")
+            && self.insns.first().is_some_and(|i| i.address == 0x1489BAC)
+        {
+            eprintln!(
+                "[throwdbg] blk={} taken={} fall={:?} merge={:?} both_term={} then={} else={} mst={} mem={} then_term={} else_term={}",
+                blk, taken, fall, merge, both_terminate,
+                then_b.len(), else_b.len(),
+                merge.map_or(false, |m| stops.contains(&m)),
+                merge.map_or(false, |m| self.emitted.borrow().contains(&m)),
+                terminates(&then_b), terminates(&else_b)
+            );
+        }
+
         let mut stmts = Vec::new();
         let then_terminated = terminates(&then_b);
         let else_terminated = terminates(&else_b);
-        stmts.push(Stmt::If { cond: cond_r, then_body: then_b, else_body: else_b });
+        stmts.push(Stmt::If {
+            cond: cond_r,
+            then_body: then_b,
+            else_body: else_b,
+        });
+        // A branch inside a loop can reconverge at a block outside the loop
+        // body without that block being the loop's ordinary exit. The arm walk
+        // stops at that join, and the loop emitter resumes at `exit_blk`; if
+        // this join is not carried explicitly, that path disappears. This is
+        // the conditional side-exit shape where one arm continues/returns and
+        // the other reaches a post-loop block (for example, a guarded array
+        // element return inside a scan loop).
+        if let Some(m) = merge.filter(|&m| {
+            self.in_loop_body.get()
+                && stops.contains(&m)
+                && self.loop_body_exit.get() != Some(m)
+        }) {
+            if !both_terminate {
+                let s = self.jump_or_tail(m, loops, loop_exits, GotoReason::LoopExit);
+                stmts.extend(s);
+                return (stmts, None);
+            }
+        }
         if let Some(m) = merge {
-            if std::env::var("ILR_IFDBG").is_ok() {
-                eprintln!("[merge] blk={} m={} in_stops={} emitted={}", blk, m, stops.contains(&m), self.emitted.borrow().contains(&m));
+            if crate::recovery::env_flags::flag("ILR_IFDBG") {
+                eprintln!(
+                    "[merge] blk={} m={} in_stops={} emitted={}",
+                    blk,
+                    m,
+                    stops.contains(&m),
+                    self.emitted.borrow().contains(&m)
+                );
             }
             let m_stops = stops.contains(&m);
             let m_emitted = self.emitted.borrow().contains(&m);
@@ -6404,18 +10429,55 @@ impl<'a> Structurer<'a> {
                 // than recursing one level deeper into it) is what keeps a long
                 // chain of guards at constant nesting depth; recursing here is
                 // how a chain reached `MAX_NEST_DEPTH` and lost its tail.
+                //
+                // DEAD MERGE: when both arms terminate (throw/return/goto),
+                // control can never reach the merge from this if-else. Walking
+                // it placed the merge's statements — very often another `throw`
+                // — AFTER the if-else as if they were live code.
+                //
+                // Suppress ONLY when the merge has no OTHER live entry: every
+                // predecessor is one of this branch's edges (`blk`/`taken`/
+                // `fall`) or is itself a terminal block (ends in Return/Throw).
+                // A merge reached from any other non-terminating block is still
+                // live, and suppressing it would make `emit_region` abandon the
+                // tail, which the coverage-repair re-walk then re-emits — a net
+                // throw INCREASE (observed on ReorderItems @0x14975C0, 6→33).
+                if both_terminate && !throw_fix_off() {
+                    let merge_is_dead =
+                        self.sc.preds.get(m).map_or(true, |ps| {
+                            ps.iter().all(|&p| {
+                                p == blk
+                                    || p == taken
+                                    || fall == Some(p)
+                                    || self.sc.blocks.get(p).map_or(true, |bb| {
+                                        bb.end > bb.start
+                                            && matches!(
+                                                self.insns[bb.end - 1].op,
+                                                Op::Return | Op::Throw
+                                            )
+                                    })
+                            })
+                        });
+                    if merge_is_dead {
+                        DEAD_MERGE_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return (stmts, None);
+                    }
+                }
                 return (stmts, Some(m));
             }
             if m_emitted && !(then_terminated && else_terminated) {
                 // The merge was already emitted by an earlier arm walk —
-                // emit an explicit jump so control still flows there.
-                stmts.push(self.goto_stmt_reason(m, GotoReason::MergeEmitted));
+                // emit an explicit jump so control still flows there, unless
+                // what the merge starts is a duplicable return tail.
+                let tail = self.goto_or_tail(m, GotoReason::MergeEmitted);
+                stmts.extend(tail);
             }
         } else if !taken_arm_walked
             && !matches!(stmts.last(), Some(Stmt::Goto(_)))
             && !both_terminate
         {
-            stmts.push(self.goto_stmt_reason(taken, GotoReason::NoMerge));
+            let s = self.jump_or_tail(taken, loops, loop_exits, GotoReason::NoMerge);
+            stmts.extend(s);
         }
         (stmts, None)
     }
@@ -6453,8 +10515,15 @@ impl<'a> Structurer<'a> {
         };
         let (mut stmts, next) =
             self.emit_region(effective, stops, loops, loop_exits, depth + depth_step);
-        if std::env::var("ILR_IFDBG").is_ok() {
-            eprintln!("[arm] start={} effective={} stmts={} next={:?} stops_has_start={}", start, effective, stmts.len(), next, stops.contains(&start));
+        if crate::recovery::env_flags::flag("ILR_IFDBG") {
+            eprintln!(
+                "[arm] start={} effective={} stmts={} next={:?} stops_has_start={}",
+                start,
+                effective,
+                stmts.len(),
+                next,
+                stops.contains(&start)
+            );
         }
         // Drop a trailing `goto` ONLY when it targets THIS arm's join. The join
         // is emitted as the sibling immediately after the `if`, so such a goto
@@ -6468,6 +10537,28 @@ impl<'a> Structurer<'a> {
             let jl = label_name(self.sc, j);
             while matches!(stmts.last(), Some(Stmt::Goto(l)) if *l == jl) {
                 stmts.pop();
+            }
+        }
+        // The arm walk returns its stopping block separately from its
+        // statements. Its parent usually resumes at an ordinary join, but a
+        // secondary stop has no such continuation path: dropping it turns the
+        // arm into a fall-through into its sibling or out of the method. Carry
+        // that edge here; the primary join remains a natural fall-through.
+        if let Some(next) = next.filter(|next| stops.contains(next) && Some(*next) != join) {
+            let terminal = stmts.last().is_some_and(|stmt| {
+                matches!(
+                    stmt,
+                    Stmt::Return(_)
+                        | Stmt::Throw(_)
+                        | Stmt::Goto(_)
+                        | Stmt::Break
+                        | Stmt::Continue
+                )
+            });
+            let target = label_name(self.sc, next);
+            let already_jumps = matches!(stmts.last(), Some(Stmt::Goto(label)) if *label == target);
+            if !terminal && !already_jumps {
+                stmts.push(self.goto_stmt_reason(next, GotoReason::SplitBoundary));
             }
         }
         stmts
@@ -6557,6 +10648,10 @@ impl<'a> Structurer<'a> {
         outer_exits: &[(usize, usize)],
         depth: usize,
     ) -> (Vec<Stmt>, Option<usize>) {
+        let exit_mark = self.bailed_exits.borrow().len();
+        // The loop statement renders the header's test/prelude, so the block
+        // has text even though it never passes emit_region's guard.
+        self.rendered.borrow_mut().insert(header);
         let hb = &self.sc.blocks[header];
         let outside = |t: Option<usize>| t.map(|t| !info.body.contains(&t)).unwrap_or(false);
         let exit_on_fall = outside(hb.succ_fall);
@@ -6583,9 +10678,7 @@ impl<'a> Structurer<'a> {
             let mut e = None;
             for &l in info.latches.iter() {
                 let lb = &self.sc.blocks[l];
-                if lb.end <= lb.start
-                    || !matches!(self.insns[lb.end - 1].op, Op::CondJump(_))
-                {
+                if lb.end <= lb.start || !matches!(self.insns[lb.end - 1].op, Op::CondJump(_)) {
                     continue;
                 }
                 if lb.succ_taken == Some(header) && outside(lb.succ_fall) {
@@ -6648,14 +10741,15 @@ impl<'a> Structurer<'a> {
         // A header `CondJump` that keeps both edges inside the body is
         // interior code (see `header_exit`), so the do-while/latch path below
         // must own the condition instead.
-        let has_header_test = header_exit.is_some()
-            && matches!(self.insns[hb.end - 1].op, Op::CondJump(_));
+        let has_header_test =
+            header_exit.is_some() && matches!(self.insns[hb.end - 1].op, Op::CondJump(_));
 
         if has_header_test {
             let mut cond = self.branch_condition(header);
             if !exit_on_fall {
                 cond = invert(&cond); // taken exits → invert for `while`
             }
+            let pre = self.unclaimed_pre_test_prelude(header);
             // ROTATED loop: the header is its OWN latch — the back edge is the
             // header's own branch back to its first instruction, so the body
             // lives inside the header and the native code runs it BEFORE the
@@ -6666,7 +10760,7 @@ impl<'a> Structurer<'a> {
             // body — an unkillable infinite loop). Only `do { body } while
             // (cond)` keeps the body's "at least once" and its reassignments.
             if info.latches.contains(&header) {
-                let body = match body_start {
+                let mut body = match body_start {
                     Some(b) => {
                         let (body, _) = self.emit_loop_body(
                             b,
@@ -6684,7 +10778,35 @@ impl<'a> Structurer<'a> {
                     }
                     None => self.fold_prelude(header),
                 };
-                return (vec![Stmt::DoWhile { body, cond }], exit_blk);
+                self.adopt_orphan_loop_blocks(
+                    header,
+                    info,
+                    &mut body,
+                    &body_stops,
+                    loops,
+                    &loop_exits,
+                    depth,
+                );
+                // `do { body } while (test)` runs the body BEFORE the test,
+                // so the unclaimed pre-test stores lead the body.
+                let mut body = body;
+                if !pre.is_empty() {
+                    let mut lead = pre.clone();
+                    lead.extend(body);
+                    body = lead;
+                }
+                let mut stmts = vec![Stmt::DoWhile { body, cond }];
+                self.drain_bailed_exits(
+                    exit_mark,
+                    &mut stmts,
+                    header,
+                    exit_blk,
+                    outer_stops,
+                    loops,
+                    &loop_exits,
+                    depth,
+                );
+                return (stmts, exit_blk);
             }
             // Single-block loop (body == {header}): the body statements live
             // in the header itself before its CondJump — emit them directly
@@ -6705,7 +10827,7 @@ impl<'a> Structurer<'a> {
             // the test inlines them, and emitting them as well produced a dead
             // binding (`v40 = this._pickupRoot;` beside
             // `if (this._pickupRoot == 0)`).
-            let (body, _) = match body_start {
+            let (mut body, _) = match body_start {
                 Some(b) => {
                     let (rest, _) = self.emit_loop_body(
                         b,
@@ -6725,7 +10847,16 @@ impl<'a> Structurer<'a> {
                 }
                 None => (self.fold_prelude(header), None),
             };
-            if std::env::var("ILR_LOOPDBG").is_ok() {
+            self.adopt_orphan_loop_blocks(
+                header,
+                info,
+                &mut body,
+                &body_stops,
+                loops,
+                &loop_exits,
+                depth,
+            );
+            if crate::recovery::env_flags::flag("ILR_LOOPDBG") {
                 // Diagnostic only, and deliberately SIDE-EFFECT FREE: do not
                 // call `fold_prelude` here, it appends to the claim log.
                 eprintln!(
@@ -6742,15 +10873,47 @@ impl<'a> Structurer<'a> {
             // header itself (body_stops), so emit_region returns nothing even
             // though the header's prelude (before its CondJump) IS the body.
             if body.is_empty() && info.body.len() == 1 {
-                let prelude = self.fold_prelude(header);
+                let mut prelude = self.fold_prelude(header);
                 if !prelude.is_empty() {
-                    let stmts = vec![Stmt::While { cond, body: prelude }];
+                    let mut inner = pre.clone();
+                    inner.append(&mut prelude);
+                    let mut stmts = vec![Stmt::While {
+                        cond,
+                        body: inner,
+                    }];
+                    self.drain_bailed_exits(
+                        exit_mark,
+                        &mut stmts,
+                        header,
+                        exit_blk,
+                        outer_stops,
+                        loops,
+                        &loop_exits,
+                        depth,
+                    );
                     return (stmts, exit_blk);
                 }
             }
-            let stmts = vec![Stmt::While { cond, body }];
+            let mut stmts = pre;
+            stmts.push(Stmt::While { cond, body });
+            self.drain_bailed_exits(
+                exit_mark,
+                &mut stmts,
+                header,
+                exit_blk,
+                outer_stops,
+                loops,
+                &loop_exits,
+                depth,
+            );
             (stmts, exit_blk)
         } else {
+            if crate::recovery::env_flags::flag("ILR_LOOPDBG") {
+                eprintln!(
+                    "[loop2] header=B{} exit={:?} body={:?} latches={:?}",
+                    header, exit_blk, info.body, info.latches
+                );
+            }
             // The header's OWN code runs first on every iteration. When the
             // header terminates in a CondJump that does NOT leave the loop,
             // that branch is interior code (a hoisted null guard, a rotated
@@ -6765,7 +10928,14 @@ impl<'a> Structurer<'a> {
             let header_interior_branch = header_exit.is_none()
                 && info.body.len() > 1
                 && matches!(self.insns[hb.end - 1].op, Op::CondJump(_));
-            let (body, _) = if header_interior_branch {
+            // The header's pre-test statements when the walk starts BELOW it:
+            // the block is marked rendered here, so anything the body walk
+            // never visits (it starts at `body_start`, not at the header) is
+            // lost. `do { … } while` runs the body after the header, so these
+            // lead the body. Same rule as the `while` form: only what the
+            // condition did not claim.
+            let mut pre = self.unclaimed_header_prelude(header);
+            let (mut body, _) = if header_interior_branch {
                 body_stops.remove(&header);
                 let prev = self.skip_loop_header.replace(Some(header));
                 let r = self.emit_loop_body(
@@ -6780,17 +10950,21 @@ impl<'a> Structurer<'a> {
                 r
             } else {
                 match body_start {
-                    Some(b) => self.emit_loop_body(
-                        b,
-                        &body_stops,
-                        loops,
-                        &loop_exits,
-                        exit_blk,
-                        depth + 1,
-                    ),
+                    Some(b) => {
+                        self.emit_loop_body(b, &body_stops, loops, &loop_exits, exit_blk, depth + 1)
+                    }
                     None => (self.fold_prelude(header), None),
                 }
             };
+            self.adopt_orphan_loop_blocks(
+                header,
+                info,
+                &mut body,
+                &body_stops,
+                loops,
+                &loop_exits,
+                depth,
+            );
             // A latch that is a single self-jumping insn (e.g. the async
             // state machine's parking branch `B: jump B`) has NO statements
             // in the recovered IR — the interesting work sits in the blocks
@@ -6872,16 +11046,31 @@ impl<'a> Structurer<'a> {
                     }
                 }
             }
-            let stmts = vec![Stmt::DoWhile {
-                body: if empty_body {
-                    vec![Stmt::Comment(
-                        "spin wait (native self-loop; work precedes loop)".into(),
-                    )]
-                } else {
-                    body
-                },
+            let mut inner = if empty_body {
+                vec![Stmt::Comment(
+                    "spin wait (native self-loop; work precedes loop)".into(),
+                )]
+            } else {
+                body
+            };
+            if !pre.is_empty() {
+                pre.append(&mut inner);
+                inner = pre;
+            }
+            let mut stmts = vec![Stmt::DoWhile {
+                body: inner,
                 cond: c,
             }];
+            self.drain_bailed_exits(
+                exit_mark,
+                &mut stmts,
+                header,
+                exit_blk,
+                outer_stops,
+                loops,
+                &loop_exits,
+                depth,
+            );
             (stmts, exit_blk)
         }
     }
@@ -6952,8 +11141,7 @@ fn flat_guard_labels_are_internal(
                 if !fall_blocks.contains(&source) {
                     let is_guard_fall_edge = source == guard_header
                         && sc.blocks.get(guard_header).is_some_and(|guard| {
-                            guard.succ_fall == Some(target)
-                                && guard.succ_taken != Some(target)
+                            guard.succ_fall == Some(target) && guard.succ_taken != Some(target)
                         });
                     if !is_guard_fall_edge {
                         return false;
@@ -6978,20 +11166,24 @@ fn flat_guard_body_nesting_refusal(
         for s in stmts {
             let child_depth = match s {
                 Stmt::Label(_) if !labels_are_internal => {
-                    return Err(FlatGuardNestingRefusal::Label)
+                    return Err(FlatGuardNestingRefusal::Label);
                 }
                 Stmt::Label(_) => 0,
-                Stmt::Assign(_, Some(_), _) => {
-                    return Err(FlatGuardNestingRefusal::Declaration)
-                }
-                Stmt::If { then_body, else_body, .. } => {
-                    inspect(then_body, labels_are_internal)?
-                        .max(inspect(else_body, labels_are_internal)?)
-                }
+                Stmt::Assign(_, Some(_), _) => return Err(FlatGuardNestingRefusal::Declaration),
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => inspect(then_body, labels_are_internal)?
+                    .max(inspect(else_body, labels_are_internal)?),
                 Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
                     inspect(body, labels_are_internal)?
                 }
-                Stmt::Try { try_body, catches, finally_body } => {
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
                     let mut d = inspect(try_body, labels_are_internal)?;
                     for (_, body) in catches {
                         d = d.max(inspect(body, labels_are_internal)?);
@@ -7001,20 +11193,30 @@ fn flat_guard_body_nesting_refusal(
                     }
                     d
                 }
-                Stmt::Switch { cases, tail, .. } => {
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
                     let mut d = inspect(tail, labels_are_internal)?;
                     for (_, body) in cases {
                         d = d.max(inspect(body, labels_are_internal)?);
                     }
+                    if let Some(arm) = default {
+                        d = d.max(inspect(arm, labels_are_internal)?);
+                    }
                     d
                 }
-                Stmt::For { init, incr, body, .. } => {
-                    inspect(init, labels_are_internal)?
-                        .max(inspect(incr, labels_are_internal)?)
+                Stmt::For {
+                    init, incr, body, ..
+                } => inspect(init, labels_are_internal)?
+                    .max(inspect(incr, labels_are_internal)?)
+                    .max(inspect(body, labels_are_internal)?),
+                Stmt::Using { decl, body } => {
+                    inspect(std::slice::from_ref(decl), labels_are_internal)?
                         .max(inspect(body, labels_are_internal)?)
                 }
-                Stmt::Using { decl, body } => inspect(std::slice::from_ref(decl), labels_are_internal)?
-                    .max(inspect(body, labels_are_internal)?),
                 Stmt::Lock { body, .. } | Stmt::ForEach { body, .. } => {
                     inspect(body, labels_are_internal)?
                 }
@@ -7040,9 +11242,7 @@ fn flat_guard_body_nesting_refusal(
     // nesting ceiling used by the walker; deeply nested bodies stay flat.
     match inspect(stmts, labels_are_internal) {
         Err(refusal) => Some(refusal),
-        Ok(nested) if depth + 1 + nested > MAX_NEST_DEPTH => {
-            Some(FlatGuardNestingRefusal::Depth)
-        }
+        Ok(nested) if depth + 1 + nested > MAX_NEST_DEPTH => Some(FlatGuardNestingRefusal::Depth),
         Ok(_) => None,
     }
 }
@@ -7175,36 +11375,366 @@ fn st_name(li: usize) -> String {
     format!("v{li}")
 }
 
+/// `ILR_VNCENSUS=<csv>`: one row per surviving `vN` display name.
+///
+/// The vN work needs numbers, not anecdotes: how many refs each name carries,
+/// how many SSA versions map to it, how many definitions/uses it has, the
+/// local's managed type and slot origin, and the SHAPE of its definitions.
+/// Rows are appended from every render worker; the header is written once.
+fn vncensus_record(
+    rva: u64,
+    table: &super::locals::LocalTable,
+    insns: &[Insn],
+    text: &str,
+) {
+    use std::io::Write;
+    let Ok(path) = std::env::var("ILR_VNCENSUS") else {
+        return;
+    };
+    static WRITER: std::sync::OnceLock<
+        std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+    > = std::sync::OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let f = std::fs::File::create(&path).unwrap_or_else(|e| {
+            panic!("ILR_VNCENSUS: cannot create {path}: {e}")
+        });
+        let mut w = std::io::BufWriter::new(f);
+        let _ = writeln!(
+            w,
+            "rva,li,refs,versions,defs,uses,ty,origin,flags,defkinds,movesrc,s1,s1copy,s1mem,multivuse"
+        );
+        std::sync::Mutex::new(w)
+    });
+
+    // Tokenize the final text once: only `v<digits>` tokens that still name a
+    // table entry are residual vN references.
+    let mut refs: HashMap<usize, usize> = HashMap::new();
+    for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        let Some(rest) = tok.strip_prefix('v') else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(li) = rest.parse::<usize>() {
+            if li < table.infos.len() {
+                *refs.entry(li).or_default() += 1;
+            }
+        }
+    }
+    if refs.is_empty() {
+        return;
+    }
+
+    fn op_kind(op: &Op) -> &'static str {
+        match op {
+            Op::Move => "Move",
+            Op::Phi => "Phi",
+            Op::Call => "Call",
+            Op::CallVoid => "CallVoid",
+            Op::IndirectCall => "IndirectCall",
+            Op::Arith(_) => "Arith",
+            Op::FloatArith(_) => "FArith",
+            Op::Compare(_) => "Compare",
+            Op::Convert(_) => "Convert",
+            Op::NewObj(_) => "NewObj",
+            Op::NewArr(_) => "NewArr",
+            Op::Box(_) => "Box",
+            Op::LoadLength => "LoadLength",
+            Op::Jump(_) | Op::CondJump(_) => "Jump",
+            _ => "Other",
+        }
+    }
+    fn move_src(op: &Op, operands: &[Operand]) -> &'static str {
+        if !matches!(op, Op::Move) {
+            return "";
+        }
+        match operands.get(1) {
+            Some(Operand::Local(_)) => "local",
+            Some(Operand::Memory { .. }) => "mem",
+            Some(Operand::Immediate(_)) => "imm",
+            Some(Operand::Field(_)) => "field",
+            Some(Operand::InstanceField { .. }) => "ifield",
+            Some(Operand::Register(_)) => "reg",
+            Some(_) => "other",
+            None => "",
+        }
+    }
+    fn operand_locals(op: &Operand, out: &mut Vec<u32>) {
+        match op {
+            Operand::Local(v) => out.push(*v),
+            Operand::Memory { base, index, .. } => {
+                operand_locals(base, out);
+                if let Some(i) = index {
+                    operand_locals(i, out);
+                }
+            }
+            Operand::AddressOf(b) | Operand::ArrayLength(b) => operand_locals(b, out),
+            Operand::ArrayAccess { array, index } => {
+                operand_locals(array, out);
+                operand_locals(index, out);
+            }
+            Operand::InstanceField { base, .. } => operand_locals(base, out),
+            _ => {}
+        }
+    }
+
+    let mut versions: HashMap<usize, usize> = HashMap::new();
+    for &li in table.index_of.values() {
+        *versions.entry(li).or_default() += 1;
+    }
+    // Per VERSION first: the single-def/single-use share is a property of an
+    // SSA version, and a merged display name can pool several of them.
+    let mut vdefs: HashMap<u32, usize> = HashMap::new();
+    let mut vuses: HashMap<u32, usize> = HashMap::new();
+    let mut vop: HashMap<u32, &'static str> = HashMap::new();
+    let mut vsrc: HashMap<u32, &'static str> = HashMap::new();
+    for insn in insns {
+        let dpos = Insn::dest_position(&insn.op);
+        if let Some(pos) = dpos {
+            if let Some(Operand::Local(d)) = insn.operands.get(pos) {
+                *vdefs.entry(*d).or_default() += 1;
+                vop.insert(*d, op_kind(&insn.op));
+                let src = move_src(&insn.op, &insn.operands);
+                if !src.is_empty() {
+                    vsrc.insert(*d, src);
+                }
+            }
+        }
+        for (i, op) in insn.operands.iter().enumerate() {
+            if Some(i) == dpos {
+                continue;
+            }
+            let mut ls = Vec::new();
+            operand_locals(op, &mut ls);
+            for d in ls {
+                *vuses.entry(d).or_default() += 1;
+            }
+        }
+    }
+    // Aggregate to the display name.
+    let mut defs: HashMap<usize, Vec<&'static str>> = HashMap::new();
+    let mut moves: HashMap<usize, HashMap<&'static str, usize>> = HashMap::new();
+    let mut uses: HashMap<usize, usize> = HashMap::new();
+    // per display name: (single-def-single-use, ...-copy, ...-mem, one-def-many-use)
+    let mut singles: HashMap<usize, (usize, usize, usize, usize)> = HashMap::new();
+    for (&v, &li) in &table.index_of {
+        let d = vdefs.get(&v).copied().unwrap_or(0);
+        let u = vuses.get(&v).copied().unwrap_or(0);
+        for _ in 0..d {
+            defs.entry(li).or_default().push(vop.get(&v).copied().unwrap_or("?"));
+        }
+        if let Some(src) = vsrc.get(&v) {
+            *moves.entry(li).or_default().entry(src).or_default() += 1;
+        }
+        *uses.entry(li).or_default() += u;
+        let s = singles.entry(li).or_default();
+        if d == 1 && u == 1 {
+            s.0 += 1;
+            match vsrc.get(&v) {
+                Some(&"local") => s.1 += 1,
+                Some(&"mem") => s.2 += 1,
+                _ => {}
+            }
+        } else if d == 1 && u > 1 {
+            s.3 += 1;
+        }
+    }
+
+    let mut out = String::new();
+    for (&li, &refs) in &refs {
+        let info = &table.infos[li];
+        let d = defs.get(&li).cloned().unwrap_or_default();
+        let mut kinds: HashMap<&str, usize> = HashMap::new();
+        for k in &d {
+            *kinds.entry(k).or_default() += 1;
+        }
+        let kind_text = kinds
+            .iter()
+            .map(|(k, n)| format!("{k}:{n}"))
+            .collect::<Vec<_>>()
+            .join("+");
+        let move_text = moves
+            .get(&li)
+            .map(|m| {
+                m.iter()
+                    .map(|(k, n)| format!("{k}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            })
+            .unwrap_or_default();
+        let uses_total = uses.get(&li).copied().unwrap_or(0);
+        let mut flags = String::new();
+        if info.is_this {
+            flags.push('T');
+        }
+        if info.is_param.is_some() {
+            flags.push('P');
+        }
+        if info.is_return_buffer {
+            flags.push('R');
+        }
+        if info.is_incoming_arg {
+            flags.push('I');
+        }
+        let (s1, s1_copy, s1_mem, multi_use) =
+            singles.get(&li).copied().unwrap_or((0, 0, 0, 0));
+        out.push_str(&format!(
+            "{rva:#x},{li},{refs},{},{},{uses_total},{},{},{flags},{kind_text},{move_text},{s1},{s1_copy},{s1_mem},{multi_use}\n",
+            versions.get(&li).copied().unwrap_or(0),
+            d.len(),
+            info.ty.display_name(),
+            info.slot_origin,
+        ));
+    }
+    if let Ok(mut w) = writer.lock() {
+        let _ = w.write_all(out.as_bytes());
+    }
+}
+
+/// `x = new T(); if (x == null) return;` — the null test on a fresh
+/// allocation can never be true (a managed `new` returns a live object or
+/// throws OOM; the IL2CPP allocator helper never returns null). The guard is
+/// injected noise, and it is exactly what BLOCKS `object_init` from folding
+/// the following `x.A = …; x.B = …;` run into `new T { A = …, B = … }`.
+/// Removing it is unconditional: the tested value is the allocation result.
+fn strip_new_result_guards(stmts: &mut Vec<Stmt>) -> usize {
+    fn null_eq_target(cond: &Expr, target: &str) -> bool {
+        let is_null = |e: &Expr| matches!(e, Expr::Null | Expr::Int(0));
+        match cond {
+            Expr::Cmp(CmpKind::Eq, a, b) => {
+                (matches!(&**a, Expr::Var(n) if n == target) && is_null(b))
+                    || (matches!(&**b, Expr::Var(n) if n == target) && is_null(a))
+            }
+            _ => false,
+        }
+    }
+    let mut n = 0usize;
+    super::reconstruct::walk_mut(stmts, &mut |list| {
+        let mut i = 0usize;
+        while i < list.len() {
+            let target = match &list[i] {
+                Stmt::Assign(t, _, e)
+                    if matches!(
+                        e,
+                        Expr::NewObj(..) | Expr::NewArr(..) | Expr::CollectionInit { .. }
+                    ) =>
+                {
+                    t.clone()
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            // The guard need not be adjacent: a call or class-init statement
+            // between the allocation and the test still cannot make the fresh
+            // result null, so walk the straight-line run until the variable is
+            // mentioned, reassigned, or control flow intervenes.
+            let mut j = i + 1;
+            while j < list.len() {
+                let is_guard = matches!(
+                    &list[j],
+                    Stmt::If { cond, then_body, else_body }
+                        if else_body.is_empty()
+                            && then_body.len() == 1
+                            && matches!(then_body[0], Stmt::Return(_))
+                            && null_eq_target(cond, &target)
+                );
+                if is_guard {
+                    list.remove(j);
+                    n += 1;
+                    continue;
+                }
+                if matches!(&list[j], Stmt::Label(_))
+                    || super::reconstruct::leaves_region(&list[j])
+                    || super::reconstruct::stmt_mentions_deep(&list[j], &target)
+                {
+                    break;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+    });
+    n
+}
+
+/// Every label defined in the tree (trace helper).
+fn trace_defined_labels(stmts: &[Stmt]) -> HashSet<String> {
+    fn walk(list: &[Stmt], out: &mut HashSet<String>) {
+        for s in list {
+            if let Stmt::Label(l) = s {
+                out.insert(l.clone());
+            }
+            let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+            super::reconstruct::children(s, &mut kids);
+            for k in kids {
+                walk(k, out);
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(stmts, &mut out);
+    out
+}
+
+/// Every label a `goto` names (trace helper).
+fn trace_referenced_labels(stmts: &[Stmt]) -> HashSet<String> {
+    fn walk(list: &[Stmt], out: &mut HashSet<String>) {
+        for s in list {
+            if let Stmt::Goto(l) = s {
+                out.insert(l.clone());
+            }
+            let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+            super::reconstruct::children(s, &mut kids);
+            for k in kids {
+                walk(k, out);
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(stmts, &mut out);
+    out
+}
+
+/// `ILR_TRACE`: log every label `step` removed while a surviving `goto`
+/// still names it — the exact per-stage origin of the final markers.
+fn trace_label_drops(rva: u64, step: &str, before: &HashSet<String>, stmts: &[Stmt]) {
+    if before.is_empty() {
+        return;
+    }
+    let now = trace_defined_labels(stmts);
+    if before.difference(&now).next().is_none() {
+        return;
+    }
+    let refs = trace_referenced_labels(stmts);
+    for l in before.difference(&now) {
+        if refs.contains(l) {
+            eprintln!("[labdrop] {rva:#x} {step} {l}");
+        }
+    }
+}
+
 /// Remove `goto L…;` statements whose label is never defined anywhere in the
 /// rendered body (the emission guard can reference blocks that end up
 /// elided). Also drops now-empty trailing constructs.
 fn drop_unreachable_gotos(stmts: &mut Vec<Stmt>) {
     let mut labels: HashSet<String> = HashSet::new();
     fn collect(stmts: &[Stmt], labels: &mut HashSet<String>) {
-        // RECURSE: labels defined inside nested bodies (an if's else-arm, a
-        // loop body) are still valid goto targets. The old flat scan only
-        // saw the top list, so a `goto L1` pointing at a label inside an
-        // if-arm was wrongly stripped and its merge disappeared.
+        // RECURSE exhaustively (If arms, loop bodies, switch arms, try
+        // regions, using/lock/foreach bodies): a label defined anywhere in
+        // the tree is a valid goto target, and the hand-rolled match used to
+        // miss For/ForEach/Switch/StringSwitch — so a `goto L1` pointing at
+        // such a label was wrongly annotated "target not emitted".
         for s in stmts {
             if let Stmt::Label(l) = s {
                 labels.insert(l.clone());
             }
-            match s {
-                Stmt::If { then_body, else_body, .. } => {
-                    collect(then_body, labels);
-                    collect(else_body, labels);
-                }
-                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect(body, labels),
-                Stmt::Try { try_body, catches, finally_body } => {
-                    collect(try_body, labels);
-                    for (_, b) in catches {
-                        collect(b, labels);
-                    }
-                    if let Some(f) = finally_body {
-                        collect(f, labels);
-                    }
-                }
-                _ => {}
+            let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+            super::reconstruct::children(s, &mut kids);
+            for k in kids {
+                collect(k, labels);
             }
         }
     }
@@ -7227,29 +11757,181 @@ fn drop_unreachable_gotos(stmts: &mut Vec<Stmt>) {
             }
         }
         for s in stmts.iter_mut() {
-            match s {
-                Stmt::If { then_body, else_body, .. } => {
-                    strip(then_body, labels);
-                    strip(else_body, labels);
-                }
-                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => strip(body, labels),
-                // Gotos inside catch/finally bodies are ABI rethrow/cleanup
-                // edges to blocks emitted elsewhere — without recursing here
-                // they survive every sweep and render as dangling labels.
-                Stmt::Try { try_body, catches, finally_body } => {
-                    strip(try_body, labels);
-                    for (_, b) in catches {
-                        strip(b, labels);
-                    }
-                    if let Some(f) = finally_body {
-                        strip(f, labels);
-                    }
-                }
-                _ => {}
+            for k in super::reconstruct::children_mut(s) {
+                strip(k, labels);
             }
         }
     }
     strip(stmts, &labels);
+}
+
+/// `ILR_DANGLE=1` census: classify every `goto` whose label the final tree
+/// does not define. `[dangle]` reports the totals; this function returns
+/// `(dangling gotos, has switch, per-class counts)`.
+fn dangle_census(
+    stmts: &[Stmt],
+    post_repair: &HashSet<String>,
+    sc: &StructuredCfg,
+    insns: &[Insn],
+    reachable: &[bool],
+    rendered: &HashSet<usize>,
+) -> (u64, bool, [u64; 9]) {
+    let mut defined: HashSet<String> = HashSet::new();
+    let mut targets: HashSet<String> = HashSet::new();
+    collect_label_refs(stmts, &mut defined, &mut targets);
+    let mut name_to_block: HashMap<String, usize> = HashMap::new();
+    for b in 0..sc.blocks.len() {
+        name_to_block.entry(label_name(sc, b)).or_insert(b);
+    }
+    let mut switch_targets: HashSet<usize> = HashSet::new();
+    for insn in insns {
+        if let Op::Switch(ts) = &insn.op {
+            for &t in ts {
+                if let Some(&tb) = sc.block_of.get(t) {
+                    switch_targets.insert(tb);
+                }
+            }
+        }
+    }
+    // 0 total, 1 in a case body, 2 in another switch position, 3 label was
+    // defined after coverage repair, 4 target block unreachable, 5 target block
+    // never rendered, 6 target block rendered, 7 label resolves to no block,
+    // 8 target block is a switch case target.
+    let mut c = [0u64; 9];
+    let mut has_switch = false;
+    fn classify(
+        l: &str,
+        in_case: bool,
+        in_switch: bool,
+        post_repair: &HashSet<String>,
+        name_to_block: &HashMap<String, usize>,
+        switch_targets: &HashSet<usize>,
+        reachable: &[bool],
+        rendered: &HashSet<usize>,
+        c: &mut [u64; 9],
+    ) {
+        c[0] += 1;
+        if in_case {
+            c[1] += 1;
+        } else if in_switch {
+            c[2] += 1;
+        }
+        if post_repair.contains(l) {
+            c[3] += 1;
+        }
+        match name_to_block.get(l) {
+            None => c[7] += 1,
+            Some(&b) => {
+                if !reachable.get(b).copied().unwrap_or(false) {
+                    c[4] += 1;
+                }
+                if rendered.contains(&b) {
+                    c[6] += 1;
+                } else {
+                    c[5] += 1;
+                }
+                if switch_targets.contains(&b) {
+                    c[8] += 1;
+                }
+            }
+        }
+    }
+    fn walk(
+        list: &[Stmt],
+        in_case: bool,
+        in_switch: bool,
+        defined: &HashSet<String>,
+        post_repair: &HashSet<String>,
+        name_to_block: &HashMap<String, usize>,
+        switch_targets: &HashSet<usize>,
+        reachable: &[bool],
+        rendered: &HashSet<usize>,
+        c: &mut [u64; 9],
+        has_switch: &mut bool,
+    ) {
+        for s in list {
+            match s {
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
+                    *has_switch = true;
+                    for (_, b) in cases {
+                        walk(
+                            b, true, true, defined, post_repair, name_to_block, switch_targets,
+                            reachable, rendered, c, has_switch,
+                        );
+                    }
+                    walk(
+                        tail, false, true, defined, post_repair, name_to_block, switch_targets,
+                        reachable, rendered, c, has_switch,
+                    );
+                    if let Some(d) = default {
+                        walk(
+                            d, false, true, defined, post_repair, name_to_block, switch_targets,
+                            reachable, rendered, c, has_switch,
+                        );
+                    }
+                }
+                Stmt::StringSwitch { cases, tail, .. } => {
+                    *has_switch = true;
+                    for (_, b) in cases {
+                        walk(
+                            b, true, true, defined, post_repair, name_to_block, switch_targets,
+                            reachable, rendered, c, has_switch,
+                        );
+                    }
+                    if let Some(d) = tail {
+                        walk(
+                            d, false, true, defined, post_repair, name_to_block, switch_targets,
+                            reachable, rendered, c, has_switch,
+                        );
+                    }
+                }
+                _ => {
+                    // A dangling `goto`, or a marker an earlier sweep left in
+                    // the tree. Both count: the final text carries both.
+                    let dangle: Option<&str> = match s {
+                        Stmt::Goto(l) if !defined.contains(l.as_str()) => Some(l.as_str()),
+                        Stmt::Comment(cs) if cs.contains("(target not emitted)") => cs
+                            .strip_prefix("goto ")
+                            .and_then(|r| r.split_once(';').map(|(l, _)| l)),
+                        _ => None,
+                    };
+                    if let Some(l) = dangle {
+                        classify(
+                            l, in_case, in_switch, post_repair, name_to_block, switch_targets,
+                            reachable, rendered, c,
+                        );
+                    }
+                    let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+                    super::reconstruct::children(s, &mut kids);
+                    for k in kids {
+                        walk(
+                            k, in_case, in_switch, defined, post_repair, name_to_block,
+                            switch_targets, reachable, rendered, c, has_switch,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    walk(
+        stmts,
+        false,
+        false,
+        &defined,
+        post_repair,
+        &name_to_block,
+        &switch_targets,
+        reachable,
+        rendered,
+        &mut c,
+        &mut has_switch,
+    );
+    (c[0], has_switch, c)
 }
 
 /// Final invariant: no `goto Lx;` in the finished text may reference a label the
@@ -7269,19 +11951,40 @@ pub(crate) fn strip_undefined_gotos(out: &mut String) {
     if !out.contains("goto L") {
         return;
     }
+    /// A label name the renderer can produce: `L<blk>`, or `L<blk>_<k>` when
+    /// the auto name collided with an assigned one (`label_name`). The old
+    /// check accepted only the first form, so a defined `L4_1:` was invisible
+    /// to the sweep: `case 4: goto L4_1;` stayed in the text with no target.
+    fn is_label_name(l: &str) -> bool {
+        let Some(rest) = l.strip_prefix('L') else {
+            return false;
+        };
+        let mut parts = rest.split('_');
+        let Some(first) = parts.next() else {
+            return false;
+        };
+        if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        match parts.next() {
+            None => true,
+            Some(k) => {
+                !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()) && parts.next().is_none()
+            }
+        }
+    }
     let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in out.lines() {
         let t = line.trim();
         if let Some(l) = t.strip_suffix(':') {
-            if l.starts_with('L') && l[1..].bytes().all(|b| b.is_ascii_digit()) && l.len() > 1 {
+            if is_label_name(l) {
                 defined.insert(l.to_string());
             }
         }
     }
     /// `Lx` if `t` is exactly a label token, else `None`.
     fn label_tok(t: &str) -> Option<&str> {
-        Some(t.strip_suffix(';')?)
-            .filter(|l| l.starts_with('L') && l.len() > 1 && l[1..].bytes().all(|b| b.is_ascii_digit()))
+        Some(t.strip_suffix(';')?).filter(|l| is_label_name(l))
     }
     let mut result = String::with_capacity(out.len());
     for raw in out.split_inclusive('\n') {
@@ -7349,7 +12052,8 @@ pub(crate) fn strip_unread_bindings(out: &mut String) {
     /// The `vN` of a `vN = …;` binding line, else `None`.
     fn binding_target(t: &str) -> Option<&str> {
         let (name, _) = t.split_once(" = ")?;
-        if name.len() > 1 && name.starts_with('v') && name[1..].bytes().all(|b| b.is_ascii_digit()) {
+        if name.len() > 1 && name.starts_with('v') && name[1..].bytes().all(|b| b.is_ascii_digit())
+        {
             Some(name)
         } else {
             None
@@ -7369,7 +12073,10 @@ pub(crate) fn strip_unread_bindings(out: &mut String) {
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
                     j += 1;
                 }
-                if !bytes.get(j).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
+                if !bytes
+                    .get(j)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                {
                     out.push(&t[i..j]);
                     i = j;
                     continue;
@@ -7383,10 +12090,7 @@ pub(crate) fn strip_unread_bindings(out: &mut String) {
     // Reads per name. The TARGET of a binding is a def and never counts, or a
     // name bound twice with no reader would look read by its own other binding.
     let lines: Vec<&str> = out.split_inclusive('\n').collect();
-    let bindings: Vec<Option<&str>> = lines
-        .iter()
-        .map(|l| binding_target(l.trim()))
-        .collect();
+    let bindings: Vec<Option<&str>> = lines.iter().map(|l| binding_target(l.trim())).collect();
     let mut reads: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (i, line) in lines.iter().enumerate() {
         // Only the RIGHT-HAND SIDE counts on a binding line: the target is a
@@ -7458,9 +12162,7 @@ fn sanitize_stmts(stmts: &mut Vec<Stmt>) {
             Stmt::Assign(target, _, Expr::Var(src)) if target == src => {
                 *stmt = Stmt::Comment("\u{0}removed".into());
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. }
-                if body.is_empty() =>
-            {
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } if body.is_empty() => {
                 // Keep the loop itself (its condition may be meaningful) but
                 // mark the empty body instead of rendering a bare infinite
                 // loop that looks like a decompiler failure.
@@ -7478,8 +12180,11 @@ fn sanitize_stmts(stmts: &mut Vec<Stmt>) {
         //   statements exist, keep the shell.
         // - Artifact ctor calls with no recoverable operands.
         match stmt {
-            Stmt::If { cond, then_body, else_body }
-                if then_body.iter().all(is_noise_stmt)
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } if then_body.iter().all(is_noise_stmt)
                     && else_body.iter().all(is_noise_stmt)
                     // A label inside the branch can be a goto target from
                     // elsewhere in the method — dropping the branch would
@@ -7510,7 +12215,12 @@ fn sanitize_stmts(stmts: &mut Vec<Stmt>) {
         // else-arm with no payload after a terminating then-arm → drop it
         // (`return x; else {}` — the else is unreachable scheduling shape).
         // Applied after the whole-branch fold above, before recursion.
-        if let Stmt::If { then_body, else_body, .. } = stmt {
+        if let Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } = stmt
+        {
             let then_terminates = then_body
                 .last()
                 .is_some_and(|s| matches!(s, Stmt::Return(_) | Stmt::Throw(_)));
@@ -7523,7 +12233,11 @@ fn sanitize_stmts(stmts: &mut Vec<Stmt>) {
             }
         }
         match stmt {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 sanitize_stmts(then_body);
                 sanitize_stmts(else_body);
             }
@@ -7575,9 +12289,9 @@ pub(crate) fn branch_repair(stmts: &mut Vec<Stmt>) {
     // itself is idempotent (a folded guard no longer matches the shape), but the
     // census must count it once — keyed by statement address, never dereferenced.
     let mut fold_seen: HashSet<*const Stmt> = HashSet::new();
-    branch_repair_local(stmts, &global_gotos, &mut fold_seen);
+    branch_repair_local(stmts, &mut global_gotos, &mut fold_seen);
     fold_shared_if_suffixes(stmts);
-    fold_gotos_to_void_return(stmts);
+    fold_gotos_to_return(stmts);
     fold_gotos_to_break(stmts);
     let mut labels: HashSet<String> = HashSet::new();
     collect_labels(stmts, &mut labels);
@@ -7599,26 +12313,41 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
     fn has_declaration(stmts: &[Stmt]) -> bool {
         stmts.iter().any(|stmt| match stmt {
             Stmt::Assign(_, ty, _) => ty.is_some(),
-            Stmt::If { then_body, else_body, .. } => {
-                has_declaration(then_body) || has_declaration(else_body)
-            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => has_declaration(then_body) || has_declaration(else_body),
             Stmt::While { body, .. }
             | Stmt::DoWhile { body, .. }
             | Stmt::ForEach { body, .. }
             | Stmt::Lock { body, .. } => has_declaration(body),
-            Stmt::For { init, incr, body, .. } => {
-                has_declaration(init) || has_declaration(incr) || has_declaration(body)
-            }
+            Stmt::For {
+                init, incr, body, ..
+            } => has_declaration(init) || has_declaration(incr) || has_declaration(body),
             Stmt::Using { decl, body } => {
                 has_declaration(std::slice::from_ref(decl)) || has_declaration(body)
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 has_declaration(try_body)
                     || catches.iter().any(|(_, body)| has_declaration(body))
-                    || finally_body.as_ref().is_some_and(|body| has_declaration(body))
+                    || finally_body
+                        .as_ref()
+                        .is_some_and(|body| has_declaration(body))
             }
-            Stmt::Switch { cases, tail, .. } => {
-                cases.iter().any(|(_, body)| has_declaration(body)) || has_declaration(tail)
+            Stmt::Switch {
+                cases,
+                tail,
+                default,
+                ..
+            } => {
+                cases.iter().any(|(_, body)| has_declaration(body))
+                    || has_declaration(tail)
+                    || default.as_ref().is_some_and(|arm| has_declaration(arm))
             }
             _ => false,
         })
@@ -7626,7 +12355,7 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
 
     fn safe_suffix(stmts: &[Stmt]) -> bool {
         stmts.iter().all(|stmt| match stmt {
-            Stmt::Eval(_) | Stmt::Return(_) | Stmt::Throw(_) | Stmt::Comment(_) => true,
+            Stmt::Eval(_) | Stmt::Return(_) | Stmt::Throw(_) | Stmt::Comment(_) | Stmt::Attribute { .. } => true,
             Stmt::Assign(_, ty, _) => ty.is_none(),
             _ => false,
         })
@@ -7636,7 +12365,9 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
         let positions: Vec<_> = arm
             .iter()
             .enumerate()
-            .filter_map(|(i, stmt)| matches!(stmt, Stmt::Label(label) if label == target).then_some(i))
+            .filter_map(|(i, stmt)| {
+                matches!(stmt, Stmt::Label(label) if label == target).then_some(i)
+            })
             .collect();
         if positions.len() != 1 {
             return None;
@@ -7651,7 +12382,11 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
         // invalidate any of the outer arm slices being examined.
         for stmt in stmts.iter_mut() {
             match stmt {
-                Stmt::If { then_body, else_body, .. } => {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     rewrite_list(then_body, refs);
                     rewrite_list(else_body, refs);
                 }
@@ -7659,7 +12394,9 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
                 | Stmt::DoWhile { body, .. }
                 | Stmt::ForEach { body, .. }
                 | Stmt::Lock { body, .. } => rewrite_list(body, refs),
-                Stmt::For { init, incr, body, .. } => {
+                Stmt::For {
+                    init, incr, body, ..
+                } => {
                     rewrite_list(init, refs);
                     rewrite_list(incr, refs);
                     rewrite_list(body, refs);
@@ -7668,7 +12405,11 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
                     let _ = decl;
                     rewrite_list(body, refs);
                 }
-                Stmt::Try { try_body, catches, finally_body } => {
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
                     rewrite_list(try_body, refs);
                     for (_, body) in catches {
                         rewrite_list(body, refs);
@@ -7677,11 +12418,19 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
                         rewrite_list(body, refs);
                     }
                 }
-                Stmt::Switch { cases, tail, .. } => {
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
                     for (_, body) in cases {
                         rewrite_list(body, refs);
                     }
                     rewrite_list(tail, refs);
+                    if let Some(arm) = default {
+                        rewrite_list(arm, refs);
+                    }
                 }
                 _ => {}
             }
@@ -7690,33 +12439,50 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
         let mut i = 0;
         while i < stmts.len() {
             let candidate = match &stmts[i] {
-                Stmt::If { then_body, else_body, .. } => {
-                    STRUCT_CENSUS.shared_if_suffix_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    STRUCT_CENSUS
+                        .shared_if_suffix_attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if has_declaration(then_body) || has_declaration(else_body) {
-                        STRUCT_CENSUS.shared_if_suffix_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        STRUCT_CENSUS
+                            .shared_if_suffix_refused
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         None
                     } else {
                         // The opposite arm must end in the sole goto to a label
                         // in the target arm. Comments after the goto are inert.
                         let inspect = |target_arm: &[Stmt], goto_arm: &[Stmt]| {
-                            let (goto_index, label) = goto_arm.iter().enumerate().rev()
-                                .find_map(|(n, stmt)| match stmt {
+                            let (goto_index, label) = goto_arm.iter().enumerate().rev().find_map(
+                                |(n, stmt)| match stmt {
                                     Stmt::Comment(_) => None,
                                     Stmt::Goto(label) => Some((n, label.clone())),
                                     _ => Some((usize::MAX, String::new())),
-                                })?;
-                            if goto_index == usize::MAX || refs.get(&label).copied().unwrap_or(0) == 0 {
+                                },
+                            )?;
+                            if goto_index == usize::MAX
+                                || refs.get(&label).copied().unwrap_or(0) == 0
+                            {
                                 return None;
                             }
                             let (label_index, suffix) = unique_label_suffix(target_arm, &label)?;
                             Some((label, label_index, goto_index, suffix))
                         };
-                        if let Some((label, label_index, goto_index, suffix)) = inspect(then_body, else_body) {
+                        if let Some((label, label_index, goto_index, suffix)) =
+                            inspect(then_body, else_body)
+                        {
                             Some((true, label, label_index, goto_index, suffix))
-                        } else if let Some((label, label_index, goto_index, suffix)) = inspect(else_body, then_body) {
+                        } else if let Some((label, label_index, goto_index, suffix)) =
+                            inspect(else_body, then_body)
+                        {
                             Some((false, label, label_index, goto_index, suffix))
                         } else {
-                            STRUCT_CENSUS.shared_if_suffix_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            STRUCT_CENSUS
+                                .shared_if_suffix_refused
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             None
                         }
                     }
@@ -7724,8 +12490,19 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
                 _ => None,
             };
             if let Some((in_then, label, label_index, goto_index, suffix)) = candidate {
-                let Stmt::If { then_body, else_body, .. } = &mut stmts[i] else { unreachable!() };
-                let (target, source) = if in_then { (then_body, else_body) } else { (else_body, then_body) };
+                let Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } = &mut stmts[i]
+                else {
+                    unreachable!()
+                };
+                let (target, source) = if in_then {
+                    (then_body, else_body)
+                } else {
+                    (else_body, then_body)
+                };
                 target.truncate(label_index);
                 source.remove(goto_index);
                 // Preserve comments that followed the removed goto in place;
@@ -7734,7 +12511,9 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
                 continuation.push(Stmt::Label(label));
                 continuation.extend(suffix);
                 stmts.splice(i + 1..i + 1, continuation);
-                STRUCT_CENSUS.shared_if_suffix_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                STRUCT_CENSUS
+                    .shared_if_suffix_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 i += 2;
             } else {
                 i += 1;
@@ -7747,119 +12526,445 @@ fn fold_shared_if_suffixes(stmts: &mut Vec<Stmt>) {
     rewrite_list(stmts, &refs);
 }
 
-/// Replace a jump to a label immediately followed by `return;` with that
-/// return. The target executes no intervening statement and reads no local,
-/// so moving the terminator to the jump site preserves the selected path and
-/// avoids a method-level jump. Keep the label and original return for any
-/// fallthrough or remaining references. A return is forbidden in a finally
-/// clause, so labels and jump sources inside finally bodies are refused.
-fn fold_gotos_to_void_return(stmts: &mut Vec<Stmt>) {
-    fn collect(stmts: &[Stmt], in_finally: bool, labels: &mut HashSet<String>) {
+/// Replace a jump to a label whose straight-line bridge ends in a return with
+/// the exact bridge statements. This includes argument-slot copies and effectful
+/// calls in shared epilogues; retaining each statement and its order preserves
+/// the selected path. Keep the label and original bridge for any fallthrough or
+/// remaining references. A return is forbidden in a finally clause, so labels
+/// and jump sources inside finally bodies are refused. A bridge may also end in
+/// a nested `if` when both arms terminate, which lets a branch-local return
+/// epilogue be placed at its actual source edge without introducing a label.
+fn fold_gotos_to_return(stmts: &mut Vec<Stmt>) {
+    type Bridge = (Vec<usize>, Vec<Stmt>);
+
+    fn child_scope(parent: &[usize], next: &mut usize) -> Vec<usize> {
+        let mut child = parent.to_vec();
+        child.push(*next);
+        *next += 1;
+        child
+    }
+
+    /// A statement list that returns or throws on every path, with only
+    /// effect-preserving straight-line statements before its terminal.
+    fn all_paths_terminate(
+        stmts: &[Stmt],
+        scope: &[usize],
+        known_returns: &HashMap<String, Bridge>,
+    ) -> bool {
+        let meaningful: Vec<&Stmt> = stmts
+            .iter()
+            .filter(|s| !matches!(s, Stmt::Comment(_) | Stmt::Attribute { .. }))
+            .collect();
+        let Some(last) = meaningful.last() else {
+            return false;
+        };
+        let prefix_is_simple = |prefix: &[&Stmt]| {
+            prefix.iter().all(|s| {
+                matches!(
+                    s,
+                    Stmt::Assign(_, None, _) | Stmt::EventAssign { .. } | Stmt::IndexAssign { .. } | Stmt::Eval(_)
+                )
+            })
+        };
+        let prefix = &meaningful[..meaningful.len() - 1];
+        if !prefix_is_simple(prefix) {
+            return false;
+        }
+        match last {
+            Stmt::Return(_) | Stmt::Throw(_) => true,
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                all_paths_terminate(then_body, scope, known_returns)
+                    && all_paths_terminate(else_body, scope, known_returns)
+            }
+            Stmt::Goto(target) => known_returns
+                .get(target)
+                .is_some_and(|(target_scope, _)| target_scope == scope),
+            _ => false,
+        }
+    }
+
+    fn return_bridge(
+        stmts: &[Stmt],
+        label_index: usize,
+        scope: &[usize],
+        known_returns: &HashMap<String, Bridge>,
+    ) -> Option<Vec<Stmt>> {
+        let next_index =
+            |from: usize| (from..stmts.len()).find(|&i| !matches!(stmts[i], Stmt::Comment(_)));
+        let first = next_index(label_index + 1)?;
+        let mut bridge = Vec::new();
+        let mut at = first;
+        loop {
+            match &stmts[at] {
+                Stmt::Comment(_) => {}
+                // Preserve writes exactly. A declaration (`Some(type)`) is
+                // scope-sensitive, so refuse it instead of duplicating it into
+                // a branch where the original local declaration may be visible.
+                Stmt::Assign(_, None, _) | Stmt::EventAssign { .. } | Stmt::IndexAssign { .. } | Stmt::Eval(_) => {
+                    bridge.push(stmts[at].clone());
+                }
+                Stmt::Return(_) if !bridge.is_empty() => {
+                    bridge.push(stmts[at].clone());
+                    return Some(bridge);
+                }
+                Stmt::Return(value) => return Some(vec![Stmt::Return(value.clone())]),
+                Stmt::Throw(value) => {
+                    bridge.push(Stmt::Throw(value.clone()));
+                    return Some(bridge);
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } if all_paths_terminate(then_body, scope, known_returns)
+                    && all_paths_terminate(else_body, scope, known_returns) =>
+                {
+                    bridge.push(stmts[at].clone());
+                    return Some(bridge);
+                }
+                Stmt::Goto(target) if !bridge.is_empty() => {
+                    let (target_scope, target_bridge) = known_returns.get(target)?;
+                    if target_scope != scope {
+                        return None;
+                    }
+                    bridge.extend(target_bridge.iter().cloned());
+                    return Some(bridge);
+                }
+                _ => return None,
+            }
+            at = next_index(at + 1)?;
+        }
+    }
+
+    fn collect(
+        stmts: &[Stmt],
+        in_finally: bool,
+        scope: &[usize],
+        next_scope: &mut usize,
+        labels: &mut HashMap<String, Bridge>,
+        follow_gotos: bool,
+    ) {
+        let known_returns = if follow_gotos {
+            labels.clone()
+        } else {
+            HashMap::new()
+        };
         for (i, stmt) in stmts.iter().enumerate() {
             if !in_finally {
                 if let Stmt::Label(label) = stmt {
-                    if stmts[i + 1..]
-                        .iter()
-                        .find(|next| !matches!(next, Stmt::Comment(_)))
-                        .is_some_and(|next| matches!(next, Stmt::Return(None)))
-                    {
-                        labels.insert(label.clone());
+                    if !labels.contains_key(label) {
+                        if let Some(bridge) = return_bridge(stmts, i, scope, &known_returns) {
+                            labels.insert(label.clone(), (scope.to_vec(), bridge));
+                        }
                     }
                 }
             }
             match stmt {
-                Stmt::If { then_body, else_body, .. } => {
-                    collect(then_body, in_finally, labels);
-                    collect(else_body, in_finally, labels);
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect(
+                        then_body,
+                        in_finally,
+                        scope,
+                        next_scope,
+                        labels,
+                        follow_gotos,
+                    );
+                    collect(
+                        else_body,
+                        in_finally,
+                        scope,
+                        next_scope,
+                        labels,
+                        follow_gotos,
+                    );
                 }
                 Stmt::While { body, .. }
                 | Stmt::DoWhile { body, .. }
                 | Stmt::ForEach { body, .. }
-                | Stmt::Lock { body, .. } => collect(body, in_finally, labels),
-                Stmt::For { init, incr, body, .. } => {
-                    collect(init, in_finally, labels);
-                    collect(incr, in_finally, labels);
-                    collect(body, in_finally, labels);
+                | Stmt::Lock { body, .. } => {
+                    collect(body, in_finally, scope, next_scope, labels, follow_gotos)
+                }
+                Stmt::For {
+                    init, incr, body, ..
+                } => {
+                    collect(init, in_finally, scope, next_scope, labels, follow_gotos);
+                    collect(incr, in_finally, scope, next_scope, labels, follow_gotos);
+                    collect(body, in_finally, scope, next_scope, labels, follow_gotos);
                 }
                 Stmt::Using { decl, body } => {
-                    collect(std::slice::from_ref(decl), in_finally, labels);
-                    collect(body, in_finally, labels);
+                    collect(
+                        std::slice::from_ref(decl),
+                        in_finally,
+                        scope,
+                        next_scope,
+                        labels,
+                        follow_gotos,
+                    );
+                    collect(body, in_finally, scope, next_scope, labels, follow_gotos);
                 }
-                Stmt::Try { try_body, catches, finally_body } => {
-                    collect(try_body, in_finally, labels);
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
+                    let try_scope = child_scope(scope, next_scope);
+                    collect(
+                        try_body,
+                        in_finally,
+                        &try_scope,
+                        next_scope,
+                        labels,
+                        follow_gotos,
+                    );
                     for (_, body) in catches {
-                        collect(body, in_finally, labels);
+                        let catch_scope = child_scope(scope, next_scope);
+                        collect(
+                            body,
+                            in_finally,
+                            &catch_scope,
+                            next_scope,
+                            labels,
+                            follow_gotos,
+                        );
                     }
                     if let Some(body) = finally_body {
-                        collect(body, true, labels);
+                        let finally_scope = child_scope(scope, next_scope);
+                        collect(body, true, &finally_scope, next_scope, labels, follow_gotos);
                     }
                 }
-                Stmt::Switch { cases, tail, .. } => {
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
                     for (_, body) in cases {
-                        collect(body, in_finally, labels);
+                        collect(body, in_finally, scope, next_scope, labels, follow_gotos);
                     }
-                    collect(tail, in_finally, labels);
+                    collect(tail, in_finally, scope, next_scope, labels, follow_gotos);
+                    if let Some(arm) = default {
+                        collect(arm, in_finally, scope, next_scope, labels, follow_gotos);
+                    }
                 }
                 _ => {}
             }
         }
     }
 
-    fn rewrite(stmts: &mut [Stmt], in_finally: bool, labels: &HashSet<String>) {
-        for stmt in stmts {
+    fn rewrite(
+        stmts: &mut Vec<Stmt>,
+        in_finally: bool,
+        scope: &[usize],
+        next_scope: &mut usize,
+        labels: &HashMap<String, Bridge>,
+    ) {
+        let mut i = 0;
+        while i < stmts.len() {
             if !in_finally {
-                if let Stmt::Goto(label) = stmt {
-                    if labels.contains(label) {
-                        *stmt = Stmt::Return(None);
-                        STRUCT_CENSUS
-                            .goto_return_folds
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
+                if let Stmt::Goto(label) = &stmts[i] {
+                    if let Some((target_scope, bridge)) = labels.get(label) {
+                        if target_scope == scope {
+                            let mut replacement = bridge.clone();
+                            // A conditional bridge may itself contain a jump
+                            // to a previously proven return bridge. Resolve
+                            // those edges inside the cloned tree as well.
+                            rewrite(&mut replacement, in_finally, scope, next_scope, labels);
+                            let replacement_len = replacement.len();
+                            stmts.splice(i..=i, replacement);
+                            STRUCT_CENSUS
+                                .goto_return_folds
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            i += replacement_len;
+                            continue;
+                        }
                     }
                 }
             }
-            match stmt {
-                Stmt::If { then_body, else_body, .. } => {
-                    rewrite(then_body, in_finally, labels);
-                    rewrite(else_body, in_finally, labels);
+            match &mut stmts[i] {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    rewrite(then_body, in_finally, scope, next_scope, labels);
+                    rewrite(else_body, in_finally, scope, next_scope, labels);
                 }
                 Stmt::While { body, .. }
                 | Stmt::DoWhile { body, .. }
                 | Stmt::ForEach { body, .. }
-                | Stmt::Lock { body, .. } => rewrite(body, in_finally, labels),
-                Stmt::For { init, incr, body, .. } => {
-                    rewrite(init, in_finally, labels);
-                    rewrite(incr, in_finally, labels);
-                    rewrite(body, in_finally, labels);
+                | Stmt::Lock { body, .. } => rewrite(body, in_finally, scope, next_scope, labels),
+                Stmt::For {
+                    init, incr, body, ..
+                } => {
+                    rewrite(init, in_finally, scope, next_scope, labels);
+                    rewrite(incr, in_finally, scope, next_scope, labels);
+                    rewrite(body, in_finally, scope, next_scope, labels);
                 }
-                Stmt::Using { decl, body } => {
-                    rewrite(std::slice::from_mut(decl), in_finally, labels);
-                    rewrite(body, in_finally, labels);
-                }
-                Stmt::Try { try_body, catches, finally_body } => {
-                    rewrite(try_body, in_finally, labels);
+                Stmt::Using { body, .. } => rewrite(body, in_finally, scope, next_scope, labels),
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
+                    let try_scope = child_scope(scope, next_scope);
+                    rewrite(try_body, in_finally, &try_scope, next_scope, labels);
                     for (_, body) in catches {
-                        rewrite(body, in_finally, labels);
+                        let catch_scope = child_scope(scope, next_scope);
+                        rewrite(body, in_finally, &catch_scope, next_scope, labels);
                     }
                     if let Some(body) = finally_body {
-                        rewrite(body, true, labels);
+                        let finally_scope = child_scope(scope, next_scope);
+                        rewrite(body, true, &finally_scope, next_scope, labels);
                     }
                 }
-                Stmt::Switch { cases, tail, .. } => {
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
                     for (_, body) in cases {
-                        rewrite(body, in_finally, labels);
+                        rewrite(body, in_finally, scope, next_scope, labels);
                     }
-                    rewrite(tail, in_finally, labels);
+                    rewrite(tail, in_finally, scope, next_scope, labels);
+                    if let Some(arm) = default {
+                        rewrite(arm, in_finally, scope, next_scope, labels);
+                    }
                 }
                 _ => {}
             }
+            i += 1;
         }
     }
 
-    let mut labels = HashSet::new();
-    collect(stmts, false, &mut labels);
+    fn prune_dead_return_bridges(
+        stmts: &mut Vec<Stmt>,
+        labels: &HashMap<String, Bridge>,
+        refs: &HashMap<String, usize>,
+    ) {
+        let mut i = 0;
+        while i < stmts.len() {
+            let removable = match &stmts[i] {
+                Stmt::Label(label)
+                    if labels.contains_key(label) && refs.get(label).copied().unwrap_or(0) == 0 =>
+                {
+                    let prev = stmts[..i]
+                        .iter()
+                        .rposition(|s| !matches!(s, Stmt::Comment(_)));
+                    let stopped = prev.is_some_and(|p| {
+                        matches!(
+                            stmts[p],
+                            Stmt::Return(_)
+                                | Stmt::Throw(_)
+                                | Stmt::Goto(_)
+                                | Stmt::Break
+                                | Stmt::Continue
+                        )
+                    });
+                    if stopped {
+                        let end = stmts[i + 1..]
+                            .iter()
+                            .position(|s| matches!(s, Stmt::Label(_)))
+                            .map_or(stmts.len(), |n| i + 1 + n);
+                        Some(end)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(end) = removable {
+                stmts.drain(i..end);
+                continue;
+            }
+            match &mut stmts[i] {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    prune_dead_return_bridges(then_body, labels, refs);
+                    prune_dead_return_bridges(else_body, labels, refs);
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::Lock { body, .. } => prune_dead_return_bridges(body, labels, refs),
+                Stmt::For {
+                    init, incr, body, ..
+                } => {
+                    prune_dead_return_bridges(init, labels, refs);
+                    prune_dead_return_bridges(incr, labels, refs);
+                    prune_dead_return_bridges(body, labels, refs);
+                }
+                Stmt::Using { body, .. } => {
+                    prune_dead_return_bridges(body, labels, refs);
+                }
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
+                    prune_dead_return_bridges(try_body, labels, refs);
+                    for (_, body) in catches {
+                        prune_dead_return_bridges(body, labels, refs);
+                    }
+                    if let Some(body) = finally_body {
+                        prune_dead_return_bridges(body, labels, refs);
+                    }
+                }
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
+                    for (_, body) in cases {
+                        prune_dead_return_bridges(body, labels, refs);
+                    }
+                    prune_dead_return_bridges(tail, labels, refs);
+                    if let Some(arm) = default {
+                        prune_dead_return_bridges(arm, labels, refs);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    let mut labels = HashMap::new();
+    let mut next_scope = 0;
+    collect(stmts, false, &[], &mut next_scope, &mut labels, false);
+    // A return bridge can itself jump to the shared return block, so discover
+    // those labels after direct return targets and repeat to cover short chains
+    // without making arbitrary goto cycles look like returns.
+    loop {
+        let before = labels.len();
+        let mut next_scope = 0;
+        collect(stmts, false, &[], &mut next_scope, &mut labels, true);
+        if labels.len() == before {
+            break;
+        }
+    }
     if !labels.is_empty() {
-        rewrite(stmts, false, &labels);
+        let mut next_scope = 0;
+        rewrite(stmts, false, &[], &mut next_scope, &labels);
+        // A coverage-repair label can become unnecessary after its incoming
+        // jumps are rewritten as returns. Remove only a proven return bridge
+        // that follows an unconditional terminator and has no remaining goto
+        // references; other skipped regions stay visible and intact.
+        let mut refs = HashMap::new();
+        count_all_gotos(stmts, &mut refs);
+        prune_dead_return_bridges(stmts, &labels, &refs);
     }
 }
 
@@ -7921,45 +13026,184 @@ fn fold_gotos_to_break(stmts: &mut Vec<Stmt>) {
             }
 
             match stmt {
-                Stmt::If { then_body, else_body, .. } => {
-                    collect(then_body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
-                    collect(else_body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect(
+                        then_body,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
+                    collect(
+                        else_body,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
                 Stmt::While { body, .. }
                 | Stmt::DoWhile { body, .. }
                 | Stmt::ForEach { body, .. } => {
-                    collect(body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                    collect(
+                        body,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
-                Stmt::For { init, incr, body, .. } => {
-                    collect(init, finally_id, next_scope, next_finally, scopes, try_finally, targets);
-                    collect(incr, finally_id, next_scope, next_finally, scopes, try_finally, targets);
-                    collect(body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                Stmt::For {
+                    init, incr, body, ..
+                } => {
+                    collect(
+                        init,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
+                    collect(
+                        incr,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
+                    collect(
+                        body,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
                 Stmt::Lock { body, .. } => {
-                    collect(body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                    collect(
+                        body,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
                 Stmt::Using { decl, body } => {
-                    collect(std::slice::from_ref(decl), finally_id, next_scope, next_finally, scopes, try_finally, targets);
-                    collect(body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                    collect(
+                        std::slice::from_ref(decl),
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
+                    collect(
+                        body,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
-                Stmt::Try { try_body, catches, finally_body } => {
-                    collect(try_body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
+                    collect(
+                        try_body,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                     for (_, body) in catches {
-                        collect(body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                        collect(
+                            body,
+                            finally_id,
+                            next_scope,
+                            next_finally,
+                            scopes,
+                            try_finally,
+                            targets,
+                        );
                     }
                     if let Some(body) = finally_body {
                         let id = *next_finally;
                         *next_finally += 1;
                         try_finally.insert(ptr, id);
-                        collect(body, id, next_scope, next_finally, scopes, try_finally, targets);
+                        collect(
+                            body,
+                            id,
+                            next_scope,
+                            next_finally,
+                            scopes,
+                            try_finally,
+                            targets,
+                        );
                     }
                 }
-                Stmt::Switch { cases, tail, .. } => {
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
                     for (_, body) in cases {
-                        collect(body, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                        collect(
+                            body,
+                            finally_id,
+                            next_scope,
+                            next_finally,
+                            scopes,
+                            try_finally,
+                            targets,
+                        );
+                    }
+                    // The default arm is inside the switch, like the cases.
+                    if let Some(arm) = default {
+                        collect(
+                            arm,
+                            finally_id,
+                            next_scope,
+                            next_finally,
+                            scopes,
+                            try_finally,
+                            targets,
+                        );
                     }
                     // The tail is rendered after the switch, outside its break scope.
-                    collect(tail, finally_id, next_scope, next_finally, scopes, try_finally, targets);
+                    collect(
+                        tail,
+                        finally_id,
+                        next_scope,
+                        next_finally,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
                 _ => {}
             }
@@ -7981,49 +13225,139 @@ fn fold_gotos_to_break(stmts: &mut Vec<Stmt>) {
                     && nearest_scope.is_some_and(|(_, scope_finally)| scope_finally == finally_id)
                 {
                     *stmt = Stmt::Break;
-                    STRUCT_CENSUS.goto_break_folds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    STRUCT_CENSUS
+                        .goto_break_folds
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
             }
             let ptr = stmt as *const Stmt;
             let own_scope = scopes.get(&ptr).copied();
             match stmt {
-                Stmt::If { then_body, else_body, .. } => {
-                    rewrite(then_body, nearest_scope, finally_id, scopes, try_finally, targets);
-                    rewrite(else_body, nearest_scope, finally_id, scopes, try_finally, targets);
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    rewrite(
+                        then_body,
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
+                    rewrite(
+                        else_body,
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
                 Stmt::While { body, .. }
                 | Stmt::DoWhile { body, .. }
                 | Stmt::ForEach { body, .. } => {
                     rewrite(body, own_scope, finally_id, scopes, try_finally, targets);
                 }
-                Stmt::For { init, incr, body, .. } => {
-                    rewrite(init, nearest_scope, finally_id, scopes, try_finally, targets);
-                    rewrite(incr, nearest_scope, finally_id, scopes, try_finally, targets);
+                Stmt::For {
+                    init, incr, body, ..
+                } => {
+                    rewrite(
+                        init,
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
+                    rewrite(
+                        incr,
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                     rewrite(body, own_scope, finally_id, scopes, try_finally, targets);
                 }
                 Stmt::Lock { body, .. } => {
-                    rewrite(body, nearest_scope, finally_id, scopes, try_finally, targets);
+                    rewrite(
+                        body,
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
                 Stmt::Using { decl, body } => {
-                    rewrite(std::slice::from_mut(decl), nearest_scope, finally_id, scopes, try_finally, targets);
-                    rewrite(body, nearest_scope, finally_id, scopes, try_finally, targets);
+                    rewrite(
+                        std::slice::from_mut(decl),
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
+                    rewrite(
+                        body,
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
-                Stmt::Try { try_body, catches, finally_body } => {
-                    rewrite(try_body, nearest_scope, finally_id, scopes, try_finally, targets);
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
+                    rewrite(
+                        try_body,
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                     for (_, body) in catches {
-                        rewrite(body, nearest_scope, finally_id, scopes, try_finally, targets);
+                        rewrite(
+                            body,
+                            nearest_scope,
+                            finally_id,
+                            scopes,
+                            try_finally,
+                            targets,
+                        );
                     }
                     if let Some(body) = finally_body {
                         let nested_id = try_finally.get(&ptr).copied().unwrap_or(finally_id);
                         rewrite(body, nearest_scope, nested_id, scopes, try_finally, targets);
                     }
                 }
-                Stmt::Switch { cases, tail, .. } => {
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
                     for (_, body) in cases {
                         rewrite(body, own_scope, finally_id, scopes, try_finally, targets);
                     }
-                    rewrite(tail, nearest_scope, finally_id, scopes, try_finally, targets);
+                    if let Some(arm) = default {
+                        rewrite(arm, own_scope, finally_id, scopes, try_finally, targets);
+                    }
+                    rewrite(
+                        tail,
+                        nearest_scope,
+                        finally_id,
+                        scopes,
+                        try_finally,
+                        targets,
+                    );
                 }
                 _ => {}
             }
@@ -8035,7 +13369,15 @@ fn fold_gotos_to_break(stmts: &mut Vec<Stmt>) {
     let mut scopes = HashMap::new();
     let mut try_finally = HashMap::new();
     let mut targets = HashMap::new();
-    collect(stmts, 0, &mut next_scope, &mut next_finally, &mut scopes, &mut try_finally, &mut targets);
+    collect(
+        stmts,
+        0,
+        &mut next_scope,
+        &mut next_finally,
+        &mut scopes,
+        &mut try_finally,
+        &mut targets,
+    );
     rewrite(stmts, None, 0, &scopes, &try_finally, &targets);
 }
 
@@ -8043,14 +13385,18 @@ fn fold_gotos_to_break(stmts: &mut Vec<Stmt>) {
 /// ifs) and Pass C (fold gotos whose label is the very next statement).
 fn branch_repair_local(
     stmts: &mut Vec<Stmt>,
-    global_gotos: &HashMap<String, usize>,
+    global_gotos: &mut HashMap<String, usize>,
     fold_seen: &mut HashSet<*const Stmt>,
 ) {
     // Bottom-up so inner constructs settle before outer ones decide which
     // gotos are "last in arm".
     for stmt in stmts.iter_mut() {
         match stmt {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 branch_repair_local(then_body, global_gotos, fold_seen);
                 branch_repair_local(else_body, global_gotos, fold_seen);
             }
@@ -8065,16 +13411,25 @@ fn branch_repair_local(
     loop {
         let mut flipped = false;
         for stmt in stmts.iter_mut() {
-            if let Stmt::If { cond, then_body, else_body } = stmt {
+            if let Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } = stmt
+            {
                 let then_empty = then_body.iter().all(is_noise_stmt);
-                let else_has_payload = !else_body.is_empty() && !else_body.iter().all(is_noise_stmt);
+                let else_has_payload =
+                    !else_body.is_empty() && !else_body.iter().all(is_noise_stmt);
                 if then_empty && else_has_payload {
                     *cond = invert(cond);
                     std::mem::swap(then_body, else_body);
                     // the old then-arm (noise) is now the else-arm: an empty
                     // shell after a terminating payload arm is unreachable —
                     // drop it so the output doesn't read `else { }`.
-                    if then_body.last().is_some_and(|s| matches!(s, Stmt::Return(_) | Stmt::Throw(_))) {
+                    if then_body
+                        .last()
+                        .is_some_and(|s| matches!(s, Stmt::Return(_) | Stmt::Throw(_)))
+                    {
                         else_body.clear();
                     }
                     flipped = true;
@@ -8104,7 +13459,11 @@ fn branch_repair_local(
         }
         for s in stmts.iter_mut() {
             match s {
-                Stmt::If { then_body, else_body, .. } => {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     drop_redundant_tails(then_body);
                     drop_redundant_tails(else_body);
                 }
@@ -8170,7 +13529,12 @@ fn branch_repair_local(
 fn lower_switch_case_gotos(stmts: &mut [Stmt]) {
     for stmt in stmts {
         match stmt {
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch {
+                cases,
+                tail,
+                default,
+                ..
+            } => {
                 let mut case_values = HashMap::<String, u64>::new();
                 for (value, body) in cases.iter() {
                     if let Some(Stmt::Label(label)) = body.first() {
@@ -8181,9 +13545,17 @@ fn lower_switch_case_gotos(stmts: &mut [Stmt]) {
                     lower_gotos_to_case(body, &case_values);
                     lower_switch_case_gotos(body);
                 }
+                if let Some(arm) = default {
+                    lower_gotos_to_case(arm, &case_values);
+                    lower_switch_case_gotos(arm);
+                }
                 lower_switch_case_gotos(tail);
             }
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 lower_switch_case_gotos(then_body);
                 lower_switch_case_gotos(else_body);
             }
@@ -8191,7 +13563,9 @@ fn lower_switch_case_gotos(stmts: &mut [Stmt]) {
             | Stmt::DoWhile { body, .. }
             | Stmt::ForEach { body, .. }
             | Stmt::Lock { body, .. } => lower_switch_case_gotos(body),
-            Stmt::For { init, incr, body, .. } => {
+            Stmt::For {
+                init, incr, body, ..
+            } => {
                 lower_switch_case_gotos(init);
                 lower_switch_case_gotos(incr);
                 lower_switch_case_gotos(body);
@@ -8200,7 +13574,11 @@ fn lower_switch_case_gotos(stmts: &mut [Stmt]) {
                 lower_switch_case_gotos(std::slice::from_mut(decl));
                 lower_switch_case_gotos(body);
             }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 lower_switch_case_gotos(try_body);
                 for (_, body) in catches {
                     lower_switch_case_gotos(body);
@@ -8229,7 +13607,11 @@ fn lower_gotos_to_case(stmts: &mut [Stmt], case_values: &HashMap<String, u64>) {
                     STRUCT_CENSUS.case_goto_refused.fetch_add(1, Relaxed);
                 }
             }
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 lower_gotos_to_case(then_body, case_values);
                 lower_gotos_to_case(else_body, case_values);
             }
@@ -8237,7 +13619,9 @@ fn lower_gotos_to_case(stmts: &mut [Stmt], case_values: &HashMap<String, u64>) {
             | Stmt::DoWhile { body, .. }
             | Stmt::ForEach { body, .. }
             | Stmt::Lock { body, .. } => lower_gotos_to_case(body, case_values),
-            Stmt::For { init, incr, body, .. } => {
+            Stmt::For {
+                init, incr, body, ..
+            } => {
                 lower_gotos_to_case(init, case_values);
                 lower_gotos_to_case(incr, case_values);
                 lower_gotos_to_case(body, case_values);
@@ -8264,14 +13648,18 @@ fn count_all_gotos(stmts: &[Stmt], out: &mut HashMap<String, usize>) {
             *out.entry(l.clone()).or_insert(0) += 1;
         }
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 count_all_gotos(then_body, out);
                 count_all_gotos(else_body, out);
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
-                count_all_gotos(body, out)
-            }
-            Stmt::For { init, incr, body, .. } => {
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => count_all_gotos(body, out),
+            Stmt::For {
+                init, incr, body, ..
+            } => {
                 count_all_gotos(init, out);
                 count_all_gotos(incr, out);
                 count_all_gotos(body, out);
@@ -8282,7 +13670,11 @@ fn count_all_gotos(stmts: &[Stmt], out: &mut HashMap<String, usize>) {
                 count_all_gotos(body, out);
             }
             Stmt::Lock { body, .. } | Stmt::ForEach { body, .. } => count_all_gotos(body, out),
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 count_all_gotos(try_body, out);
                 for (_, b) in catches {
                     count_all_gotos(b, out);
@@ -8291,9 +13683,17 @@ fn count_all_gotos(stmts: &[Stmt], out: &mut HashMap<String, usize>) {
                     count_all_gotos(f, out);
                 }
             }
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch {
+                cases,
+                tail,
+                default,
+                ..
+            } => {
                 for (_, b) in cases {
                     count_all_gotos(b, out);
+                }
+                if let Some(arm) = default {
+                    count_all_gotos(arm, out);
                 }
                 count_all_gotos(tail, out);
             }
@@ -8317,8 +13717,7 @@ fn count_all_gotos(stmts: &[Stmt], out: &mut HashMap<String, usize>) {
 /// statement (the per-ancestor-level double recursion below) are deduped by
 /// address in `fold_branch_over_join`; clone recounts are genuine distinct
 /// statements and count again.
-static GUARD_CHAIN_CANDIDATES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static GUARD_CHAIN_CANDIDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GUARD_CHAIN_FOLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GUARD_CHAIN_REFUSED_OUTSIDE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -8349,14 +13748,18 @@ fn collect_all_labels(stmts: &[Stmt], out: &mut HashSet<String>) {
             out.insert(l.clone());
         }
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collect_all_labels(then_body, out);
                 collect_all_labels(else_body, out);
             }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
-                collect_all_labels(body, out)
-            }
-            Stmt::For { init, incr, body, .. } => {
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_all_labels(body, out),
+            Stmt::For {
+                init, incr, body, ..
+            } => {
                 collect_all_labels(init, out);
                 collect_all_labels(incr, out);
                 collect_all_labels(body, out);
@@ -8365,10 +13768,12 @@ fn collect_all_labels(stmts: &[Stmt], out: &mut HashSet<String>) {
                 collect_all_labels(std::slice::from_ref(decl), out);
                 collect_all_labels(body, out);
             }
-            Stmt::Lock { body, .. } | Stmt::ForEach { body, .. } => {
-                collect_all_labels(body, out)
-            }
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Lock { body, .. } | Stmt::ForEach { body, .. } => collect_all_labels(body, out),
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 collect_all_labels(try_body, out);
                 for (_, b) in catches {
                     collect_all_labels(b, out);
@@ -8377,9 +13782,17 @@ fn collect_all_labels(stmts: &[Stmt], out: &mut HashSet<String>) {
                     collect_all_labels(f, out);
                 }
             }
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch {
+                cases,
+                tail,
+                default,
+                ..
+            } => {
                 for (_, b) in cases {
                     collect_all_labels(b, out);
+                }
+                if let Some(arm) = default {
+                    collect_all_labels(arm, out);
                 }
                 collect_all_labels(tail, out);
             }
@@ -8388,26 +13801,88 @@ fn collect_all_labels(stmts: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
+#[cfg(test)]
+mod branch_join_tests {
+    use super::*;
+
+    fn v(n: &str) -> Expr { Expr::Var(n.to_string()) }
+
+    #[test]
+    fn a_payload_before_the_join_goto_becomes_an_else_arm() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: v("c"),
+                then_body: vec![
+                    Stmt::Assign("x".into(), None, Expr::Int(1)),
+                    Stmt::Goto("L0".into()),
+                ],
+                else_body: vec![],
+            },
+            Stmt::Assign("y".into(), None, Expr::Int(2)),
+            Stmt::Label("L0".into()),
+            Stmt::Return(None),
+        ];
+        branch_repair(&mut stmts);
+        assert!(
+            stmts.iter().all(|s| !matches!(s, Stmt::Goto(_))),
+            "goto survived: {stmts:#?}"
+        );
+        let Stmt::If { then_body, else_body, .. } = &stmts[0] else { panic!("if") };
+        assert_eq!(then_body.len(), 1);
+        assert_eq!(else_body.len(), 1);
+    }
+
+    #[test]
+    fn a_join_goto_in_the_else_arm_pulls_the_region_into_then() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: v("c"),
+                then_body: vec![Stmt::Assign("x".into(), None, Expr::Int(1))],
+                else_body: vec![Stmt::Goto("L0".into())],
+            },
+            Stmt::Assign("y".into(), None, Expr::Int(2)),
+            Stmt::Label("L0".into()),
+            Stmt::Return(None),
+        ];
+        branch_repair(&mut stmts);
+        assert!(
+            stmts.iter().all(|s| !matches!(s, Stmt::Goto(_))),
+            "goto survived: {stmts:#?}"
+        );
+        let Stmt::If { then_body, else_body, .. } = &stmts[0] else { panic!("if") };
+        assert_eq!(then_body.len(), 2);
+        assert!(else_body.is_empty());
+    }
+}
+
 fn fold_branch_over_join(
     stmts: &mut Vec<Stmt>,
-    global_gotos: &HashMap<String, usize>,
+    global_gotos: &mut HashMap<String, usize>,
     fold_seen: &mut HashSet<*const Stmt>,
 ) {
     // Bottom-up: an inner list's own guards collapse before an outer list
     // decides whether the region between ITS goto and label is foldable.
     for s in stmts.iter_mut() {
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 fold_branch_over_join(then_body, global_gotos, fold_seen);
                 fold_branch_over_join(else_body, global_gotos, fold_seen);
             }
-            Stmt::While { body, .. }
-            | Stmt::DoWhile { body, .. }
-            | Stmt::ForEach { body, .. } => fold_branch_over_join(body, global_gotos, fold_seen),
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. } => {
+                fold_branch_over_join(body, global_gotos, fold_seen)
+            }
             Stmt::For { body, .. } => fold_branch_over_join(body, global_gotos, fold_seen),
             Stmt::Using { body, .. } => fold_branch_over_join(body, global_gotos, fold_seen),
             Stmt::Lock { body, .. } => fold_branch_over_join(body, global_gotos, fold_seen),
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 fold_branch_over_join(try_body, global_gotos, fold_seen);
                 for (_, b) in catches.iter_mut() {
                     fold_branch_over_join(b, global_gotos, fold_seen);
@@ -8416,9 +13891,17 @@ fn fold_branch_over_join(
                     fold_branch_over_join(f, global_gotos, fold_seen);
                 }
             }
-            Stmt::Switch { cases, tail, .. } => {
+            Stmt::Switch {
+                cases,
+                tail,
+                default,
+                ..
+            } => {
                 for (_, b) in cases.iter_mut() {
                     fold_branch_over_join(b, global_gotos, fold_seen);
+                }
+                if let Some(arm) = default {
+                    fold_branch_over_join(arm, global_gotos, fold_seen);
                 }
                 fold_branch_over_join(tail, global_gotos, fold_seen);
             }
@@ -8438,52 +13921,70 @@ fn fold_branch_over_join(
     let mut i = stmts.len();
     while i > 0 {
         i -= 1;
-        let Stmt::If { then_body, else_body, .. } = &stmts[i] else {
+        let Stmt::If {
+            cond: _,
+            then_body,
+            else_body,
+        } = &stmts[i]
+        else {
             continue;
         };
-        if !else_body.iter().all(is_noise_stmt) {
+        // Which arm ENDS with the jump to the join?
+        //
+        //   A  `if (c) { A; goto L; }            S; L:`  S runs only when `!c`
+        //   B  `if (c) { T } else { E; goto L; } S; L:`  S runs only when `c`
+        //
+        // A used to require the `goto` to be the arm's ONLY statement, which
+        // left the dominant corpus shape — a payload in front of the jump —
+        // completely unfolded. B was refused outright because its else arm is
+        // not "noise". Between them they are 17,489 of the 23,531 remaining
+        // `goto`s in the TR2 corpus.
+        let then_tail = trailing_join_goto(then_body);
+        let else_tail = trailing_join_goto(else_body);
+        // A label in either arm is refused: the arm is REPLACED by the
+        // rewrite, and a landing site that another `goto` still names would
+        // be stranded — it is not inside the region the outside-edge gate
+        // counts.
+        if then_body
+            .iter()
+            .chain(else_body.iter())
+            .any(|s| matches!(s, Stmt::Label(_)))
+        {
             continue;
         }
-        // then-arm: labels/comments are scaffolding, the goto is the payload.
-        let mut payload = then_body.iter().filter(|s| {
-            !matches!(s, Stmt::Comment(_) | Stmt::Label(_))
-        });
-        let (Some(Stmt::Goto(l)), None) = (payload.next(), payload.next()) else {
-            continue;
+        let (mirror, tail_idx, l) = match (then_tail, else_tail) {
+            (Some(t), _) if else_body.iter().all(is_noise_stmt) => (false, t.0, t.1),
+            (None, Some(t)) => (true, t.0, t.1),
+            // Both arms jump (so the region is not gated by one predicate),
+            // or the only jump sits in a `then` arm that has a real `else`.
+            _ => continue,
         };
-        let l = l.clone();
-        // Census: this guard has the foldable shape (lone `goto`, noise-only
-        // else arm). Deduped by statement address — the per-ancestor-level
-        // double recursion above re-examines the same statement, and only the
-        // first examination counts. (An ancestor fold can later CLONE this
-        // guard into a nested region with a fresh address; that clone is a
-        // distinct statement and counts again.)
+        // Census: deduped by statement address. The per-ancestor-level double
+        // recursion re-examines the same statement, and only the first
+        // examination counts.
         let count_this = fold_seen.insert(&stmts[i] as *const Stmt);
         if count_this {
             use std::sync::atomic::Ordering::Relaxed;
             GUARD_CHAIN_CANDIDATES.fetch_add(1, Relaxed);
         }
         // Close the jump: the label must be defined later in THIS list.
-        // Comments do not count as "between" (no output for them), but a
-        // real statement must be there or this is the vacuous case.
+        // Comments do not count as "between" (no output for them), but a real
+        // statement must be there or this is the vacuous case.
         let mut j = i + 1;
-        let mut meaningful = 0usize;
         let mut label_at = None;
         while j < stmts.len() {
             match &stmts[j] {
                 Stmt::Comment(_) => {}
                 Stmt::Label(n) => {
-                    meaningful += 1;
                     if *n == l {
                         label_at = Some(j);
                         break;
                     }
                 }
-                _ => meaningful += 1,
+                _ => {}
             }
             j += 1;
         }
-        // `meaningful < 2`: the label itself plus nothing before it.
         let Some(label_at) = label_at else {
             if count_this {
                 use std::sync::atomic::Ordering::Relaxed;
@@ -8491,25 +13992,10 @@ fn fold_branch_over_join(
             }
             continue;
         };
-        if meaningful < 2 {
-            if count_this {
-                use std::sync::atomic::Ordering::Relaxed;
-                GUARD_CHAIN_REFUSED_UNCLOSED.fetch_add(1, Relaxed);
-            }
-            continue;
-        }
-        // A label inside the region is a landing site — but only an edge
-        // from OUTSIDE the region makes folding unsound. The method-wide
-        // counts were taken before any pass moved a jump, so a label whose
-        // every `goto` sits inside the region (a self-contained landing site)
-        // or which nothing targets at all (a dead merge anchor the quiet-label
-        // sweep removes right after) moves along with its edges intact. Any
-        // outside edge still blocks, exactly as before.
-        //
-        // ALL labels at any depth, not just flat ones: pulling the region
-        // under `!c` makes every landing site inside it conditional, and a
-        // label nested in an arm or loop body ridden along "opaquely" would
-        // strand an outside edge just as surely as a flat one.
+        // A label inside the region is a landing site — but only an edge from
+        // OUTSIDE the region makes folding unsound. `global_gotos` is kept
+        // LIVE (decremented on every fold) so a guard consumed earlier in this
+        // same pass cannot leave a stale count that blocks the outer fold.
         {
             let mut inside: HashMap<String, usize> = HashMap::new();
             count_all_gotos(&stmts[i + 1..label_at], &mut inside);
@@ -8519,8 +14005,7 @@ fn fold_branch_over_join(
             // leak into the output.
             let mut blocked = false;
             for n in &region_labels {
-                if global_gotos.get(n).copied().unwrap_or(0)
-                    > inside.get(n).copied().unwrap_or(0)
+                if global_gotos.get(n).copied().unwrap_or(0) > inside.get(n).copied().unwrap_or(0)
                 {
                     blocked = true;
                     break;
@@ -8534,26 +14019,73 @@ fn fold_branch_over_join(
                 continue;
             }
         }
-        let (new_cond, region): (Expr, Vec<Stmt>) = {
-            let Stmt::If { cond, .. } = &stmts[i] else {
-                unreachable!()
-            };
-            (invert(cond), stmts[i + 1..label_at].to_vec())
-        };
-        stmts[i] = Stmt::If {
-            cond: new_cond,
-            then_body: region,
-            else_body: Vec::new(),
-        };
-        stmts.drain(i + 1..label_at);
-        // Exact: each drain consumes one guard `goto`, and a folded guard no
-        // longer matches the shape above — so this fires exactly once per
-        // fold, on any visit. (Predicates are inverted, never deleted; the
-        // join label is kept by the drain bounds.)
+        let region: Vec<Stmt> = stmts[i + 1..label_at].to_vec();
+        // The jump is consumed from here on, whichever rewrite runs.
+        if let Some(c) = global_gotos.get_mut(&l) {
+            *c = c.saturating_sub(1);
+        }
         {
             use std::sync::atomic::Ordering::Relaxed;
             GUARD_CHAIN_FOLDS.fetch_add(1, Relaxed);
         }
+        if region.is_empty() {
+            // Nothing between the guard and its join: the jump is a plain
+            // fall-through. Keep the arm's payload, drop the jump.
+            if let Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } = &mut stmts[i]
+            {
+                if mirror {
+                    else_body.truncate(tail_idx);
+                } else {
+                    then_body.truncate(tail_idx);
+                }
+            }
+            continue;
+        }
+        let rewritten = {
+            let Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } = &stmts[i]
+            else {
+                unreachable!()
+            };
+            let cond = cond.clone();
+            if mirror {
+                // The region runs when the predicate HOLDS, so it joins the
+                // `then` arm; the else arm keeps the payload before the jump.
+                let mut then_new = then_body.clone();
+                then_new.extend(region);
+                Stmt::If {
+                    cond,
+                    then_body: then_new,
+                    else_body: else_body[..tail_idx].to_vec(),
+                }
+            } else if tail_idx == 0 {
+                // Lone `goto`: the inverted predicate reads better than an
+                // empty `then` arm.
+                Stmt::If {
+                    cond: invert(&cond),
+                    then_body: region,
+                    else_body: Vec::new(),
+                }
+            } else {
+                // Payload stays under the predicate; the skipped statements
+                // become the `else` arm. A run of these nests into an
+                // if / else-if chain and every `goto` in it disappears.
+                Stmt::If {
+                    cond,
+                    then_body: then_body[..tail_idx].to_vec(),
+                    else_body: region,
+                }
+            }
+        };
+        stmts[i] = rewritten;
+        stmts.drain(i + 1..label_at);
         // Reverse order folds the INNER guard first, so the outer guard's
         // region already holds the folded `if (!c2) { … }` when it is judged:
         // a chain of any length collapses fully, leaving zero gotos. The old
@@ -8561,6 +14093,24 @@ fn fold_branch_over_join(
         // cross-level (the limitation noted below no longer applies to
         // same-list chains; it remains true only for genuinely cross-level
         // jumps, which keep their correct `goto`).
+    }
+}
+
+
+/// The index and target of the arm's trailing join jump, ignoring trailing
+/// comments/attributes the structurer drops around it. A `Label` is NOT
+/// ignored: the callers refuse arms that define one.
+fn trailing_join_goto(body: &[Stmt]) -> Option<(usize, String)> {
+    let mut end = body.len();
+    while end > 0 && matches!(body[end - 1], Stmt::Comment(_) | Stmt::Attribute { .. }) {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    match &body[end - 1] {
+        Stmt::Goto(l) => Some((end - 1, l.clone())),
+        _ => None,
     }
 }
 
@@ -8586,7 +14136,12 @@ fn drop_vacuous_if_gotos(stmts: &mut Vec<Stmt>) {
         let next = stmts[i + 1..]
             .iter()
             .find(|s| !matches!(s, Stmt::Comment(_)));
-        let Stmt::If { cond, then_body, else_body } = &stmts[i] else {
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = &stmts[i]
+        else {
             continue;
         };
         if !else_body.iter().all(is_noise_stmt) {
@@ -8611,12 +14166,20 @@ fn drop_vacuous_if_gotos(stmts: &mut Vec<Stmt>) {
     }
     for s in stmts.iter_mut() {
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 drop_vacuous_if_gotos(then_body);
                 drop_vacuous_if_gotos(else_body);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => drop_vacuous_if_gotos(body),
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 drop_vacuous_if_gotos(try_body);
                 for (_, b) in catches.iter_mut() {
                     drop_vacuous_if_gotos(b);
@@ -8638,12 +14201,20 @@ fn collect_labels(stmts: &[Stmt], out: &mut HashSet<String>) {
             out.insert(l.clone());
         }
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 collect_labels(then_body, out);
                 collect_labels(else_body, out);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_labels(body, out),
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 collect_labels(try_body, out);
                 for (_, b) in catches {
                     collect_labels(b, out);
@@ -8663,7 +14234,11 @@ fn strip_dangling(stmts: &mut Vec<Stmt>, labels: &HashSet<String>) {
     stmts.retain(|s| !matches!(s, Stmt::Goto(l) if !labels.contains(l)));
     for s in stmts.iter_mut() {
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 strip_dangling(then_body, labels);
                 strip_dangling(else_body, labels);
             }
@@ -8675,18 +14250,13 @@ fn strip_dangling(stmts: &mut Vec<Stmt>, labels: &HashSet<String>) {
 
 // Pass E: labels with no remaining references are merge anchors for gotos
 // that became fall-throughs — remove them.
-fn strip_quiet_labels(stmts: &mut Vec<Stmt>, referenced: &HashSet<String>) {
+pub(crate) fn strip_quiet_labels(stmts: &mut Vec<Stmt>, referenced: &HashSet<String>) {
     stmts.retain(|s| !matches!(s, Stmt::Label(l) if !referenced.contains(l)));
+    // Exhaustive recursion: the old match covered only If/While, so labels
+    // under For/ForEach/Lock/Using/StringSwitch were never swept.
     for s in stmts.iter_mut() {
-        match s {
-            Stmt::If { then_body, else_body, .. } => {
-                strip_quiet_labels(then_body, referenced);
-                strip_quiet_labels(else_body, referenced);
-            }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
-                strip_quiet_labels(body, referenced);
-            }
-            _ => {}
+        for k in super::reconstruct::children_mut(s) {
+            strip_quiet_labels(k, referenced);
         }
     }
 }
@@ -8708,37 +14278,19 @@ fn ends_with_terminator(body: &[Stmt]) -> bool {
     )
 }
 
-fn collect_gotos(stmts: &[Stmt], out: &mut HashSet<String>) {
+pub(crate) fn collect_gotos(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         if let Stmt::Goto(l) = s {
             out.insert(l.clone());
         }
-        // The switch shell's `case k: goto Lx` references live INSIDE
-        // Stmt::Switch as data — without counting them, Pass E strips every
-        // arm label as "unreferenced" while the case gotos survive, leaving
-        // dangling case targets (Evaluate after arm rendering).
-        if let Stmt::Switch { cases, tail, .. } = s {
-            for (_, body) in cases {
-                collect_gotos(body, out);
-            }
-            collect_gotos(tail, out);
-        }
-        match s {
-            Stmt::If { then_body, else_body, .. } => {
-                collect_gotos(then_body, out);
-                collect_gotos(else_body, out);
-            }
-            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_gotos(body, out),
-            Stmt::Try { try_body, catches, finally_body } => {
-                collect_gotos(try_body, out);
-                for (_, b) in catches {
-                    collect_gotos(b, out);
-                }
-                if let Some(f) = finally_body {
-                    collect_gotos(f, out);
-                }
-            }
-            _ => {}
+        // Exhaustive visitor: covers Switch arms (whose `case k: goto Lx`
+        // references live as DATA), StringSwitch, For/ForEach/Lock/Using —
+        // the hand-rolled match used to miss those and the label stripper
+        // then deleted labels the gotos still referenced.
+        let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+        super::reconstruct::children(s, &mut kids);
+        for k in kids {
+            collect_gotos(k, out);
         }
     }
 }
@@ -8758,7 +14310,7 @@ fn collect_gotos(stmts: &[Stmt], out: &mut HashSet<String>) {
 /// observable left in it after its body was emptied.
 fn expr_has_load(e: &Expr) -> bool {
     match e {
-        Expr::RawDeref(..) | Expr::Field(..) | Expr::StaticField(..) => true,
+        Expr::RawDeref(..) | Expr::Field(..) | Expr::StaticField(..) | Expr::Index { .. } => true,
         Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) => expr_has_load(a) || expr_has_load(b),
         Expr::Not(a) | Expr::Neg(a) | Expr::Cast(_, a) => expr_has_load(a),
         Expr::Cond(a, b, c) => expr_has_load(a) || expr_has_load(b) || expr_has_load(c),
@@ -8768,12 +14320,14 @@ fn expr_has_load(e: &Expr) -> bool {
 
 fn is_noise_stmt(s: &Stmt) -> bool {
     match s {
-        Stmt::Label(_) | Stmt::Comment(_) => true,
+        Stmt::Label(_) | Stmt::Comment(_) | Stmt::Attribute { .. } => true,
         Stmt::Assign(t, _, Expr::Var(src)) if t == src => true,
         Stmt::Eval(e) => is_artifact_ctor(e),
-        Stmt::If { then_body, else_body, .. } => {
-            then_body.iter().all(is_noise_stmt) && else_body.iter().all(is_noise_stmt)
-        }
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => then_body.iter().all(is_noise_stmt) && else_body.iter().all(is_noise_stmt),
         _ => false,
     }
 }
@@ -8787,12 +14341,20 @@ fn is_artifact_ctor(e: &Expr) -> bool {
         Expr::Call { recv, name, args }
             if name.ends_with(".ctor")
                 && matches!(recv.as_deref(), None | Some(Expr::Unknown))
-                && args.iter().all(|a| matches!(a, Expr::Unknown | Expr::MissingAbiArg)) =>
-            true,
+                && args
+                    .iter()
+                    .all(|a| matches!(a, Expr::Unknown | Expr::MissingAbiArg)) =>
+        {
+            true
+        }
         Expr::NewObj(ty, args)
             if ty == "__unknown"
-                && args.iter().all(|a| matches!(a, Expr::Unknown | Expr::MissingAbiArg)) =>
-            true,
+                && args
+                    .iter()
+                    .all(|a| matches!(a, Expr::Unknown | Expr::MissingAbiArg)) =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -8800,7 +14362,10 @@ fn is_artifact_ctor(e: &Expr) -> bool {
 /// Does this expression contain a call (side effects worth keeping)?
 fn expr_has_call(e: &Expr) -> bool {
     match e {
-        Expr::Call { .. } | Expr::RawCall(..) | Expr::NewObj(..) | Expr::NewArr(..)
+        Expr::Call { .. }
+        | Expr::RawCall(..)
+        | Expr::NewObj(..)
+        | Expr::NewArr(..)
         | Expr::Await(_) => true,
         Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) => expr_has_call(a) || expr_has_call(b),
         Expr::Not(a) | Expr::Neg(a) | Expr::Cast(_, a) => expr_has_call(a),
@@ -8808,7 +14373,67 @@ fn expr_has_call(e: &Expr) -> bool {
         Expr::Field(base, _) => expr_has_call(base),
         Expr::RawDeref(a, _, _) => expr_has_call(a),
         Expr::RawAddr(a, _) | Expr::AddressOf(a) => expr_has_call(a),
+        Expr::ArrayInit { items, .. } => items.iter().any(expr_has_call),
+        Expr::CollectionInit { ctor_args, items, .. } => {
+            ctor_args.iter().any(expr_has_call) || items.iter().any(expr_has_call)
+        }
+        Expr::ObjInit {
+            ctor_args, fields, ..
+        } => {
+            ctor_args.iter().any(expr_has_call)
+                || fields.iter().any(|(_, v)| expr_has_call(v))
+        }
+        Expr::Index { collection, index } => expr_has_call(collection) || expr_has_call(index),
+        Expr::NullConditional { receiver, access } => {
+            expr_has_call(receiver) || expr_has_call(access)
+        }
         _ => false,
+    }
+}
+
+/// Labels defined by and jumped to inside a statement tree.
+fn collect_label_refs(
+    stmts: &[Stmt],
+    defined: &mut HashSet<String>,
+    targets: &mut HashSet<String>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Label(l) => {
+                defined.insert(l.clone());
+            }
+            Stmt::Goto(l) => {
+                targets.insert(l.clone());
+            }
+            _ => {}
+        }
+        let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+        super::reconstruct::children(s, &mut kids);
+        for k in kids {
+            collect_label_refs(k, defined, targets);
+        }
+    }
+}
+
+/// The label for `blk`, or `None` when that name was already written into
+/// this method. See [`Structurer::labels_written`].
+fn label_once(
+    written: &std::cell::RefCell<std::collections::HashSet<String>>,
+    sc: &StructuredCfg,
+    blk: usize,
+    trace_birth: bool,
+) -> Option<Stmt> {
+    let name = label_name(sc, blk);
+    if written.borrow_mut().insert(name.clone()) {
+        if trace_birth {
+            eprintln!(
+                "[labbirth] {:#x} {name}",
+                crate::recovery::reconstruct::trace_rva_pub()
+            );
+        }
+        Some(Stmt::Label(name))
+    } else {
+        None
     }
 }
 
@@ -8856,17 +14481,25 @@ pub mod rewrites {
     /// parent-level folds only reshape THIS list and can never unlock folds
     /// inside already-processed children.
     pub(super) fn apply(stmts: &mut Vec<Stmt>) {
-        let prof = std::env::var("ILR_PROF").is_ok();
+        let prof = crate::recovery::env_flags::flag("ILR_PROF");
         let t0 = std::time::Instant::now();
         for stmt in stmts.iter_mut() {
             match stmt {
-                Stmt::If { then_body, else_body, .. } => {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     apply(then_body);
                     apply(else_body);
                 }
                 Stmt::While { body, .. } => apply(body),
                 Stmt::DoWhile { body, .. } => apply(body),
-                Stmt::Try { try_body, catches, finally_body } => {
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
                     apply(try_body);
                     for (_, body) in catches.iter_mut() {
                         apply(body);
@@ -8878,16 +14511,24 @@ pub mod rewrites {
                 _ => {}
             }
         }
-        if prof { eprintln!("[rw] children {}us", t0.elapsed().as_micros()); }
+        if prof {
+            eprintln!("[rw] children {}us", t0.elapsed().as_micros());
+        }
         let t1 = std::time::Instant::now();
         fold_bool_assign(stmts);
-        if prof { eprintln!("[rw] bool_assign {}us", t1.elapsed().as_micros()); }
+        if prof {
+            eprintln!("[rw] bool_assign {}us", t1.elapsed().as_micros());
+        }
         let t2 = std::time::Instant::now();
         fold_ternary(stmts);
-        if prof { eprintln!("[rw] ternary {}us", t2.elapsed().as_micros()); }
+        if prof {
+            eprintln!("[rw] ternary {}us", t2.elapsed().as_micros());
+        }
         let t3 = std::time::Instant::now();
         fold_async_await(stmts);
-        if prof { eprintln!("[rw] async {}us", t3.elapsed().as_micros()); }
+        if prof {
+            eprintln!("[rw] async {}us", t3.elapsed().as_micros());
+        }
     }
 
     /// IL2CPP async state machines: awaiter patterns render as opaque
@@ -8915,7 +14556,11 @@ pub mod rewrites {
                 for s in stmts {
                     match s {
                         Stmt::Eval(e) | Stmt::Assign(_, _, e) => e.render(buf),
-                        Stmt::If { then_body, else_body, .. } => {
+                        Stmt::If {
+                            then_body,
+                            else_body,
+                            ..
+                        } => {
                             walk(then_body, buf);
                             walk(else_body, buf);
                         }
@@ -8930,12 +14575,31 @@ pub mod rewrites {
         let mut i = 0;
         while i < stmts.len() {
             // Pattern: Assign(t, Call F(...)); If { !t.IsCompleted, ... } [, t.GetResult() after]
-            let Some(Stmt::Assign(task, _, task_expr)) = stmts.get(i) else { i += 1; continue };
-            let Expr::Call { name: task_name, .. } = task_expr else { i += 1; continue };
-            let Some(Stmt::If { cond, then_body, else_body }) = stmts.get(i + 1) else { i += 1; continue };
+            let Some(Stmt::Assign(task, _, task_expr)) = stmts.get(i) else {
+                i += 1;
+                continue;
+            };
+            let Expr::Call {
+                name: task_name, ..
+            } = task_expr
+            else {
+                i += 1;
+                continue;
+            };
+            let Some(Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            }) = stmts.get(i + 1)
+            else {
+                i += 1;
+                continue;
+            };
             // condition must be a NOT of `<task>.IsCompleted` (or == false)
             let is_completed_test = match cond {
-                Expr::Not(inner) => matches!(**inner, Expr::Field(ref r, ref f) if f == "IsCompleted"),
+                Expr::Not(inner) => {
+                    matches!(**inner, Expr::Field(ref r, ref f) if f == "IsCompleted")
+                }
                 Expr::Cmp(super::CmpKind::Eq, a, b) => field_false(a) || field_false(b),
                 _ => false,
             };
@@ -8944,7 +14608,10 @@ pub mod rewrites {
                 continue;
             }
             // the suspend arm must mention OnCompleted/AwaitSuspension
-            let suspend = renders_containing(then_body, &["OnCompleted", "AwaitSuspension", "UnsafeOnCompleted"]);
+            let suspend = renders_containing(
+                then_body,
+                &["OnCompleted", "AwaitSuspension", "UnsafeOnCompleted"],
+            );
             if suspend == 0 {
                 i += 1;
                 continue;
@@ -8957,14 +14624,17 @@ pub mod rewrites {
                 }
             }
             let _ = else_body;
-            let await_stmt = Stmt::Assign(
-                task.clone(),
-                None,
-                Expr::Await(Box::new(task_expr.clone())),
+            let await_stmt =
+                Stmt::Assign(task.clone(), None, Expr::Await(Box::new(task_expr.clone())));
+            stmts.splice(
+                i..i + consumed,
+                vec![
+                    await_stmt,
+                    Stmt::Comment(format!(
+                        "await {task_name}() — suspend/resume state machine folded"
+                    )),
+                ],
             );
-            stmts.splice(i..i + consumed, vec![await_stmt, Stmt::Comment(format!(
-                "await {task_name}() — suspend/resume state machine folded"
-            ))]);
             i += 2;
         }
     }
@@ -8975,7 +14645,12 @@ pub mod rewrites {
         let mut i = 0;
         while i < stmts.len() {
             let (cond, target) = {
-                let Some(Stmt::If { cond, then_body, else_body }) = stmts.get(i) else {
+                let Some(Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                }) = stmts.get(i)
+                else {
                     i += 1;
                     continue;
                 };
@@ -8983,10 +14658,8 @@ pub mod rewrites {
                     i += 1;
                     continue;
                 }
-                let (
-                    Stmt::Assign(t1, _, Expr::Bool(tv)),
-                    Stmt::Assign(t2, _, Expr::Bool(fv)),
-                ) = (&then_body[0], &else_body[0])
+                let (Stmt::Assign(t1, _, Expr::Bool(tv)), Stmt::Assign(t2, _, Expr::Bool(fv))) =
+                    (&then_body[0], &else_body[0])
                 else {
                     i += 1;
                     continue;
@@ -9018,19 +14691,16 @@ pub mod rewrites {
     fn fold_ternary(stmts: &mut Vec<Stmt>) {
         for i in 0..stmts.len() {
             let matched = match stmts.get(i) {
-                Some(Stmt::If { cond, then_body, else_body }) => {
+                Some(Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                }) => {
                     if then_body.len() == 1 && else_body.len() == 1 {
                         match (&then_body[0], &else_body[0]) {
-                            (
-                                Stmt::Assign(t1, ty, va),
-                                Stmt::Assign(t2, _, vb),
-                            ) if t1 == t2 => Some((
-                                cond.clone(),
-                                t1.clone(),
-                                ty.clone(),
-                                va.clone(),
-                                vb.clone(),
-                            )),
+                            (Stmt::Assign(t1, ty, va), Stmt::Assign(t2, _, vb)) if t1 == t2 => {
+                                Some((cond.clone(), t1.clone(), ty.clone(), va.clone(), vb.clone()))
+                            }
                             _ => None,
                         }
                     } else {
@@ -9078,7 +14748,35 @@ pub mod cleanup {
     }
 
     /// Collect every identifier used as a value in the statement tree.
+    ///
+    /// EXHAUSTIVE. This set is the dead-store pass's proof that a binding has
+    /// no reader anywhere, while `dead_stores_flat` runs on ONE list at a
+    /// time. A hand-rolled walker that skipped Switch/For/ForEach/Lock/Using
+    /// therefore deleted real definitions whose only reads lived in those
+    /// constructs: measured on `Describe` @0x151F34C, the phi copies
+    /// `v70 = in_x2` / `v70 = v403` were removed from the two arms while 149
+    /// reads remained in the switch, and every use rendered as an undefined
+    /// local. Statement recursion goes through `reconstruct::children`;
+    /// expression recursion covers every `Expr` variant that owns operands.
     fn collect_expr_reads(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+        fn names_in_text(t: &str, out: &mut std::collections::HashSet<String>) {
+            let mut cur = String::new();
+            for ch in t.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    cur.push(ch);
+                } else {
+                    if !cur.is_empty() {
+                        if !cur.as_bytes()[0].is_ascii_digit() {
+                            out.insert(cur.clone());
+                        }
+                        cur.clear();
+                    }
+                }
+            }
+            if !cur.is_empty() && !cur.as_bytes()[0].is_ascii_digit() {
+                out.insert(cur);
+            }
+        }
         fn expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
             match e {
                 Expr::Var(n) => {
@@ -9101,57 +14799,173 @@ pub mod cleanup {
                         expr(a, out);
                     }
                 }
-                Expr::Field(r, _) | Expr::Not(r) | Expr::Neg(r) | Expr::RawAddr(r, _)
-                | Expr::RawDeref(r, _, _) | Expr::AddressOf(r) | Expr::Await(r)
-                | Expr::Cast(_, r) => expr(r, out),
+                Expr::ArrayInit { items, .. } | Expr::Tuple { elements: items, .. } => {
+                    for a in items {
+                        expr(a, out);
+                    }
+                }
+                Expr::CollectionInit {
+                    ctor_args, items, ..
+                } => {
+                    for a in ctor_args.iter().chain(items.iter()) {
+                        expr(a, out);
+                    }
+                }
+                Expr::ObjInit {
+                    ctor_args, fields, ..
+                } => {
+                    for a in ctor_args {
+                        expr(a, out);
+                    }
+                    for (_, v) in fields {
+                        expr(v, out);
+                    }
+                }
+                Expr::Field(r, _)
+                | Expr::Not(r)
+                | Expr::Neg(r)
+                | Expr::RawAddr(r, _)
+                | Expr::RawDeref(r, _, _)
+                | Expr::AddressOf(r)
+                | Expr::Await(r)
+                | Expr::Cast(_, r)
+                | Expr::IndexFromEnd(r)
+                | Expr::PatternMatch { expr: r, .. }
+                | Expr::Lambda { body: r, .. } => expr(r, out),
+                Expr::Index { collection, index } => {
+                    expr(collection, out);
+                    expr(index, out);
+                }
+                Expr::NullConditional { receiver, access } => {
+                    expr(receiver, out);
+                    expr(access, out);
+                }
                 Expr::Cond(c, a, b) => {
                     expr(c, out);
                     expr(a, out);
                     expr(b, out);
+                }
+                Expr::StringInterp { parts } => {
+                    for p in parts {
+                        if let super::InterpPart::Expr(x, _) = p {
+                            expr(x, out);
+                        }
+                    }
+                }
+                Expr::MethodChain { receiver, methods } => {
+                    expr(receiver, out);
+                    for m in methods {
+                        for a in &m.args {
+                            expr(a, out);
+                        }
+                    }
+                }
+                Expr::SwitchExpr {
+                    discrim,
+                    arms,
+                    default_arm,
+                } => {
+                    expr(discrim, out);
+                    for (p, r) in arms {
+                        expr(p, out);
+                        expr(r, out);
+                    }
+                    if let Some(d) = default_arm {
+                        expr(d, out);
+                    }
+                }
+                Expr::Range { from, to } => {
+                    if let Some(f) = from {
+                        expr(f, out);
+                    }
+                    if let Some(t) = to {
+                        expr(t, out);
+                    }
                 }
                 _ => {}
             }
         }
         for s in stmts {
             match s {
-                Stmt::Assign(_, _, r) | Stmt::Eval(r) | Stmt::Throw(r) | Stmt::Return(Some(r)) => {
+                Stmt::Assign(t, _, r) => {
+                    // A complex target (`v1782.field`, `*(nint*)(v1782+16)`)
+                    // READS its base local; a plain scalar target is a write.
+                    if t.chars()
+                        .any(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+                    {
+                        names_in_text(t, out);
+                    }
                     expr(r, out)
                 }
-                Stmt::If { cond, then_body, else_body } => {
-                    expr(cond, out);
-                    collect_expr_reads(then_body, out);
-                    collect_expr_reads(else_body, out);
-                }
-                Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
-                    expr(cond, out);
-                    collect_expr_reads(body, out);
-                }
-                Stmt::Try { try_body, catches, finally_body } => {
-                    collect_expr_reads(try_body, out);
-                    for (_, b) in catches {
-                        collect_expr_reads(b, out);
+                Stmt::Eval(r) | Stmt::Throw(r) | Stmt::Return(Some(r)) => expr(r, out),
+                Stmt::Return(None) => {}
+                Stmt::YieldReturn(r) => expr(r, out),
+                Stmt::If { cond, .. } => expr(cond, out),
+                Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } => expr(cond, out),
+                Stmt::For { cond, .. } => {
+                    if let Some(c) = cond {
+                        expr(c, out);
                     }
-                    if let Some(f) = finally_body {
-                        collect_expr_reads(f, out);
+                }
+                Stmt::Lock { expr: e, .. } => expr(e, out),
+                Stmt::StringSwitch { disc, .. } => expr(disc, out),
+                Stmt::Switch { disc, .. } => names_in_text(disc, out),
+                Stmt::ForEach { collection, .. } => names_in_text(collection, out),
+                Stmt::IndexAssign {
+                    collection,
+                    index,
+                    value,
+                } => {
+                    expr(collection, out);
+                    expr(index, out);
+                    expr(value, out);
+                }
+                Stmt::EventAssign { field, value, .. } => {
+                    expr(field, out);
+                    expr(value, out);
+                }
+                Stmt::Attribute { args, .. } => {
+                    for a in args {
+                        expr(a, out);
                     }
+                }
+                Stmt::Using { decl, .. } => {
+                    collect_expr_reads(std::slice::from_ref(decl.as_ref()), out);
                 }
                 _ => {}
+            }
+            let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+            super::super::reconstruct::children(s, &mut kids);
+            for k in kids {
+                collect_expr_reads(k, out);
             }
         }
     }
 
-    fn apply_inner(stmts: &mut Vec<Stmt>, in_loop: bool, reads: &std::collections::HashSet<String>) {
-        let prof = std::env::var("ILR_PROF").is_ok();
+    fn apply_inner(
+        stmts: &mut Vec<Stmt>,
+        in_loop: bool,
+        reads: &std::collections::HashSet<String>,
+    ) {
+        let prof = crate::recovery::env_flags::flag("ILR_PROF");
         let t0 = std::time::Instant::now();
         for stmt in stmts.iter_mut() {
             match stmt {
-                Stmt::If { then_body, else_body, .. } => {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     apply_inner(then_body, in_loop, reads);
                     apply_inner(else_body, in_loop, reads);
                 }
                 Stmt::While { body, .. } => apply_inner(body, true, reads),
                 Stmt::DoWhile { body, .. } => apply_inner(body, true, reads),
-                Stmt::Try { try_body, catches, finally_body } => {
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
                     // try/catch bodies are exception paths: the flat scan
                     // cannot see the handler's reads either — same rule as
                     // loops applies (a store in `try` may be read by the
@@ -9187,7 +15001,9 @@ pub mod cleanup {
         if !in_loop {
             dead_stores_flat(stmts, reads);
         }
-        if prof { eprintln!("[cl] dead_stores {}us", t0.elapsed().as_micros()); }
+        if prof {
+            eprintln!("[cl] dead_stores {}us", t0.elapsed().as_micros());
+        }
     }
 
     /// Dead-store elimination for ONE statement list (children already
@@ -9216,8 +15032,7 @@ pub mod cleanup {
             _ => return false,
         }
         // `*`, `[`, `.`, `->`, `(` all mean "through a pointer / a field".
-        t.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
 
     /// Does evaluating this expression have an effect the caller can see?
@@ -9251,6 +15066,12 @@ pub mod cleanup {
             Expr::Cond(c, a, b) => {
                 expr_has_side_effect(c) || expr_has_side_effect(a) || expr_has_side_effect(b)
             }
+            Expr::Index { collection, index } => {
+                expr_has_side_effect(collection) || expr_has_side_effect(index)
+            }
+            Expr::NullConditional { receiver, access } => {
+                expr_has_side_effect(receiver) || expr_has_side_effect(access)
+            }
             _ => false,
         }
     }
@@ -9259,10 +15080,11 @@ pub mod cleanup {
         let mut i = stmts.len();
         while i > 0 {
             i -= 1;
-            let (target, rhs) = match &stmts[i] {
-                Stmt::Assign(t, _, rhs) if !t.is_empty() && is_scalar_target(t) => {
-                    (t.clone(), rhs.clone())
-                }
+            // Borrow the target instead of cloning it: only a store that is
+            // actually removed pays for a clone, and the scan below only needs
+            // the name.
+            let target: &str = match &stmts[i] {
+                Stmt::Assign(t, _, _) if !t.is_empty() && is_scalar_target(t) => t.as_str(),
                 _ => continue,
             };
             // READ SOMEWHERE IN THE BODY → NOT DEAD. The scan below is
@@ -9277,24 +15099,40 @@ pub mod cleanup {
             // structurer emits label/goto shells), so a def can sit textually
             // above its reader, or in a sibling list. `body_reads` is the
             // whole-method read set gathered once by `apply`.
-            if body_reads.contains(&target) {
+            if body_reads.contains(target) {
                 continue;
             }
             let mut live = false;
             for j in (i + 1)..stmts.len() {
                 match &stmts[j] {
                     Stmt::Assign(t2, _, rhs) => {
-                        if t2 == &target { break; }
-                        if reads_var(rhs, &target) { live = true; break; }
+                        if t2 == target {
+                            break;
+                        }
+                        if reads_var(rhs, target) {
+                            live = true;
+                            break;
+                        }
                     }
                     Stmt::Eval(e) | Stmt::Throw(e) => {
-                        if reads_var(e, &target) { live = true; break; }
+                        if reads_var(e, target) {
+                            live = true;
+                            break;
+                        }
                     }
                     Stmt::Return(Some(e)) => {
-                        if reads_var(e, &target) { live = true; break; }
+                        if reads_var(e, target) {
+                            live = true;
+                            break;
+                        }
                     }
-                    Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } => {
-                        if reads_var(cond, &target) { live = true; break; }
+                    Stmt::If { cond, .. }
+                    | Stmt::While { cond, .. }
+                    | Stmt::DoWhile { cond, .. } => {
+                        if reads_var(cond, target) {
+                            live = true;
+                            break;
+                        }
                         live = true;
                         break;
                     }
@@ -9303,11 +15141,18 @@ pub mod cleanup {
                     // (e.g. the merge block re-reading a temp). Treating the
                     // store as dead truncated every merge that followed a
                     // `goto L…`. Same for anything we can't see through.
-                    _ => { live = true; break; }
+                    _ => {
+                        live = true;
+                        break;
+                    }
                 }
             }
             if !live {
                 // Keep the EFFECT, drop the dead binding.
+                let rhs = match &stmts[i] {
+                    Stmt::Assign(_, _, e) => e.clone(),
+                    _ => continue,
+                };
                 if expr_has_side_effect(&rhs) {
                     stmts[i] = Stmt::Eval(rhs);
                 } else {
@@ -9324,15 +15169,34 @@ pub mod cleanup {
             Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) => reads_var(a, name) || reads_var(b, name),
             Expr::Not(inner) | Expr::Neg(inner) => reads_var(inner, name),
             Expr::Field(recv, _) => reads_var(recv, name),
-            Expr::Call { recv: Some(r), args, .. } => {
-                reads_var(r, name) || args.iter().any(|a| reads_var(a, name))
+            Expr::Call {
+                recv: Some(r),
+                args,
+                ..
+            } => reads_var(r, name) || args.iter().any(|a| reads_var(a, name)),
+            Expr::Call {
+                recv: None, args, ..
             }
-            Expr::Call { recv: None, args, .. } | Expr::RawCall(_, args, _) => {
-                args.iter().any(|a| reads_var(a, name))
-            }
+            | Expr::RawCall(_, args, _) => args.iter().any(|a| reads_var(a, name)),
             Expr::NewObj(_, args) => args.iter().any(|a| reads_var(a, name)),
+            Expr::CollectionInit {
+                ctor_args, items, ..
+            } => {
+                ctor_args.iter().any(|a| reads_var(a, name))
+                    || items.iter().any(|a| reads_var(a, name))
+            }
+            Expr::ObjInit {
+                ctor_args, fields, ..
+            } => {
+                ctor_args.iter().any(|a| reads_var(a, name))
+                    || fields.iter().any(|(_, v)| reads_var(v, name))
+            }
             Expr::RawDeref(base, _, _) => reads_var(base, name),
             Expr::RawAddr(base, _) | Expr::AddressOf(base) => reads_var(base, name),
+            Expr::Index { collection, index } => reads_var(collection, name) || reads_var(index, name),
+            Expr::NullConditional { receiver, access } => {
+                reads_var(receiver, name) || reads_var(access, name)
+            }
             _ => false,
         }
     }
@@ -9382,15 +15246,66 @@ fn exprs_eq(a: &Expr, b: &Expr) -> bool {
         }
         (Cast(t1, x), Cast(t2, y)) => t1 == t2 && exprs_eq(x, y),
         (
-            Call { recv: r1, name: n1, args: a1 },
-            Call { recv: r2, name: n2, args: a2 },
-        ) => n1 == n2 && args_eq(a1, a2) && match (r1, r2) {
-            (Some(x), Some(y)) => exprs_eq(x, y),
-            (None, None) => true,
-            _ => false,
-        },
+            Call {
+                recv: r1,
+                name: n1,
+                args: a1,
+            },
+            Call {
+                recv: r2,
+                name: n2,
+                args: a2,
+            },
+        ) => {
+            n1 == n2
+                && args_eq(a1, a2)
+                && match (r1, r2) {
+                    (Some(x), Some(y)) => exprs_eq(x, y),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
         (NewObj(t1, a1), NewObj(t2, a2)) => t1 == t2 && args_eq(a1, a2),
         (NewArr(t1, a1), NewArr(t2, a2)) => t1 == t2 && args_eq(a1, a2),
+        (
+            ArrayInit {
+                elem_type: t1,
+                items: a1,
+            },
+            ArrayInit {
+                elem_type: t2,
+                items: a2,
+            },
+        ) => t1 == t2 && args_eq(a1, a2),
+        (
+            CollectionInit {
+                type_name: t1,
+                ctor_args: c1,
+                items: i1,
+            },
+            CollectionInit {
+                type_name: t2,
+                ctor_args: c2,
+                items: i2,
+            },
+        ) => t1 == t2 && args_eq(c1, c2) && args_eq(i1, i2),
+        (
+            ObjInit {
+                type_name: t1,
+                ctor_args: c1,
+                fields: f1,
+            },
+            ObjInit {
+                type_name: t2,
+                ctor_args: c2,
+                fields: f2,
+            },
+        ) => {
+            t1 == t2
+                && args_eq(c1, c2)
+                && f1.len() == f2.len()
+                && f1.iter().zip(f2).all(|((n1, v1), (n2, v2))| n1 == n2 && exprs_eq(v1, v2))
+        }
         (RawCall(u1, a1, r1), RawCall(u2, a2, r2)) => u1 == u2 && args_eq(a1, a2) && r1 == r2,
         _ => false,
     }
@@ -9404,8 +15319,7 @@ fn args_eq(a: &[Expr], b: &[Expr]) -> bool {
 fn expr_is_complement(a: &Expr, b: &Expr) -> bool {
     use Expr::*;
     if let (Cmp(k1, l1, r1), Cmp(k2, l2, r2)) = (a, b) {
-        return std::mem::discriminant(k2)
-            == std::mem::discriminant(&(*k1).invert())
+        return std::mem::discriminant(k2) == std::mem::discriminant(&(*k1).invert())
             && exprs_eq(l1, l2)
             && exprs_eq(r1, r2);
     }
@@ -9426,6 +15340,7 @@ fn expr_effectful(e: &Expr) -> bool {
             recv.as_deref().is_some_and(expr_effectful) || args.iter().any(expr_effectful)
         }
         RawCall(..) | NewObj(..) | NewArr(..) | Await(_) => true,
+        CollectionInit { .. } | ObjInit { .. } => true,
         Bin(_, x, y) | Cmp(_, x, y) => expr_effectful(x) || expr_effectful(y),
         Not(x) | Neg(x) | Cast(_, x) => expr_effectful(x),
         Field(r, _) | RawDeref(r, _, _) | RawAddr(r, _) | AddressOf(r) => expr_effectful(r),
@@ -9435,8 +15350,28 @@ fn expr_effectful(e: &Expr) -> bool {
         // runs when the delegate is invoked, so the literal itself is
         // side-effect-free and a guard over it can fold.
         Lambda { .. } => false,
+        ArrayInit { items, .. } => items.iter().any(expr_effectful),
         Var(_) | This | Int(_) | Float(_) | Double(_) | Bool(_) | Str(_) | Null | Unknown
         | MissingAbiArg | StaticField(..) | MethodGroup(_) => false,
+        Index { collection, index } => expr_effectful(collection) || expr_effectful(index),
+        NullConditional { receiver, access } => expr_effectful(receiver) || expr_effectful(access),
+        PatternMatch { expr, .. } => expr_effectful(expr),
+        StringInterp { parts } => parts.iter().any(|p| matches!(p, InterpPart::Expr(e, _) if expr_effectful(e))),
+        Tuple { elements, .. } => elements.iter().any(expr_effectful),
+        MethodChain { receiver, methods } => {
+            expr_effectful(receiver) || methods.iter().any(|m| m.args.iter().any(expr_effectful))
+        }
+        SwitchExpr { discrim, arms, default_arm } => {
+            expr_effectful(discrim)
+                || arms.iter().any(|(p, r)| expr_effectful(p) || expr_effectful(r))
+                || default_arm.as_deref().is_some_and(|e| expr_effectful(e))
+        }
+        Range { from, to } => {
+            from.as_ref().is_some_and(|f| expr_effectful(f))
+                || to.as_ref().is_some_and(|t| expr_effectful(t))
+        }
+        IndexFromEnd(e) => expr_effectful(e),
+        TypeOf(_) => false,
     }
 }
 
@@ -9446,12 +15381,20 @@ fn fold_impossible_guards(stmts: &mut Vec<Stmt>) {
     // recurse into children first (innermost artifacts fold first)
     for s in stmts.iter_mut() {
         match s {
-            Stmt::If { then_body, else_body, .. } => {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 fold_impossible_guards(then_body);
                 fold_impossible_guards(else_body);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => fold_impossible_guards(body),
-            Stmt::Try { try_body, catches, finally_body } => {
+            Stmt::Try {
+                try_body,
+                catches,
+                finally_body,
+            } => {
                 fold_impossible_guards(try_body);
                 for (_, b) in catches.iter_mut() {
                     fold_impossible_guards(b);
@@ -9466,9 +15409,11 @@ fn fold_impossible_guards(stmts: &mut Vec<Stmt>) {
     let mut i = 0;
     while i < stmts.len() {
         let outer = match &stmts[i] {
-            Stmt::If { cond, then_body, else_body }
-                if then_body.len() == 1 && else_body.is_empty() =>
-            {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } if then_body.len() == 1 && else_body.is_empty() => {
                 (cond.clone(), then_body[0].clone())
             }
             _ => {
@@ -9477,7 +15422,12 @@ fn fold_impossible_guards(stmts: &mut Vec<Stmt>) {
             }
         };
         let (c1, inner) = outer;
-        let Stmt::If { cond: c2, then_body: x, else_body: e2 } = &inner else {
+        let Stmt::If {
+            cond: c2,
+            then_body: x,
+            else_body: e2,
+        } = &inner
+        else {
             i += 1;
             continue;
         };
@@ -9486,7 +15436,7 @@ fn fold_impossible_guards(stmts: &mut Vec<Stmt>) {
             continue;
         }
         let pure = x.iter().all(|s| match s {
-            Stmt::Comment(_) | Stmt::Break | Stmt::Continue => true,
+            Stmt::Comment(_) | Stmt::Attribute { .. } | Stmt::Break | Stmt::Continue => true,
             Stmt::Return(None) => true,
             Stmt::Return(Some(e)) => !expr_effectful(e),
             Stmt::Assign(t, _, e) => !t.contains('.') && !t.contains('[') && !expr_effectful(e),
@@ -9697,7 +15647,11 @@ fn fold_decided_guards_inner(
         };
         let Some(decided) = decision else {
             match &mut stmts[i] {
-                Stmt::If { cond, then_body, else_body } => {
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
                     let cond = cond.clone();
                     let t = extend_facts(&cond, &facts, false);
                     let e = extend_facts(&cond, &facts, true);
@@ -9707,7 +15661,11 @@ fn fold_decided_guards_inner(
                 Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
                     fold_decided_guards_inner(body, &facts, depth + 1, all_refs)
                 }
-                Stmt::Try { try_body, catches, finally_body } => {
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
                     fold_decided_guards_inner(try_body, &facts, depth + 1, all_refs);
                     for (_, b) in catches.iter_mut() {
                         fold_decided_guards_inner(b, &facts, depth + 1, all_refs);
@@ -9724,7 +15682,14 @@ fn fold_decided_guards_inner(
         // `decided == true`  → the then-arm is taken, the else-arm is dead.
         // `decided == false` → the else-arm is taken, the then-arm is dead.
         let dead_unsafe = {
-            let Stmt::If { then_body, else_body, .. } = &stmts[i] else { unreachable!() };
+            let Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } = &stmts[i]
+            else {
+                unreachable!()
+            };
             let dead_arm: &Vec<Stmt> = if decided { else_body } else { then_body };
             let mut dead_labels = HashSet::new();
             collect_labels(dead_arm, &mut dead_labels);
@@ -9738,7 +15703,14 @@ fn fold_decided_guards_inner(
                     .any(|l| all_refs.contains(l) && !dead_refs.contains(l))
             }
         };
-        let Stmt::If { cond, then_body, else_body } = &mut stmts[i] else { unreachable!() };
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = &mut stmts[i]
+        else {
+            unreachable!()
+        };
         if dead_unsafe {
             // A `goto` outside the dead arm targets a label it defines. Leave
             // the shell rather than orphan that goto, but still fold nested
@@ -9769,7 +15741,7 @@ fn fold_decided_guards_inner(
     }
 }
 
-/// Event-accessor CAS-retry idiom → the single store the C# source was.
+/// Event-accessor CAS-retry idiom → C# `+=` / `-=`.
 ///
 /// Roslyn + IL2CPP compile `[CompilerGenerated]` event add/remove accessors
 /// into a lock-free CAS retry loop: `Delegate.Combine/Remove(field, value)`
@@ -9777,16 +15749,17 @@ fn fold_decided_guards_inner(
 /// generic-sharing runtime thunk. The thunk's result register is never
 /// modeled, so the loop's real exit test degrades and the whole loop renders
 /// as a bogus `while (Delegate.Combine(this.Evt, v) != 0) { }` shell — with
-/// the store itself silently missing (the audit's clean-but-dropped family:
+/// the update itself silently missing (the audit's clean-but-dropped family:
 /// output looks structured, yet the method's only real operation is gone).
 ///
 /// Single-threaded pseudo-C# cannot express atomics: for the accessor
 /// contract the retry loop IS the plain store `this.Evt = Delegate.Combine(
-/// this.Evt, value)`, so the whole loop collapses to that assignment.
+/// this.Evt, value)`, so the whole loop collapses to the event operation.
 ///
 /// Safety gates (a failed match leaves the low-level output untouched):
 ///  * the method is accessor-named (add_/remove_);
-///  * its ENTIRE body is [plain vN copies] + exactly ONE such loop — real
+///  * its ENTIRE body is [class-init work + field snapshot] + exactly ONE
+///    recognized retry loop — real
 ///    logic (custom accessors) breaks the shape and is preserved;
 ///  * the loop body is CAS-pure (only the combine call, raw runtime thunks
 ///    and null-guards — never returns/throws/allocations/managed calls);
@@ -9797,6 +15770,9 @@ fn fold_decided_guards_inner(
 pub(crate) fn collapse_event_cas_accessors(stmts: &mut Vec<Stmt>, method_name: &str) {
     let is_accessor = method_name.starts_with("add_") || method_name.starts_with("remove_");
     if !is_accessor {
+        return;
+    }
+    if collapse_event_cas_do_while(stmts, method_name) {
         return;
     }
     // Top-level single-def map: vN -> its RHS expression. Collects plain
@@ -9816,7 +15792,8 @@ pub(crate) fn collapse_event_cas_accessors(stmts: &mut Vec<Stmt>, method_name: &
             Stmt::Assign(n, None, Expr::Var(src)) if n.starts_with('v') => {
                 defs.insert(n.clone(), Expr::Var(src.clone()));
             }
-            Stmt::Assign(n, None, e @ Expr::Field(..)) | Stmt::Assign(n, None, e @ Expr::StaticField(..))
+            Stmt::Assign(n, None, e @ Expr::Field(..))
+            | Stmt::Assign(n, None, e @ Expr::StaticField(..))
                 if n.starts_with('v') =>
             {
                 defs.insert(n.clone(), e.clone());
@@ -9840,8 +15817,12 @@ pub(crate) fn collapse_event_cas_accessors(stmts: &mut Vec<Stmt>, method_name: &
         }
     }
     let Some(wi) = while_idx else { return };
-    let Stmt::While { cond, body } = &stmts[wi] else { return };
-    let Some((op, a0, a1)) = find_delegate_combine_call(cond) else { return };
+    let Stmt::While { cond, body } = &stmts[wi] else {
+        return;
+    };
+    let Some((op, a0, a1)) = find_delegate_combine_call(cond) else {
+        return;
+    };
     if !body.iter().all(stmt_cas_pure) {
         return;
     }
@@ -9924,6 +15905,399 @@ pub(crate) fn collapse_event_cas_accessors(stmts: &mut Vec<Stmt>, method_name: &
     sweep_dead_copies(stmts);
 }
 
+/// Recover the common Roslyn/IL2CPP shape where the combine call is an
+/// assignment inside a `do/while`, rather than the `while (Combine(...))`
+/// shape handled above. This recognizer is intentionally tied to the generated
+/// accessor contract: a field snapshot, exactly one Combine/Remove, a
+/// compare-exchange of `(field, combined, old)`, a retry edge, and a guarded
+/// bad-delegate return. Any extra call or custom control flow leaves the
+/// original pseudocode intact.
+fn collapse_event_cas_do_while(stmts: &mut Vec<Stmt>, method_name: &str) -> bool {
+    let (add, event_name) = if let Some(n) = method_name.strip_prefix("add_") {
+        (true, n)
+    } else if let Some(n) = method_name.strip_prefix("remove_") {
+        (false, n)
+    } else {
+        return false;
+    };
+
+    let mut loop_index = None;
+    let mut snapshot: Option<(usize, String, Expr)> = None;
+    let mut tail_returns = 0usize;
+    for (i, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            Stmt::DoWhile { .. } => {
+                if loop_index.replace(i).is_some() {
+                    return false;
+                }
+            }
+            Stmt::Assign(dst, None, field @ (Expr::Field(..) | Expr::StaticField(..)))
+                if dst.starts_with('v') =>
+            {
+                if snapshot.is_some() || !accessor_field_matches(field, event_name) {
+                    return false;
+                }
+                snapshot = Some((i, dst.clone(), field.clone()));
+            }
+            Stmt::Return(None) if loop_index.is_some_and(|li| li < i) => {
+                tail_returns += 1;
+                if tail_returns > 1 {
+                    return false;
+                }
+            }
+            Stmt::Comment(_) => {}
+            s if loop_index.is_none() && accessor_init_stmt(s) => {}
+            _ => return false,
+        }
+    }
+    let (Some(li), Some((snapshot_index, old_name, field))) = (loop_index, snapshot) else {
+        return false;
+    };
+    if snapshot_index > li {
+        return false;
+    }
+    let Stmt::DoWhile { body, cond } = &stmts[li] else {
+        unreachable!()
+    };
+    if !expr_cas_pure(cond) {
+        return false;
+    }
+
+    let mut calls: Vec<&Expr> = Vec::new();
+    let [
+        Stmt::Assign(
+            combined_name,
+            None,
+            Expr::Call {
+                recv: None,
+                name: combine_name,
+                args: combine_args,
+            },
+        ),
+        Stmt::If {
+            cond: null_cond,
+            then_body: null_body,
+            else_body: null_else,
+        },
+        Stmt::Label(cast_ok_label),
+        Stmt::Assign(cas_result, None, cas_call),
+        Stmt::Assign(updated_old, None, Expr::Var(update_value)),
+        Stmt::If {
+            cond: retry_cond,
+            then_body: retry_body,
+            else_body: retry_else,
+        },
+    ] = body.as_slice()
+    else {
+        return false;
+    };
+    let Some(value) = combine_args.get(1).cloned() else {
+        return false;
+    };
+    let expected_combine = if add {
+        "Delegate.Combine"
+    } else {
+        "Delegate.Remove"
+    };
+    if combine_name != expected_combine
+        || combine_args.len() != 2
+        || !matches!(&combine_args[0], Expr::Var(n) if n == &old_name)
+        || !matches!(&combine_args[1], Expr::Var(n) if n == "value")
+        || exprs_eq(&combine_args[0], &combine_args[1])
+        || !expr_contains_var(null_cond, combined_name)
+        || !null_else.is_empty()
+        || null_body.len() != 1
+        || !matches!(update_value, n if n == cas_result)
+        || updated_old != &old_name
+        || !cas_result.starts_with('v')
+        || !expr_contains_var(retry_cond, &old_name)
+        || !expr_contains_var(retry_cond, cas_result)
+        || retry_body.len() != 1
+        || !matches!(&retry_body[0], Stmt::Continue)
+        || !retry_else.is_empty()
+        || !expr_contains_var(cond, &old_name)
+        || !expr_contains_var(cond, cas_result)
+    {
+        return false;
+    }
+
+    let [
+        Stmt::If {
+            cond: type_cond,
+            then_body: bad_cast_body,
+            else_body: cast_ok_body,
+        },
+    ] = null_body.as_slice()
+    else {
+        return false;
+    };
+    let [Stmt::Assign(_, None, bad_cast_call), Stmt::Return(None)] = bad_cast_body.as_slice()
+    else {
+        return false;
+    };
+    let [Stmt::Goto(goto_label)] = cast_ok_body.as_slice() else {
+        return false;
+    };
+    if goto_label != cast_ok_label
+        || !expr_contains_var(type_cond, combined_name)
+        || !matches!(event_call_args(bad_cast_call), Some([Expr::Var(n), _]) if n.as_str() == combined_name.as_str())
+    {
+        return false;
+    }
+
+    let Some(cas_args) = event_call_args(cas_call) else {
+        return false;
+    };
+    if cas_args.len() != 3
+        || !exprs_eq(&cas_args[0], &field)
+        || !matches!(&cas_args[1], Expr::Var(n) if n.as_str() == combined_name.as_str())
+        || !matches!(&cas_args[2], Expr::Var(n) if n.as_str() == old_name.as_str())
+    {
+        return false;
+    }
+
+    // No other calls may hide in guards or bookkeeping. The complete body is
+    // the Combine/Remove, the compare-exchange, and its guarded cast-failure
+    // helper; any additional call means this is likely a custom accessor.
+    for stmt in body {
+        collect_event_calls_stmt(stmt, &mut calls);
+    }
+    if calls.len() != 3 {
+        return false;
+    }
+
+    let mut replacement = Vec::with_capacity(stmts.len());
+    for (i, stmt) in stmts.drain(..).enumerate() {
+        if i == snapshot_index {
+            continue; // the field read only seeds the CAS retry local
+        }
+        if i == li {
+            replacement.push(Stmt::EventAssign {
+                field: field.clone(),
+                value: value.clone(),
+                add,
+            });
+        } else {
+            replacement.push(stmt);
+        }
+    }
+    *stmts = replacement;
+    true
+}
+
+fn accessor_field_matches(field: &Expr, expected: &str) -> bool {
+    match field {
+        Expr::Field(base, name) => {
+            name == expected
+                && (matches!(base.as_ref(), Expr::This)
+                    || matches!(base.as_ref(), Expr::Var(n) if n == "this"))
+        }
+        Expr::StaticField(_, name) => name == expected,
+        _ => false,
+    }
+}
+
+fn event_call_args(expr: &Expr) -> Option<&[Expr]> {
+    match expr {
+        Expr::Call {
+            recv: None, args, ..
+        }
+        | Expr::RawCall(_, args, _) => Some(args),
+        _ => None,
+    }
+}
+
+fn expr_contains_var(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Var(n) => n == name,
+        Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) => {
+            expr_contains_var(a, name) || expr_contains_var(b, name)
+        }
+        Expr::Not(e)
+        | Expr::Neg(e)
+        | Expr::Await(e)
+        | Expr::Cast(_, e)
+        | Expr::RawDeref(e, _, _)
+        | Expr::RawAddr(e, _)
+        | Expr::AddressOf(e) => expr_contains_var(e, name),
+        Expr::Field(base, _) => expr_contains_var(base, name),
+        Expr::Call { recv, args, .. } => {
+            recv.as_ref().is_some_and(|r| expr_contains_var(r, name))
+                || args.iter().any(|a| expr_contains_var(a, name))
+        }
+        Expr::Cond(c, t, e) => {
+            expr_contains_var(c, name) || expr_contains_var(t, name) || expr_contains_var(e, name)
+        }
+        Expr::Lambda { body, .. } => expr_contains_var(body, name),
+        Expr::RawCall(_, args, _) | Expr::NewObj(_, args) | Expr::NewArr(_, args) => {
+            args.iter().any(|a| expr_contains_var(a, name))
+        }
+        Expr::CollectionInit {
+            ctor_args, items, ..
+        } => {
+            ctor_args.iter().any(|a| expr_contains_var(a, name))
+                || items.iter().any(|a| expr_contains_var(a, name))
+        }
+        Expr::ObjInit {
+            ctor_args, fields, ..
+        } => {
+            ctor_args.iter().any(|a| expr_contains_var(a, name))
+                || fields.iter().any(|(_, v)| expr_contains_var(v, name))
+        }
+        _ => false,
+    }
+}
+
+fn collect_event_calls_stmt<'a>(stmt: &'a Stmt, out: &mut Vec<&'a Expr>) {
+    fn expr<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::Call { recv, args, .. } => {
+                out.push(e);
+                if let Some(r) = recv {
+                    expr(r, out);
+                }
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            Expr::RawCall(_, args, _) => {
+                out.push(e);
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            Expr::Not(a)
+            | Expr::Neg(a)
+            | Expr::Await(a)
+            | Expr::Cast(_, a)
+            | Expr::Field(a, _)
+            | Expr::RawDeref(a, _, _)
+            | Expr::RawAddr(a, _)
+            | Expr::AddressOf(a) => expr(a, out),
+            Expr::Cond(c, t, f) => {
+                expr(c, out);
+                expr(t, out);
+                expr(f, out);
+            }
+            Expr::Lambda { body, .. } => expr(body, out),
+            Expr::NewObj(_, args) | Expr::NewArr(_, args) => {
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            Expr::CollectionInit {
+                ctor_args, items, ..
+            } => {
+                for a in ctor_args.iter().chain(items) {
+                    expr(a, out);
+                }
+            }
+            Expr::ObjInit {
+                ctor_args, fields, ..
+            } => {
+                for a in ctor_args {
+                    expr(a, out);
+                }
+                for (_, v) in fields {
+                    expr(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    match stmt {
+        Stmt::Eval(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) | Stmt::YieldReturn(e) => {
+            expr(e, out)
+        }
+        Stmt::Assign(_, _, e) => expr(e, out),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            expr(cond, out);
+            for s in then_body.iter().chain(else_body) {
+                collect_event_calls_stmt(s, out);
+            }
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            expr(cond, out);
+            for s in body {
+                collect_event_calls_stmt(s, out);
+            }
+        }
+        Stmt::For {
+            init,
+            cond,
+            incr,
+            body,
+        } => {
+            for s in init.iter().chain(incr).chain(body) {
+                collect_event_calls_stmt(s, out);
+            }
+            if let Some(c) = cond {
+                expr(c, out);
+            }
+        }
+        Stmt::Switch {
+            cases,
+            tail,
+            default,
+            ..
+        } => {
+            for (_, body) in cases {
+                for s in body {
+                    collect_event_calls_stmt(s, out);
+                }
+            }
+            if let Some(arm) = default {
+                for s in arm {
+                    collect_event_calls_stmt(s, out);
+                }
+            }
+            for s in tail {
+                collect_event_calls_stmt(s, out);
+            }
+        }
+        Stmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => {
+            for s in try_body {
+                collect_event_calls_stmt(s, out);
+            }
+            for (_, body) in catches {
+                for s in body {
+                    collect_event_calls_stmt(s, out);
+                }
+            }
+            if let Some(body) = finally_body {
+                for s in body {
+                    collect_event_calls_stmt(s, out);
+                }
+            }
+        }
+        Stmt::Using { decl, body } => {
+            collect_event_calls_stmt(decl, out);
+            for s in body {
+                collect_event_calls_stmt(s, out);
+            }
+        }
+        Stmt::Lock { expr: e, body } => {
+            expr(e, out);
+            for s in body {
+                collect_event_calls_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Keep the statements of a collapsed CAS-retry body that carry a real call,
 /// dropping pure bookkeeping. Recurses through guards so a compare-exchange
 /// hidden behind `if (v44 != 0) { … }` survives with its test intact.
@@ -9931,13 +16305,21 @@ fn cas_body_effectful(s: &Stmt) -> Option<Stmt> {
     match s {
         Stmt::Eval(e) if cleanup::expr_has_side_effect(e) => Some(s.clone()),
         Stmt::Assign(_, _, e) if cleanup::expr_has_side_effect(e) => Some(s.clone()),
-        Stmt::If { cond, then_body, else_body } => {
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
             let t: Vec<Stmt> = then_body.iter().filter_map(cas_body_effectful).collect();
             let e: Vec<Stmt> = else_body.iter().filter_map(cas_body_effectful).collect();
             if t.is_empty() && e.is_empty() {
                 None
             } else {
-                Some(Stmt::If { cond: cond.clone(), then_body: t, else_body: e })
+                Some(Stmt::If {
+                    cond: cond.clone(),
+                    then_body: t,
+                    else_body: e,
+                })
             }
         }
         _ => None,
@@ -9948,7 +16330,11 @@ fn cas_body_effectful(s: &Stmt) -> Option<Stmt> {
 /// condition (through any compare/not/negate/deref wrappers).
 fn find_delegate_combine_call(e: &Expr) -> Option<(String, Expr, Expr)> {
     match e {
-        Expr::Call { recv: None, name, args } => {
+        Expr::Call {
+            recv: None,
+            name,
+            args,
+        } => {
             let nm = name.as_str();
             if (nm == "Delegate.Combine" || nm == "Delegate.Remove") && args.len() >= 2 {
                 Some((nm.to_string(), args[0].clone(), args[1].clone()))
@@ -9959,10 +16345,12 @@ fn find_delegate_combine_call(e: &Expr) -> Option<(String, Expr, Expr)> {
         Expr::Cmp(_, a, b) | Expr::Bin(_, a, b) => {
             find_delegate_combine_call(a).or_else(|| find_delegate_combine_call(b))
         }
-        Expr::Not(a) | Expr::Neg(a) | Expr::Cast(_, a) | Expr::RawDeref(a, _, _)
-        | Expr::RawAddr(a, _) | Expr::AddressOf(a) => {
-            find_delegate_combine_call(a)
-        }
+        Expr::Not(a)
+        | Expr::Neg(a)
+        | Expr::Cast(_, a)
+        | Expr::RawDeref(a, _, _)
+        | Expr::RawAddr(a, _)
+        | Expr::AddressOf(a) => find_delegate_combine_call(a),
         _ => None,
     }
 }
@@ -9978,13 +16366,17 @@ fn find_delegate_combine_call(e: &Expr) -> Option<(String, Expr, Expr)> {
 /// hand-written accessor, which must be left untouched.
 fn accessor_init_stmt(s: &Stmt) -> bool {
     match s {
-        Stmt::Comment(_) | Stmt::Break | Stmt::Continue | Stmt::Goto(_) | Stmt::Label(_) => true,
+        Stmt::Comment(_) | Stmt::Attribute { .. } | Stmt::Break | Stmt::Continue | Stmt::Goto(_) | Stmt::Label(_) => true,
         // `if (<bit test>) goto L;` — the metadata-init guard.
-        Stmt::If { cond, then_body, else_body } => {
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
             else_body.is_empty()
                 && then_body
                     .iter()
-                    .all(|s| matches!(s, Stmt::Goto(_) | Stmt::Label(_) | Stmt::Comment(_)))
+                    .all(|s| matches!(s, Stmt::Goto(_) | Stmt::Label(_) | Stmt::Comment(_) | Stmt::Attribute { .. }))
                 && stmt_init_expr_ok(cond)
         }
         // `v27 = fn_4a58960(0x60429f8, value);` — runtime init call result.
@@ -9999,9 +16391,18 @@ fn accessor_init_stmt(s: &Stmt) -> bool {
 /// Expression form admitted inside the accessor init prefix.
 fn stmt_init_expr_ok(e: &Expr) -> bool {
     match e {
-        Expr::Var(_) | Expr::This | Expr::Int(_) | Expr::Float(_) | Expr::Double(_)
-        | Expr::Bool(_) | Expr::Str(_) | Expr::Null | Expr::Unknown | Expr::MissingAbiArg
-        | Expr::StaticField(..) | Expr::Field(..) => true,
+        Expr::Var(_)
+        | Expr::This
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Double(_)
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::Null
+        | Expr::Unknown
+        | Expr::MissingAbiArg
+        | Expr::StaticField(..)
+        | Expr::Field(..) => true,
         Expr::RawCall(..) => true,
         Expr::RawDeref(b, _, _) | Expr::RawAddr(b, _) | Expr::AddressOf(b) => stmt_init_expr_ok(b),
         Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) => stmt_init_expr_ok(a) && stmt_init_expr_ok(b),
@@ -10018,12 +16419,16 @@ fn stmt_cas_pure(s: &Stmt) -> bool {
     match s {
         Stmt::Eval(e) => expr_cas_pure(e),
         Stmt::Assign(t, _, e) => !t.contains('.') && !t.contains('[') && expr_cas_pure(e),
-        Stmt::If { cond, then_body, else_body } => {
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
             expr_cas_pure(cond)
                 && then_body.iter().all(stmt_cas_pure)
                 && else_body.iter().all(stmt_cas_pure)
         }
-        Stmt::Comment(_) | Stmt::Break | Stmt::Continue => true,
+        Stmt::Comment(_) | Stmt::Attribute { .. } | Stmt::Break | Stmt::Continue => true,
         _ => false,
     }
 }
@@ -10039,10 +16444,23 @@ fn expr_cas_pure(e: &Expr) -> bool {
         }
         Expr::RawCall(_, args, _) => args.iter().all(expr_cas_pure),
         Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) => expr_cas_pure(a) && expr_cas_pure(b),
-        Expr::Not(a) | Expr::Neg(a) | Expr::Cast(_, a) | Expr::Field(a, _)
-        | Expr::RawDeref(a, _, _) | Expr::RawAddr(a, _) | Expr::AddressOf(a) => expr_cas_pure(a),
-        Expr::Var(_) | Expr::This | Expr::Int(_) | Expr::Float(_) | Expr::Double(_)
-        | Expr::Bool(_) | Expr::Str(_) | Expr::Null | Expr::Unknown | Expr::MissingAbiArg
+        Expr::Not(a)
+        | Expr::Neg(a)
+        | Expr::Cast(_, a)
+        | Expr::Field(a, _)
+        | Expr::RawDeref(a, _, _)
+        | Expr::RawAddr(a, _)
+        | Expr::AddressOf(a) => expr_cas_pure(a),
+        Expr::Var(_)
+        | Expr::This
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Double(_)
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::Null
+        | Expr::Unknown
+        | Expr::MissingAbiArg
         | Expr::StaticField(..) => true,
         _ => false,
     }
@@ -10079,7 +16497,7 @@ fn sweep_dead_copies(stmts: &mut Vec<Stmt>) {
 
 /// Collect the variable names an expression READS (a copy's LHS is a def,
 /// so it never keeps itself alive — only RHS/condition reads count).
-fn collect_used_vars(e: &Expr, out: &mut HashSet<String>) {
+pub(crate) fn collect_used_vars(e: &Expr, out: &mut HashSet<String>) {
     match e {
         Expr::Var(n) => {
             out.insert(n.clone());
@@ -10088,16 +16506,23 @@ fn collect_used_vars(e: &Expr, out: &mut HashSet<String>) {
             collect_used_vars(a, out);
             collect_used_vars(b, out);
         }
-        Expr::Not(a) | Expr::Neg(a) | Expr::Cast(_, a) | Expr::Field(a, _)
-        | Expr::RawDeref(a, _, _) | Expr::RawAddr(a, _) | Expr::AddressOf(a) => {
-            collect_used_vars(a, out)
-        }
+        Expr::Not(a)
+        | Expr::Neg(a)
+        | Expr::Cast(_, a)
+        | Expr::Field(a, _)
+        | Expr::RawDeref(a, _, _)
+        | Expr::RawAddr(a, _)
+        | Expr::AddressOf(a) => collect_used_vars(a, out),
         Expr::Cond(a, b, c) => {
             collect_used_vars(a, out);
             collect_used_vars(b, out);
             collect_used_vars(c, out);
         }
-        Expr::Call { recv, name: _, args } => {
+        Expr::Call {
+            recv,
+            name: _,
+            args,
+        } => {
             if let Some(r) = recv {
                 collect_used_vars(r, out);
             }
@@ -10110,16 +16535,42 @@ fn collect_used_vars(e: &Expr, out: &mut HashSet<String>) {
                 collect_used_vars(a, out);
             }
         }
+        Expr::ArrayInit { items, .. } => {
+            for a in items {
+                collect_used_vars(a, out);
+            }
+        }
+        Expr::CollectionInit {
+            ctor_args, items, ..
+        } => {
+            for a in ctor_args.iter().chain(items) {
+                collect_used_vars(a, out);
+            }
+        }
+        Expr::ObjInit {
+            ctor_args, fields, ..
+        } => {
+            for a in ctor_args {
+                collect_used_vars(a, out);
+            }
+            for (_, v) in fields {
+                collect_used_vars(v, out);
+            }
+        }
         Expr::Await(a) => collect_used_vars(a, out),
         _ => {}
     }
 }
 
-fn collect_used_vars_stmt(s: &Stmt, out: &mut HashSet<String>) {
+pub(crate) fn collect_used_vars_stmt(s: &Stmt, out: &mut HashSet<String>) {
     match s {
         Stmt::Eval(e) => collect_used_vars(e, out),
         Stmt::Assign(_, _, e) => collect_used_vars(e, out), // RHS only
-        Stmt::If { cond, then_body, else_body } => {
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
             collect_used_vars(cond, out);
             for x in then_body.iter().chain(else_body) {
                 collect_used_vars_stmt(x, out);
@@ -10137,7 +16588,11 @@ fn collect_used_vars_stmt(s: &Stmt, out: &mut HashSet<String>) {
             }
         }
         Stmt::Throw(e) => collect_used_vars(e, out),
-        Stmt::Try { try_body, catches, finally_body } => {
+        Stmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => {
             for x in try_body {
                 collect_used_vars_stmt(x, out);
             }
@@ -10152,7 +16607,9 @@ fn collect_used_vars_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 }
             }
         }
-        Stmt::ForEach { collection, body, .. } => {
+        Stmt::ForEach {
+            collection, body, ..
+        } => {
             for x in body {
                 collect_used_vars_stmt(x, out);
             }
@@ -10250,7 +16707,8 @@ fn undef_dbg_scan_tokens(code: &str) -> Vec<(u32, bool)> {
                 let is_def = if k < b.len() {
                     if b[k] == b'=' {
                         k + 1 >= b.len() || b[k + 1] != b'='
-                    } else if matches!(b[k], b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^') {
+                    } else if matches!(b[k], b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+                    {
                         k + 1 < b.len() && b[k + 1] == b'='
                     } else if b[k] == b'<' || b[k] == b'>' {
                         k + 2 < b.len() && b[k + 1] == b[k] && b[k + 2] == b'='
@@ -10272,29 +16730,45 @@ fn undef_dbg_scan_tokens(code: &str) -> Vec<(u32, bool)> {
 
 /// See the block comment above: one TSV record per undefined `vN`, with the
 /// reason its origin was not rendered as a name.
-fn undef_dbg_records(
-    table: &super::locals::LocalTable,
-    insns: &[Insn],
-    rva: u64,
-    body: &str,
-) {
+fn undef_dbg_records(table: &super::locals::LocalTable, insns: &[Insn], rva: u64, body: &str) {
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
     static F: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-    let Ok(path) = std::env::var("ILR_UNDEFDBG") else { return };
-    let file = F
-        .get_or_init(|| Mutex::new(std::fs::File::create(&path).expect("ILR_UNDEFDBG file")));
+    let Ok(path) = std::env::var("ILR_UNDEFDBG") else {
+        return;
+    };
+    let file =
+        F.get_or_init(|| Mutex::new(std::fs::File::create(&path).expect("ILR_UNDEFDBG file")));
 
     // Locals the IR itself DEFINES. A local in this set whose name still reads
     // undefined in the text lost its assignment STATEMENT, which is a far more
     // serious defect than a register the renderer declined to name.
     let mut ir_defines: HashSet<usize> = HashSet::new();
+    // Local → the op that defines it. `def-dropped` is not one defect: a
+    // `NewObj` local has no statement form at all, a `Call` local lost its
+    // binding, a `Move` local lost its copy. Splitting the reason by the
+    // defining op is what makes the class actionable.
+    let mut def_op: HashMap<usize, &'static str> = HashMap::new();
     for insn in insns {
         if let Some(pos) = Insn::dest_position(&insn.op) {
             if let Some(Operand::Local(v)) = insn.operands.get(pos) {
                 if let Some(&li) = table.index_of.get(v) {
                     ir_defines.insert(li);
+                    def_op.entry(li).or_insert(match &insn.op {
+                        Op::NewObj(_) => "NewObj",
+                        Op::NewArr(..) => "NewArr",
+                        Op::Call => "Call",
+                        Op::CallVoid => "CallVoid",
+                        Op::Move => "Move",
+                        Op::Arith(_) => "Arith",
+                        Op::Compare(_) => "Compare",
+                        Op::Convert(_) => "Convert",
+                        Op::Phi => "Phi",
+                        Op::FloatArith(_) => "FloatArith",
+                        Op::Box(_) => "Box",
+                        _ => "other",
+                    });
                 }
             }
         }
@@ -10328,18 +16802,20 @@ fn undef_dbg_records(
         let li = n as usize;
         let info = table.infos.get(li);
         let origin = info.map(|i| i.slot_origin.as_str()).unwrap_or("?");
-        let reason = match info {
-            Some(i) if i.is_this => "this",
-            Some(i) if i.is_param.is_some() => "param-noname",
-            _ if origin == "abs" => "abs",
-            _ if origin.starts_with("stack_") => "stack",
+        let reason: String = match info {
+            Some(i) if i.is_this => "this".to_string(),
+            Some(i) if i.is_param.is_some() => "param-noname".to_string(),
+            _ if origin == "abs" => "abs".to_string(),
+            _ if origin.starts_with("stack_") => "stack".to_string(),
             // BEFORE the origin-specific arms: a local the IR DEFINES cannot be
             // the incoming entry value of its register, whatever that register
             // is, so its missing assignment — not its origin — is the reason it
             // reads undefined.
-            _ if ir_defines.contains(&li) => "def-dropped",
-            _ if origin == "x0" => "x0",
-            _ => "no-def",
+            _ if ir_defines.contains(&li) => {
+                format!("def-dropped:{}", def_op.get(&li).copied().unwrap_or("?"))
+            }
+            _ if origin == "x0" => "x0".to_string(),
+            _ => "no-def".to_string(),
         };
         out.push_str(&format!("{rva:#x}\t{li}\t{origin}\t{c}\t{reason}\n"));
     }
@@ -10363,11 +16839,24 @@ fn undef_dbg_records(
 fn audit_op_cat(op: &Op) -> &'static str {
     match op {
         Op::Nop => "nop",
-        Op::Compare(_) | Op::Phi | Op::Jump(_) | Op::CondJump(_) | Op::Return | Op::Throw
-        | Op::IndirectCall | Op::Switch(_) => "ctl",
+        Op::Compare(_)
+        | Op::Phi
+        | Op::Jump(_)
+        | Op::CondJump(_)
+        | Op::Return
+        | Op::Throw
+        | Op::IndirectCall
+        | Op::Switch(_) => "ctl",
         Op::Move => "move",
-        Op::Call | Op::CallVoid | Op::NewObj(_) | Op::NewArr(..) | Op::ObjcMsgSend { .. }
-        | Op::MulAcc { .. } | Op::ShiftStack(_) | Op::Arith(_) | Op::FloatArith(_)
+        Op::Call
+        | Op::CallVoid
+        | Op::NewObj(_)
+        | Op::NewArr(..)
+        | Op::ObjcMsgSend { .. }
+        | Op::MulAcc { .. }
+        | Op::ShiftStack(_)
+        | Op::Arith(_)
+        | Op::FloatArith(_)
         | Op::Convert(_) => "sem",
         _ => "sem",
     }
@@ -10377,34 +16866,52 @@ fn audit_op_cat(op: &Op) -> &'static str {
 /// (op + operands) to stderr. Used with ILR_ONLY to classify what the
 /// renderer drops for a single method without re-dumping the whole corpus.
 fn audit_detail_unclaimed(rva: u64, insns: &[Insn], claims: &std::collections::HashSet<usize>) {
-    if std::env::var("ILR_AUDITDETAIL").is_err() {
+    if !crate::recovery::env_flags::flag("ILR_AUDITDETAIL") {
         return;
     }
     for (i, insn) in insns.iter().enumerate() {
         if claims.contains(&i) {
             continue;
         }
-        if matches!(insn.op, Op::Nop | Op::Compare(_) | Op::Phi | Op::Jump(_) | Op::CondJump(_)
-            | Op::Return | Op::Throw | Op::IndirectCall | Op::Switch(_)) {
+        if matches!(
+            insn.op,
+            Op::Nop
+                | Op::Compare(_)
+                | Op::Phi
+                | Op::Jump(_)
+                | Op::CondJump(_)
+                | Op::Return
+                | Op::Throw
+                | Op::IndirectCall
+                | Op::Switch(_)
+        ) {
             continue;
         }
         // register-copy moves are ABI plumbing; skip for the detail view
-        if matches!(insn.op, Op::Move)
-            && matches!(insn.operands.get(1), Some(Operand::Register(_))) {
+        if matches!(insn.op, Op::Move) && matches!(insn.operands.get(1), Some(Operand::Register(_)))
+        {
             continue;
         }
-        eprintln!("[audit] {:#x} unclaimed: {:?} {:?}", rva, insn.op, insn.operands);
+        eprintln!(
+            "[audit] {:#x} unclaimed: {:?} {:?}",
+            rva, insn.op, insn.operands
+        );
     }
 }
 
-fn audit_write_line(rva: u64, name: &str, insns: &[Insn], claims: &std::collections::HashSet<usize>) {
+fn audit_write_line(
+    rva: u64,
+    name: &str,
+    insns: &[Insn],
+    claims: &std::collections::HashSet<usize>,
+) {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
     static F: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
-    let Ok(path) = std::env::var("ILR_AUDIT") else { return };
-    let file = F.get_or_init(|| {
-        Mutex::new(std::fs::File::create(&path).expect("ILR_AUDIT file"))
-    });
+    let Ok(path) = std::env::var("ILR_AUDIT") else {
+        return;
+    };
+    let file = F.get_or_init(|| Mutex::new(std::fs::File::create(&path).expect("ILR_AUDIT file")));
     let mut ctl = 0usize;
     let mut cmp = 0usize;
     let mut reg = 0usize; // copies/seeding (reg->local, local->local): plumbing
@@ -10494,7 +17001,14 @@ pub fn render_method_csharp(
     ret_type: &ManagedType,
     declaring_tdi: i32,
 ) -> String {
-    render_method_csharp_full(ir, method_name, is_static, param_sigs, ret_type, declaring_tdi)
+    render_method_csharp_full(
+        ir,
+        method_name,
+        is_static,
+        param_sigs,
+        ret_type,
+        declaring_tdi,
+    )
 }
 
 pub fn render_method_csharp_full(
@@ -10505,7 +17019,15 @@ pub fn render_method_csharp_full(
     ret_type: &ManagedType,
     declaring_tdi: i32,
 ) -> String {
-    render_method_csharp_bounded(ir, method_name, is_static, param_sigs, ret_type, declaring_tdi, None)
+    render_method_csharp_bounded(
+        ir,
+        method_name,
+        is_static,
+        param_sigs,
+        ret_type,
+        declaring_tdi,
+        None,
+    )
 }
 
 /// Same, with an optional wall-clock budget guaranteeing termination on
@@ -10529,6 +17051,9 @@ pub fn render_method_csharp_bounded(
         deadline,
         &std::collections::HashMap::new(),
         &[],
+        &super::resolve::ResolveMaps::default(),
+        &super::heuristic_types::HeuristicIndex::build(&super::resolve::ResolveMaps::default()),
+        &super::reconstruct::generic_inference::build_generic_instantiation_map(&super::resolve::ResolveMaps::default()),
     )
 }
 
@@ -10538,6 +17063,7 @@ pub fn render_method_csharp_bounded(
 /// lives in the struct, so a second walk needs a second structurer. The shared
 /// inputs are borrowed; the loop/EH maps are cloned (they are small).
 #[allow(clippy::too_many_arguments)]
+
 fn build_structurer<'a>(
     sc: &'a StructuredCfg,
     insns: &'a [Insn],
@@ -10551,13 +17077,24 @@ fn build_structurer<'a>(
 ) -> Structurer<'a> {
     // Ordinary control flow reachability from the entry. See
     // `Structurer::normal_reachable` for why the handler walk needs it.
+    // Landing pads are handler ENTRIES, not ordinary code: an exceptional
+    // edge is not a CFG edge (Cytron et al.; Ramsey & Keep; LLVM's
+    // LandingPad block-leader convention). The BFS therefore does not enter
+    // them, so `normal_reachable` is "the blocks the method reaches without
+    // throwing". That matters because the handler walk stops at any
+    // normally-reachable block: while pads were IN this set, every handler
+    // walk stopped on its own first block and the handler body collapsed to
+    // a bare `goto` (E6 - 55 finally bodies and 720 catch bodies were a
+    // single goto in R72).
+    let pads: HashSet<usize> = handler_of.values().copied().collect();
     let normal_reachable: HashSet<usize> = {
         let mut seen: HashSet<usize> = HashSet::new();
         let mut stack: Vec<usize> = vec![0];
         while let Some(b) = stack.pop() {
-            if b >= sc.blocks.len() || !seen.insert(b) {
+            if b >= sc.blocks.len() || seen.contains(&b) || pads.contains(&b) {
                 continue;
             }
+            seen.insert(b);
             for s in [sc.blocks[b].succ_taken, sc.blocks[b].succ_fall]
                 .into_iter()
                 .flatten()
@@ -10567,7 +17104,7 @@ fn build_structurer<'a>(
         }
         seen
     };
-    Structurer {
+    let st = Structurer {
         sc,
         insns,
         ctx,
@@ -10577,6 +17114,7 @@ fn build_structurer<'a>(
         remaining: std::cell::Cell::new(100_000),
         forced_labels: std::cell::RefCell::new(HashSet::new()),
         visited: std::cell::RefCell::new(HashSet::new()),
+        rendered: std::cell::RefCell::new(HashSet::new()),
         loop_of_block: loop_of_block.clone(),
         eh_regions,
         region_of_block: region_of_block.clone(),
@@ -10584,13 +17122,23 @@ fn build_structurer<'a>(
         in_handler: std::cell::Cell::new(false),
         folding: std::cell::Cell::new(None),
         folded: std::cell::RefCell::new(std::collections::HashSet::new()),
+        labels_written: std::cell::RefCell::new(std::collections::HashSet::new()),
         discovery,
         in_loop_body: std::cell::Cell::new(false),
         loop_body_exit: std::cell::Cell::new(None),
+        bailed_exits: std::cell::RefCell::new(Vec::new()),
         skip_loop_header: std::cell::Cell::new(None),
         flat_chain_next: std::cell::Cell::new(None),
         normal_reachable,
+    };
+    // Pre-populate forced_labels with all blocks to prevent the timing bug where
+    // goto_stmt_reason adds to forced_labels AFTER the target was already emitted
+    // without its label. This ensures every block's label is emitted on first visit.
+    // Unused labels are later removed by drop_unreferenced_labels and strip_quiet_labels.
+    for b in 0..st.sc.blocks.len() {
+        st.forced_labels.borrow_mut().insert(b);
     }
+    st
 }
 
 /// As `render_method_csharp_bounded`, plus the declaring type's base-class
@@ -10602,7 +17150,200 @@ fn build_structurer<'a>(
 /// statements: the structurer wraps the statement span of every block whose
 /// native address lies inside a try region, and renders the region's
 /// landing-pad block as the handler body.
+/// Build a map from variable display name → TypeDef index (tdi) for the
+/// field annotation pass. Iterates the `LocalTable` and extracts the display
+/// name (using the same rules as `MethodCtx::var_name`) and the tdi from
+/// `ManagedType::Class(named_type)` entries.
+fn build_local_tdi_map(
+    table: &super::locals::LocalTable,
+    _stmts: &[Stmt],
+) -> std::collections::HashMap<String, i32> {
+    let mut result = std::collections::HashMap::new();
+    for (li, info) in table.infos.iter().enumerate() {
+        // Extract tdi from the type.
+        let tdi = match &info.ty {
+            ManagedType::Class(named) if named.type_def_index >= 0 => {
+                named.type_def_index
+            }
+            _ => continue,
+        };
+        // Compute the display name (mirrors MethodCtx::var_name logic).
+        // The name SPACES must match the rendered AST: a stack cell renders
+        // as `stack_N` while its local index would key `v{li}`, and a
+        // clobbered `this`/FP variant renders as `v{li}` while its primary
+        // name is `this`/the parameter. `ILR_RAWDBG` measured 85.4 % of raw
+        // sites with no inferred type; these aliases are the exact fix for
+        // the name-space part (stack cells, clobbered/versioned variants).
+        let stack = MethodCtx::stack_cell_name(&info.slot_origin);
+        let name = if info.is_this {
+            "this".to_string()
+        } else if let Some(pi) = info.is_param {
+            table.param_names.get(pi).cloned().unwrap_or_else(|| format!("arg{pi}"))
+        } else if let Some(n) = &stack {
+            n.clone()
+        } else {
+            format!("v{li}")
+        };
+        result.entry(name).or_insert(tdi);
+        // Every local also answers to its index-derived name: the renderer
+        // prints `v{li}` for clobbered `this`/multi-def FP variants and for
+        // coalesced versions without a custom version name.
+        result.entry(format!("v{li}")).or_insert(tdi);
+        if let Some(n) = stack {
+            result.entry(n).or_insert(tdi);
+        }
+    }
+    result
+}
+
+/// Build a display-name → `ManagedType` map for the local table, including
+/// primitive-typed parameters/locals (the tdi map above only keeps classes).
+/// `stack_naming` uses it to type a frame cell from a spilled RHS such as
+/// `stack_379 = in_vs52 * in_vs54` or `stack_416 = this._tileIndex`.
+fn build_local_managed_map(
+    table: &super::locals::LocalTable,
+) -> std::collections::HashMap<String, ManagedType> {
+    let mut result = std::collections::HashMap::new();
+    for (li, info) in table.infos.iter().enumerate() {
+        if matches!(info.ty, ManagedType::Unknown) {
+            continue;
+        }
+        let name = if info.is_this {
+            "this".to_string()
+        } else if let Some(pi) = info.is_param {
+            table
+                .param_names
+                .get(pi)
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("arg{pi}"))
+        } else if let Some(cell) = info.slot_origin.strip_prefix("stack_") {
+            match cell.strip_prefix('-') {
+                Some(n) => format!("stack_neg{n}"),
+                None => format!("stack_{cell}"),
+            }
+        } else {
+            format!("v{li}")
+        };
+        result.entry(name).or_insert_with(|| info.ty.clone());
+    }
+    result
+}
+
+/// Number of explicit jumps in a statement tree (the metric the structured
+/// emitter has to beat to be accepted).
+#[allow(dead_code)]
+fn count_gotos(stmts: &[Stmt]) -> usize {
+    let mut n = 0usize;
+    for s in stmts {
+        if matches!(s, Stmt::Goto(_)) {
+            n += 1;
+        }
+        let mut ch: Vec<&Vec<Stmt>> = Vec::new();
+        super::reconstruct::children(s, &mut ch);
+        for c in ch {
+            n += count_gotos(c);
+        }
+    }
+    n
+}
+
+#[allow(dead_code)]
+fn reloop_has_goto(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| {
+        if matches!(s, Stmt::Goto(_)) {
+            return true;
+        }
+        let mut ch: Vec<&Vec<Stmt>> = Vec::new();
+        super::reconstruct::children(s, &mut ch);
+        ch.into_iter().any(|c| reloop_has_goto(c))
+    })
+}
+#[allow(dead_code)]
+fn is_generated_local(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = name.strip_prefix('v') {
+        return digits(rest);
+    }
+    for prefix in ["stack_", "obj", "ptr", "num", "flag"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if digits(rest) {
+                return true;
+            }
+        }
+    }
+    false
+}
+#[allow(dead_code)]
+fn unassigned_generated_reads(stmts: &[Stmt]) -> HashSet<String> {
+    fn expr_reads(e: &Expr, read: &mut HashSet<String>) {
+        if let Expr::Var(n) = e {
+            read.insert(n.clone());
+        }
+        for c in crate::recovery::reconstruct::il2cpp_cleanup::expr_children(e) {
+            expr_reads(c, read);
+        }
+    }
+    fn walk(list: &[Stmt], assigned: &mut HashSet<String>, read: &mut HashSet<String>) {
+        for s in list {
+            match s {
+                Stmt::Assign(name, _, _) => {
+                    assigned.insert(name.clone());
+                }
+                Stmt::ForEach {
+                    var_name,
+                    collection,
+                    body,
+                } => {
+                    assigned.insert(var_name.clone());
+                    read.insert(collection.clone());
+                    walk(body, assigned, read);
+                }
+                Stmt::Switch { disc, .. } => {
+                    read.insert(disc.clone());
+                }
+                _ => {}
+            }
+            crate::recovery::reconstruct::float_locals::for_each_expr(s, &mut |e| {
+                expr_reads(e, read);
+            });
+            let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+            super::reconstruct::children(s, &mut kids);
+            for k in kids {
+                walk(k, assigned, read);
+            }
+        }
+    }
+    let mut assigned = HashSet::new();
+    let mut read = HashSet::new();
+    walk(stmts, &mut assigned, &mut read);
+    read.into_iter()
+        .filter(|n| is_generated_local(n) && !assigned.contains(n))
+        .collect()
+}
+
+/// Block → enclosing loop header, routing each block to the INNERMOST loop.
+///
+/// NESTED loops share body blocks, so this map is a CHOICE, not a union:
+/// iterating the loop map meant a block inside an inner loop could be routed
+/// to the OUTER header depending on per-process hash order — different
+/// nesting (or none) from run to run on the same binary. Sorting by body size
+/// descending makes the smallest (innermost) loop write last and win; ties
+/// break on the lowest header, i.e. first in listing order.
+fn loop_of_block_map(loops: &HashMap<usize, LoopInfo>) -> HashMap<usize, usize> {
+    let mut order: Vec<usize> = loops.keys().copied().collect();
+    order.sort_by(|a, b| loops[b].body.len().cmp(&loops[a].body.len()).then(b.cmp(a)));
+    let mut map: HashMap<usize, usize> = HashMap::new();
+    for h in order {
+        for &b in loops[&h].body.iter() {
+            map.insert(b, h);
+        }
+    }
+    map
+}
+
 pub fn render_method_csharp_full_chains(
+
     ir: &super::RecoveredIr,
     method_name: &str,
     is_static: bool,
@@ -10612,13 +17353,28 @@ pub fn render_method_csharp_full_chains(
     deadline: Option<std::time::Instant>,
     parent_chain: &std::collections::HashMap<i32, Vec<i32>>,
     eh_regions: &[super::exceptions::EhRegion],
+    resolve_maps: &super::resolve::ResolveMaps,
+    heuristic_index: &super::heuristic_types::HeuristicIndex,
+    generic_map: &super::reconstruct::generic_inference::GenericInstantiationMap,
 ) -> String {
     let t0 = std::time::Instant::now();
-    let prof = std::env::var("ILR_PROF").is_ok();
+    let prof = crate::recovery::env_flags::flag("ILR_PROF");
     let sc = analyze_blocks(&ir.insns);
-    if prof { eprintln!("[render] analyze_blocks {}us n={}", t0.elapsed().as_micros(), ir.insns.len()); }
+    if prof {
+        eprintln!(
+            "[render] analyze_blocks {}us n={}",
+            t0.elapsed().as_micros(),
+            ir.insns.len()
+        );
+    }
     let loops = find_loops(&sc);
-    if prof { eprintln!("[render] find_loops {}us nloops={}", t0.elapsed().as_micros(), loops.len()); }
+    if prof {
+        eprintln!(
+            "[render] find_loops {}us nloops={}",
+            t0.elapsed().as_micros(),
+            loops.len()
+        );
+    }
     // Attribute the goto-shaped output to its structural cause. Once per
     // method: everything below this point may build a second `Structurer`
     // (the binding-discovery walk), and those walks see the SAME CFG.
@@ -10628,7 +17384,7 @@ pub fn render_method_csharp_full_chains(
     // ONCE and used by both walks: the discovery walk must cover the same
     // blocks as the real one or a call that lives only in the cold region has
     // no binding and the real walk expands the same `bl` twice.
-    let reachable = adjoined_blocks(&sc, &ir.insns);
+    let mut reachable = adjoined_blocks(&sc, &ir.insns);
 
     // Must agree with the header renderer (line ~3834): unknown ret_type
     // prints as "void" there, so the body must treat it as void too — a
@@ -10642,7 +17398,10 @@ pub fn render_method_csharp_full_chains(
             let mut vs: Vec<_> = ir.table.index_of.iter().collect();
             vs.sort();
             for (v, li) in vs {
-                dbg.push_str(&format!("  SLOT v{} -> {}\n", v, ir.table.infos[*li].slot_origin));
+                dbg.push_str(&format!(
+                    "  SLOT v{} -> {}\n",
+                    v, ir.table.infos[*li].slot_origin
+                ));
             }
         }
         for (ii, insn) in ir.insns.iter().enumerate() {
@@ -10655,9 +17414,14 @@ pub fn render_method_csharp_full_chains(
         for (bi, b) in sc.blocks.iter().enumerate() {
             dbg.push_str(&format!(
                 "B{}: insns {}..{} term={:?} taken={:?} fall={:?} idom={:?} ipdom={:?}\n",
-                bi, b.start, b.end,
+                bi,
+                b.start,
+                b.end,
                 ir.insns.get(b.end.saturating_sub(1)).map(|i| &i.op),
-                b.succ_taken, b.succ_fall, sc.idom[bi], sc.ipdom[bi],
+                b.succ_taken,
+                b.succ_fall,
+                sc.idom[bi],
+                sc.ipdom[bi],
             ));
         }
         // Sorted by header: `loops` is a HashMap, so the unsorted dump printed
@@ -10669,7 +17433,10 @@ pub fn render_method_csharp_full_chains(
             let info = &loops[&h];
             let mut body: Vec<usize> = info.body.iter().copied().collect();
             body.sort_unstable();
-            dbg.push_str(&format!("loop header B{} latches={:?} body={:?}\n", h, info.latches, body));
+            dbg.push_str(&format!(
+                "loop header B{} latches={:?} body={:?}\n",
+                h, info.latches, body
+            ));
         }
         let cfg_path_named = format!("{}.{}.txt", cfg_path.trim_end_matches(".txt"), method_name);
         let _ = std::fs::write(&cfg_path_named, dbg);
@@ -10687,20 +17454,7 @@ pub fn render_method_csharp_full_chains(
     // to the INNERMOST enclosing loop: sort by body size descending so the
     // smallest (innermost) loop writes last and wins; ties break on the
     // lowest header, i.e. first in listing order.
-    let mut loop_order: Vec<usize> = loops.keys().copied().collect();
-    loop_order.sort_by(|a, b| {
-        loops[b]
-            .body
-            .len()
-            .cmp(&loops[a].body.len())
-            .then(b.cmp(a))
-    });
-    let mut loop_of_block: HashMap<usize, usize> = HashMap::new();
-    for h in loop_order {
-        for &b in loops[&h].body.iter() {
-            loop_of_block.insert(b, h);
-        }
-    }
+    let loop_of_block: HashMap<usize, usize> = loop_of_block_map(&loops);
 
     // EH folding maps: for each try region, the set of blocks whose native
     // addresses lie INSIDE the try range (the protected body), and the block
@@ -10717,16 +17471,27 @@ pub fn render_method_csharp_full_chains(
     let mut try_blocks_of: Vec<(usize, Vec<usize>)> = Vec::new();
     let mut handler_of: HashMap<usize, usize> = HashMap::new();
     for (ri, r) in eh_regions.iter().enumerate() {
+        // A row is a per-CALL-SITE byte range, so it starts and ends in the
+        // middle of blocks. Membership must be "does ANY instruction of the
+        // block lie in the range", which is the same rule the fold itself
+        // applies (E5) — testing the block START dropped every row that began
+        // mid-block (E4), and testing the start here while the fold tested the
+        // span is what let the two disagree about the last block.
         let mut tbs = Vec::new();
         for (bi, b) in sc.blocks.iter().enumerate() {
-            let blk_start = ir.insns[b.start].address;
-            let blk_end = ir.insns[b.end.saturating_sub(1)].address;
-            if blk_start >= r.try_start && blk_start < r.try_end {
+            let in_range = (b.start..b.end).any(|i| {
+                let a = ir.insns[i].address;
+                a >= r.try_start && a < r.try_end
+            });
+            if in_range {
                 tbs.push(bi);
             }
-            let _ = blk_end;
         }
-        if !tbs.is_empty() {
+        // A terminate-guard region never folds, so it must not enter
+        // `region_of_block`: that map is last-writer-wins, and a guard hull
+        // (they merge into one span per method) would otherwise shadow the
+        // real catch regions inside it.
+        if !tbs.is_empty() && !is_terminate_guard(r) {
             try_blocks_of.push((ri, tbs));
         }
         // handler block: first block whose start contains the landing pad
@@ -10747,7 +17512,7 @@ pub fn render_method_csharp_full_chains(
         }
     }
 
-    if std::env::var("ILR_EHREGDBG").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_EHREGDBG") {
         for (ri, r) in eh_regions.iter().enumerate() {
             eprintln!(
                 "[ehreg] R{ri} try=[{:#x},{:#x}) len={:#x} pad={:#x} cleanup={} catches={:?}",
@@ -10763,7 +17528,10 @@ pub fn render_method_csharp_full_chains(
             if let Some(info) = loops.get(&h) {
                 let mut body: Vec<usize> = info.body.iter().copied().collect();
                 body.sort_unstable();
-                eprintln!("[ehreg] loop hdr=B{h} body={body:?} latches={:?}", info.latches);
+                eprintln!(
+                    "[ehreg] loop hdr=B{h} body={body:?} latches={:?}",
+                    info.latches
+                );
             }
         }
         for (bi, b) in sc.blocks.iter().enumerate() {
@@ -10792,12 +17560,78 @@ pub fn render_method_csharp_full_chains(
     // bindings, so every use site links to the name instead of re-expanding
     // the call expression (one native `bl` rendered once per use). The
     // discovery output is discarded — only the binding map is kept.
+    super::tm_add(&super::timing::R_DUP, t0);
+    // The real context is built ONCE and cloned for the discovery walk: both
+    // were always built from the same listing with the same arguments, and
+    // `MethodCtx::build` runs a reaching-definition fixpoint — the single
+    // largest per-method cost measured (57 s of a 405 s sample, built twice).
+    // The clone copies the finished maps instead of recomputing them; the two
+    // contexts are independent from then on (each walk mutates its own).
+    let t_ctx = std::time::Instant::now();
+    // Per-VERSION types from the IR fixpoint (the name-level map drops a name
+    // whose versions disagree — the multi-def stack-cell case).
+    let ir_version_tdis =
+        super::reconstruct::field_annotation::infer_ir_version_map(&ir, resolve_maps);
+    let mut ctx = MethodCtx::build(
+        &ir.insns,
+        &ir.table,
+        declaring_tdi,
+        parent_chain,
+        ret_is_void,
+        Some((sc.blocks.as_slice(), sc.full_succ.as_slice())),
+    );
+    if !crate::recovery::env_flags::flag("ILR_NO_VNAMES") {
+        ctx.split_versions_by_type(&ir_version_tdis);
+    }
+    // Display names whose versions all share one proven tdi: exact per-name
+    // types the name-level maps may have dropped. Merged into `local_types`
+    // after the inference fixpoint runs.
+    let split_name_tdis: HashMap<String, i32> = {
+        let mut m: HashMap<String, i32> = HashMap::new();
+        let mut bad: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (v, n) in &ctx.version_names {
+            if let Some(&t) = ir_version_tdis.get(v) {
+                match m.get(n) {
+                    None => {
+                        m.insert(n.clone(), t);
+                    }
+                    Some(&p) if p == t => {}
+                    Some(_) => {
+                        bad.insert(n.clone());
+                    }
+                }
+            }
+        }
+        for b in bad {
+            m.remove(&b);
+        }
+        m
+    };
+    super::tm_add(&super::timing::R_CTX, t_ctx);
     let t_d = std::time::Instant::now();
-    let seeded = {
-        let ctx0 = MethodCtx::build(&ir.insns, &ir.table, declaring_tdi, parent_chain, ret_is_void);
+    // A method with no call-like instructions cannot produce a call binding,
+    // so the discovery walk's only product is provably empty. Skip the walk
+    // (and the context clone) entirely for those methods; the real walker
+    // then runs with an empty preseed, exactly as it would with the empty
+    // map the walk would have returned.
+    let has_calls = ir
+        .insns
+        .iter()
+        .any(|i| matches!(i.op, Op::Call | Op::CallVoid | Op::IndirectCall));
+    let seeded = if !has_calls {
+        HashMap::new()
+    } else {
+        let ctx0 = ctx.clone();
         let st0 = build_structurer(
-            &sc, &ir.insns, ctx0, deadline, &loop_of_block, eh_regions,
-            &region_of_block, &handler_of, true,
+            &sc,
+            &ir.insns,
+            ctx0,
+            deadline,
+            &loop_of_block,
+            eh_regions,
+            &region_of_block,
+            &handler_of,
+            true,
         );
         let _ = st0.emit_region(0, &HashSet::new(), &loops, &[], 0);
         // The discovery walk must cover the SAME blocks as the real one, or a
@@ -10816,19 +17650,127 @@ pub fn render_method_csharp_full_chains(
             seeded.len()
         );
     }
-    let ctx = MethodCtx::build(&ir.insns, &ir.table, declaring_tdi, parent_chain, ret_is_void);
-    *ctx.preseed_bindings.borrow_mut() = seeded;
-    if prof { eprintln!("[render] method_ctx {}us", t0.elapsed().as_micros()); }
-    let st = build_structurer(
-        &sc, &ir.insns, ctx, deadline, &loop_of_block, eh_regions,
-        &region_of_block, &handler_of, false,
-    );
-
-    CALLTRACE.with(|c| c.set(std::env::var("ILR_CALLTRACE").is_ok()));
+    super::tm_add(&super::timing::R_DISCOVERY, t_d);
+    *ctx.preseed_bindings.borrow_mut() = seeded.clone();
+    if prof {
+        eprintln!("[render] method_ctx {}us", t0.elapsed().as_micros());
+    }
     let t_e = std::time::Instant::now();
+    // WALKER ONLY. The structured emitter is gone as a production path: its
+    // measured value had collapsed to 22 methods with 1-3 fewer gotos (one
+    // method accounting for almost all of it, with a questionable body that
+    // lost its try), while undefined locals were IDENTICAL to the walker and
+    // it cost ~10% of the render. The address walker is the single emitter;
+    // `emit_region` renders the same original listing and the discovery walk
+    // above still supplies the call bindings.
+    let t_walk = std::time::Instant::now();
+    let st = build_structurer(
+        &sc,
+        &ir.insns,
+        ctx,
+        deadline,
+        &loop_of_block,
+        eh_regions,
+        &region_of_block,
+        &handler_of,
+        false,
+    );
+    super::reconstruct::set_trace_rva(ir.base_rva);
+    CALLTRACE.with(|c| c.set(crate::recovery::env_flags::flag("ILR_CALLTRACE")));
+    // PRIME THE LABEL SET WITH EVERY JUMP-TABLE TARGET, before the walk.
+    //
+    // The switch emitter forces labels over the arm-reachable region when it
+    // reaches the dispatch — too late for a target block the walk emitted
+    // EARLIER (a shared tail emitted before the switch, a loop header): that
+    // block was rendered without its label, the dispatch's `case v: goto Lx;`
+    // stubs then referenced a label that never existed, and the final sweep
+    // printed "target not emitted". Forcing the direct targets up front is the
+    // same rule applied at the only point where it can work. A label nothing
+    // references is dropped by `idioms::drop_unreferenced_labels` later.
+    //
+    // NOTE: forcing EVERY block with a predecessor was measured (R179) and is
+    // a no-op — those blocks are already `sc.labels` targets, so the label
+    // edge model is not what is missing. See HANDOFF: the remainder is
+    // duplicate emission (shared-tail copies), not label bookkeeping.
+    {
+        let mut forced = st.forced_labels.borrow_mut();
+        for insn in &ir.insns {
+            if let Op::Switch(ts) = &insn.op {
+                for &t in ts {
+                    if let Some(&tb) = sc.block_of.get(t) {
+                        if tb < sc.blocks.len() {
+                            forced.insert(tb);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let (mut body_stmts, _) = st.emit_region(0, &HashSet::new(), &loops, &[], 0);
+    // Did the walk recover ANY statement? The late sweeps legitimately empty a
+    // body whose only content was provably dead (`AppsFlyerStub.OpenSettings`,
+    // whose sole statement was a fabricated metadata-token allocation). For
+    // those, "body not recoverable" would be a false refusal: the body WAS
+    // recovered and it is empty.
+    let recovered_statements = !body_stmts.is_empty();
     CALLTRACE.with(|c| c.set(false));
-    if prof { eprintln!("[render] emit_region {}us nstmts={}", t_e.elapsed().as_micros(), body_stmts.len()); }
+    super::tm_add(&super::timing::R_WALK, t_walk);
+    // `ILR_TRACE`: per-stage label provenance for the late pipeline. Each
+    // wrapped call logs `[labdrop] rva stage label` when it removes a label a
+    // surviving goto still names, which is the exact origin of a final marker.
+    let trace_on = crate::recovery::env_flags::flag("ILR_TRACE");
+    let time_on = crate::recovery::env_flags::flag("ILR_TIMING");
+    macro_rules! trace_step {
+        ($name:literal, $e:expr) => {{
+            let before = if trace_on {
+                trace_defined_labels(&body_stmts)
+            } else {
+                HashSet::new()
+            };
+            let t = if time_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            $e;
+            if let Some(t) = t {
+                l3_add($name, t.elapsed().as_nanos() as u64);
+            }
+            if trace_on {
+                trace_label_drops(ir.base_rva, $name, &before, &body_stmts);
+            }
+        }};
+    }
+    macro_rules! trace_step_val {
+        ($name:literal, $e:expr) => {{
+            let before = if trace_on {
+                trace_defined_labels(&body_stmts)
+            } else {
+                HashSet::new()
+            };
+            let t = if time_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let v = $e;
+            if let Some(t) = t {
+                l3_add($name, t.elapsed().as_nanos() as u64);
+            }
+            if trace_on {
+                trace_label_drops(ir.base_rva, $name, &before, &body_stmts);
+            }
+            v
+        }};
+    }
+    let t_late = std::time::Instant::now();
+    if prof {
+        eprintln!(
+            "[render] emit_region {}us nstmts={}",
+            t_e.elapsed().as_micros(),
+            body_stmts.len()
+        );
+    }
     // `ILR_DEFDBG=1` (every method) or `=0xRVA` (one): for each version the IR
     // defines, what the renderer decided to do with that def, and why. Answers
     // the `def-dropped` class of the undefined-local attribution directly — a
@@ -10864,7 +17806,10 @@ pub fn render_method_csharp_full_chains(
                     if k > 0 {
                         d.push(',');
                     }
-                    d.push_str(&format!("{}:{:?}@{:#x}", i, ir.insns[i].op, ir.insns[i].address));
+                    d.push_str(&format!(
+                        "{}:{:?}@{:#x}",
+                        i, ir.insns[i].op, ir.insns[i].address
+                    ));
                 }
                 d.push(']');
                 // Use-site audit: what `inline_local_at` would do at each read.
@@ -10881,9 +17826,10 @@ pub fn render_method_csharp_full_chains(
                         None => none += 1,
                         Some(du) => {
                             let same_block_later = du > u
-                                && ctx.block_of_insn.as_ref().is_some_and(|m| {
-                                    m.get(du).copied() == m.get(u).copied()
-                                });
+                                && ctx
+                                    .block_of_insn
+                                    .as_ref()
+                                    .is_some_and(|m| m.get(du).copied() == m.get(u).copied());
                             if same_block_later {
                                 later += 1;
                             } else if ctx.def_moved_across_a_write(du, u) {
@@ -10898,9 +17844,12 @@ pub fn render_method_csharp_full_chains(
                         }
                     }
                 }
-                let alias = ir.table.index_of.get(&v).map(|_| {
-                    pure_alias_root(&ir.insns, &ctx.def_sites, v).is_some()
-                }).unwrap_or(false);
+                let alias = ir
+                    .table
+                    .index_of
+                    .get(&v)
+                    .map(|_| pure_alias_root(&ir.insns, &ctx.def_sites, v).is_some())
+                    .unwrap_or(false);
                 d.push_str(&format!(
                     " uses=[none={none} later={later} moved={moved} moved_call={moved_call} ok={ok} alias={alias}]"
                 ));
@@ -10914,7 +17863,10 @@ pub fn render_method_csharp_full_chains(
                 }
                 d.push('\n');
             }
-            let _ = std::fs::write(probe_dir().join(format!("defdbg.{:#x}.txt", ir.base_rva)), d);
+            let _ = std::fs::write(
+                probe_dir().join(format!("defdbg.{:#x}.txt", ir.base_rva)),
+                d,
+            );
         }
     }
     // STRUCTURER COVERAGE. Blocks the walk never entered are code the text does
@@ -10932,9 +17884,11 @@ pub fn render_method_csharp_full_chains(
     // `reachable` was computed at the top of this function (see
     // [`adjoined_blocks`]): it is the entry-reachable set PLUS the method's own
     // out-of-line cold region.
-    if std::env::var("ILR_COV").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_COV") {
         let visited = st.visited.borrow();
-        let unvis: Vec<usize> = (0..sc.blocks.len()).filter(|b| !visited.contains(b)).collect();
+        let unvis: Vec<usize> = (0..sc.blocks.len())
+            .filter(|b| !visited.contains(b))
+            .collect();
         if !unvis.is_empty() {
             // Three different things hide behind "unvisited", and the report must
             // not add them up as if they were one:
@@ -10948,7 +17902,10 @@ pub fn render_method_csharp_full_chains(
             //     cannot be proven and it is NOT adopted.
             let entry_reach = reachable_blocks_entry(&sc, &ir.insns);
             let skipped: Vec<usize> = unvis.iter().copied().filter(|&b| entry_reach[b]).collect();
-            let adopted_uv = unvis.iter().filter(|&&b| !entry_reach[b] && reachable[b]).count();
+            let adopted_uv = unvis
+                .iter()
+                .filter(|&&b| !entry_reach[b] && reachable[b])
+                .count();
             let n = skipped.len().min(10);
             let heads: Vec<String> = skipped[..n]
                 .iter()
@@ -10956,7 +17913,10 @@ pub fn render_method_csharp_full_chains(
                     let bb = &sc.blocks[b];
                     format!(
                         "B{b}(insn {} term {:?} t={:?} f={:?})",
-                        bb.start, self_op_name(&ir.insns[bb.end - 1].op), bb.succ_taken, bb.succ_fall
+                        bb.start,
+                        self_op_name(&ir.insns[bb.end - 1].op),
+                        bb.succ_taken,
+                        bb.succ_fall
                     )
                 })
                 .collect();
@@ -11045,6 +18005,60 @@ pub fn render_method_csharp_full_chains(
     // Loops are deliberately NOT re-structured here: the repair region is
     // reached only through those gotos, so rendering it FLAT keeps exactly one
     // copy of every block and cannot duplicate a loop body.
+    // GOTO TARGETS WHOSE BLOCK WAS NEVER EMITTED. A branch whose target edge
+    // was not recovered (indirect dispatch; an arm fenced by an
+    // already-rendered construct) leaves `goto L` in the text while block L is
+    // treated as unreachable and never walked — its code is silent (measured:
+    // UpdateMaterial @0x1982AB4 lost the whole diffuse-lit arm this way).
+    // Mark those target blocks reachable so the repair emits them with their
+    // labels and every jump resolves.
+    {
+        let mut defined: HashSet<String> = HashSet::new();
+        let mut targets: HashSet<String> = HashSet::new();
+        collect_label_refs(&body_stmts, &mut defined, &mut targets);
+        let mut forced = 0usize;
+        let missing: Vec<&String> = targets.difference(&defined).collect();
+        if !missing.is_empty() {
+            // A target block is not necessarily in `sc.labels`: when the edge
+            // itself was unrecovered (indirect dispatch) the emitter can still
+            // synthesize a jump to it, and its name is the auto `label_name`.
+            let mut name_to_block: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for b in 0..sc.blocks.len() {
+                name_to_block.entry(label_name(&sc, b)).or_insert(b);
+            }
+            if crate::recovery::env_flags::flag("ILR_COV") {
+                for label in &missing {
+                    let hit = (0..sc.blocks.len())
+                        .find(|&b| label_name(&sc, b) == label.as_str());
+                    eprintln!(
+                        "[cov] missing {label}: block={hit:?} in_sc_labels={:?} in_names={}",
+                        sc.labels.iter().find(|(_, n)| n.as_str() == label.as_str()).map(|(b, _)| *b),
+                        sc.label_names.contains(label.as_str())
+                    );
+                }
+            }
+            for label in &missing {
+                if let Some(&blk) = name_to_block.get(label.as_str()) {
+                    if blk < reachable.len() && !reachable[blk] {
+                        reachable[blk] = true;
+                        forced += 1;
+                    }
+                }
+            }
+        }
+        if crate::recovery::env_flags::flag("ILR_COV") {
+            eprintln!(
+                "[cov] {:#x}: defined={} gotos={} missing={:?} forced={} blocks={}",
+                ir.base_rva,
+                defined.len(),
+                targets.len(),
+                missing.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                forced,
+                sc.blocks.len()
+            );
+        }
+    }
     let (repaired, repaired_blocks) = st.coverage_repair(&reachable);
     if repaired_blocks > 0 {
         body_stmts.extend(repaired);
@@ -11055,20 +18069,57 @@ pub fn render_method_csharp_full_chains(
             .methods
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    // `ILR_DANGLE=1`: remember which labels the tree defined at this point, so
+    // the end-of-render census can tell "a later pass dropped this label" from
+    // "the target was never emitted at all".
+    let mut dangle_post_repair: HashSet<String> = HashSet::new();
+    if crate::recovery::env_flags::flag("ILR_DANGLE") {
+        let mut refs: HashSet<String> = HashSet::new();
+        collect_label_refs(&body_stmts, &mut dangle_post_repair, &mut refs);
+    }
 
     {
         // Post-repair coverage: what is STILL unwalked is exactly what no
         // recovered edge reaches. The headline the report quotes must describe
         // the text that was produced, not the text before the repair.
         let visited = st.visited.borrow();
-        let un = (0..sc.blocks.len()).filter(|b| !visited.contains(b)).count();
+        let un = (0..sc.blocks.len())
+            .filter(|b| !visited.contains(b))
+            .count();
         UNEMITTED_BLOCKS.with(|c| c.set(un));
         TOTAL_BLOCKS.with(|c| c.set(sc.blocks.len()));
-        if std::env::var("ILR_COV").is_ok() {
+        // The warning is about an UNRECOVERED INDIRECT DISPATCH: some `br xN`
+        // (or unresolved jump table) in the walked code leaves blocks no edge
+        // reaches. When the reachable blocks contain no such escape, the
+        // unwalked blocks cannot belong to this method at all — they are the
+        // next small functions that the metadata-derived body extent includes
+        // (`mov w0,#1; ret` neighbors). Warning about them stamped correct
+        // one-line methods ("return 1;") with "2 of 3 blocks unreachable".
+        let has_indirect_escape = (0..sc.blocks.len())
+            .filter(|b| visited.contains(b))
+            .any(|b| {
+                let end = sc.blocks[b].end;
+                end > 0
+                    && end <= ir.insns.len()
+                    && matches!(ir.insns[end - 1].op, Op::IndirectCall)
+            });
+        if un > 0 && has_indirect_escape {
+            body_stmts.insert(
+                0,
+                Stmt::Comment(format!(
+                    "WARNING: {} of {} blocks unreachable (indirect dispatch not recovered)",
+                    un,
+                    sc.blocks.len()
+                )),
+            );
+        }
+        if crate::recovery::env_flags::flag("ILR_COV") {
             // The post-repair number is the one that must be zero on the
             // reachable side: the `[cov]` line above reports what the walk
             // missed, this reports what the repair could not pick up.
-            let left = (0..sc.blocks.len()).filter(|b| !visited.contains(b)).count();
+            let left = (0..sc.blocks.len())
+                .filter(|b| !visited.contains(b))
+                .count();
             let reach_left = (0..sc.blocks.len())
                 .filter(|b| !visited.contains(b) && reachable[*b])
                 .count();
@@ -11081,24 +18132,121 @@ pub fn render_method_csharp_full_chains(
         }
     }
 
+    // ---- Read-without-writer repair ------------------------------------
+    //
+    // A call's statement can be produced into a region the structurer then
+    // DISCARDS (a speculative region walk, a bail, a folded alternative).
+    // 'bound_calls' keeps the binding, so the next visit of that site returns
+    // nothing ('call_already_emitted') and the name ends up read but never
+    // assigned -- 'ptr = v1339;' at 0x14975C0, where 0x1497df4 appears nowhere
+    // in the text. The value is gone but its readers are not.
+    //
+    // Expanding the call AT the read site is the one placement that cannot
+    // move it across a branch: the read is the place the value is used, so the
+    // callee runs exactly where its result is consumed. It costs a duplicate
+    // 'bl' in the text when the read is on more than one path; an undefined
+    // name costs the whole statement.
+    {
+        fn scan(list: &[Stmt], def: &mut HashSet<String>, rd: &mut HashSet<String>) {
+            fn vars(e: &Expr, out: &mut HashSet<String>) {
+                if let Expr::Var(n) = e {
+                    out.insert(n.clone());
+                }
+                for c in crate::recovery::reconstruct::il2cpp_cleanup::expr_children(e) {
+                    vars(c, out);
+                }
+            }
+            for s in list {
+                match s {
+                    Stmt::Assign(n, _, _) => {
+                        def.insert(n.clone());
+                    }
+                    Stmt::ForEach {
+                        var_name,
+                        collection,
+                        ..
+                    } => {
+                        def.insert(var_name.clone());
+                        rd.insert(collection.clone());
+                    }
+                    _ => {}
+                }
+                let mut names = HashSet::new();
+                crate::recovery::reconstruct::il2cpp_cleanup::for_each_own_expr(s, &mut |e| {
+                    vars(e, &mut names)
+                });
+                rd.extend(names);
+                if let Stmt::Using { decl, .. } = s {
+                    scan(std::slice::from_ref(decl.as_ref()), def, rd);
+                }
+                let mut kids: Vec<&Vec<Stmt>> = Vec::new();
+                crate::recovery::reconstruct::children(s, &mut kids);
+                for k in kids {
+                    scan(k, def, rd);
+                }
+            }
+        }
+        let mut defined: HashSet<String> = HashSet::new();
+        let mut read: HashSet<String> = HashSet::new();
+        scan(&body_stmts, &mut defined, &mut read);
+        let mut missing: Vec<(usize, String)> = st
+            .ctx
+            .bound_calls
+            .borrow()
+            .iter()
+            .filter(|(_, n)| read.contains(*n) && !defined.contains(*n))
+            .map(|(i, n)| (*i, n.clone()))
+            .collect();
+        missing.sort();
+        for (insn, name) in missing {
+            let expr = st.ctx.call_value_expr(insn, 0);
+            let done = crate::recovery::reconstruct::il2cpp_cleanup::substitute_var_in_list(
+                &mut body_stmts,
+                &name,
+                &expr,
+                None,
+            );
+            if done {
+                CALL_REPAIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if crate::recovery::env_flags::flag("ILR_UNDEFDBG") {
+                    eprintln!(
+                        "[undef] {name}: no writer; call @{:#x} expanded at its read site",
+                        st.insns[insn].address
+                    );
+                }
+            }
+        }
+    }
+
     let t_rw = std::time::Instant::now();
     // AST rewriting + cleanup passes (order matters)
     rewrites::apply(&mut body_stmts);
-    if std::env::var("ILR_STMTS").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
         let mut r2 = Renderer::new();
-        for s in &body_stmts { r2.stmt(s); }
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
         let _ = std::fs::write(probe_dir().join("after_rewrites.txt"), r2.out.clone());
     }
     // Pattern catalog: data-driven C#-construct bindings (see docs). Runs
     // after sugar rewrites, before structural cleanup — a failed match
     // leaves the lower-level sequence untouched.
     catalog::apply(&mut body_stmts);
-    if std::env::var("ILR_STMTS").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
         let mut r2 = Renderer::new();
-        for s in &body_stmts { r2.stmt(s); }
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
         let _ = std::fs::write(probe_dir().join("after_catalog.txt"), r2.out.clone());
     }
     cleanup::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
+        let mut r2 = Renderer::new();
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
+        let _ = std::fs::write(probe_dir().join("after_cleanup1.txt"), r2.out.clone());
+    }
     // STATEMENT-TREE IDIOMS: dead-end blocks / dead code, then structure-field
     // propagation. These reason about C# SHAPES rather than the CFG, so they run
     // last, after every structural pass has settled — see `idioms` module docs
@@ -11112,19 +18260,208 @@ pub fn render_method_csharp_full_chains(
     // works on statement trees and the call SITE's address lives only in the IR,
     // so a per-target count taken on both sides is what ties the two together.
     let cci_before = super::idioms::count_class_init_guards(&body_stmts);
+    super::reconstruct::set_trace_rva(ir.base_rva);
     super::idioms::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
+        let mut r2 = Renderer::new();
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
+        let _ = std::fs::write(probe_dir().join("after_idioms.txt"), r2.out.clone());
+    }
+    // LAMBDA BODY PRODUCTION (Phase 5A): if this method is a compiler-generated
+    // lambda, extract its body and register it in the global map so that other
+    // methods' delegate constructions can be folded by closures.rs.
+    if is_lambda_method(method_name) {
+        if let Some(body_expr) = extract_lambda_body(&body_stmts) {
+            let param_names: Vec<String> = param_sigs.iter().map(|(_, n)| n.clone()).collect();
+            register_lambda_body(method_name.to_string(), param_names, body_expr);
+        }
+    }
+    // Inject synthetic lambda bindings for any delegate constructions in this
+    // method's statement tree that reference registered lambda methods.
+    inject_lambda_bodies(&mut body_stmts);
     // HIGH-LEVEL CONSTRUCT RECONSTRUCTION: rebuild source-level shapes the
     // structurer could only emit flat (`for`, `using`/`lock`, lambdas, iterator
     // state machines, array initializers). Runs after `idioms` has removed the
     // machine noise, so the recognizers see the cleanest tree; a failed match is
     // a no-op that leaves the correct lower-level sequence in place.
+    super::reconstruct::set_trace_rva(ir.base_rva);
     super::reconstruct::apply(&mut body_stmts);
-    if std::env::var("ILR_STMTS").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
         let mut r2 = Renderer::new();
-        for s in &body_stmts { r2.stmt(s); }
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
+        let _ = std::fs::write(probe_dir().join("after_reconstruct.txt"), r2.out.clone());
+    }
+    dangle_checkpoint(&body_stmts, &dangle_post_repair, 0);
+    super::tm_add(&super::timing::R_L1, t_late);
+    let t_l2 = std::time::Instant::now();
+    // HEURISTIC TYPE INFERENCE: guess types from usage patterns (method calls,
+    // field accesses) when metadata-based propagation could not determine them.
+    // Runs after reconstruct so the statement tree is clean; the inferred types
+    // flow into build_local_tdi_map below and then into field_annotation.
+    let mut local_types = build_local_tdi_map(&ir.table, &body_stmts);
+    // Display-name → ManagedType for ALL typed locals/parameters (the tdi
+    // map above only carries classes). `stack_naming` reads this to type a
+    // frame cell from a spilled primitive RHS.
+    let local_mty = build_local_managed_map(&ir.table);
+    // STATEMENT-BASED TYPE INFERENCE: propagate types through assignments.
+    // If v1 = this.playerStats, then v1 gets the field's type. If v2 = GetPlayer(),
+    // then v2 gets GetPlayer's return type. Iterates to fixpoint for chains.
+    let stmt_inferred_count = super::reconstruct::field_annotation::infer_types_from_stmts(
+        &body_stmts, resolve_maps, &mut local_types,
+    );
+    if stmt_inferred_count > 0 && crate::recovery::env_flags::flag("ILR_RECON") {
+        eprintln!("[recon] statement_type_inference: {stmt_inferred_count} type(s) inferred from assignments");
+    }
+    let heuristic_inferred = super::heuristic_types::infer_types_with_index(
+        &body_stmts, heuristic_index, &local_types,
+    );
+    if !heuristic_inferred.is_empty() {
+        super::heuristic_types::merge_inferred_types(
+            &mut local_types,
+            &heuristic_inferred,
+            heuristic_index.object_tdi(),
+        );
+    }
+    // IR TYPE PROPAGATION: the SSA fixpoint proves types for copies, equal-only
+    // merges, field loads and store→load cells. Merge it into the name-keyed
+    // map (table-proved types win) so field_annotation can name more RawDerefs.
+    let ir_types = super::reconstruct::field_annotation::infer_ir_type_map(&ir, resolve_maps);
+    if crate::recovery::env_flags::flag("ILR_IRTYPE") {
+        eprintln!("[irtype] {} local(s) typed from the IR fixpoint", ir_types.len());
+    }
+    for (name, tdi) in ir_types {
+        local_types.entry(name).or_insert(tdi);
+    }
+    // Per-version split names whose versions share one proven tdi: exact
+    // types the name-level maps dropped because the ORIGINAL name was shared
+    // by versions of different types.
+    for (name, tdi) in &split_name_tdis {
+        local_types.entry(name.clone()).or_insert(*tdi);
+    }
+    // Metadata-aware reconstruction passes (vtable dispatch resolution,
+    // string literal restoration, post-hoc field annotation). These need
+    // ResolveMaps from the resolve phase and run after the standard
+    // reconstruct passes have cleaned up the machine noise.
+    //
+    // The local_types map now includes heuristic inferences, so the field
+    // annotation pass can resolve more RawDeref patterns to named fields.
+    let trace_maps_before = if trace_on {
+        trace_defined_labels(&body_stmts)
+    } else {
+        HashSet::new()
+    };
+    let maps_rewrites = super::reconstruct::apply_with_maps_and_types_and_tdi(
+        &mut body_stmts, resolve_maps, &local_types, declaring_tdi, Some(generic_map),
+    );
+    if trace_on {
+        trace_label_drops(ir.base_rva, "maps", &trace_maps_before, &body_stmts);
+    }
+    if maps_rewrites > 0 {
+        static MAPS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        MAPS_TOTAL.fetch_add(maps_rewrites as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    // POINTER OFFSETS: the same question as field_annotation, asked with the
+    // MANAGED type instead of the TypeDef index. Arrays, strings and generic
+    // instances have no TypeDef, so the tdi map cannot see them at all; this
+    // pass names the string length slot, array elements and generic-definition
+    // fields. Diagnostic census: ILR_POCENSUS=1.
+    {
+        // A ref/out/in PARAMETER already denotes the referenced value in C#, so
+        // a pointer-width load at offset 0 of one is the parameter itself. The
+        // set comes from the signature, which is the only place the modifier is
+        // still visible — the IR has already lowered it to a byref local.
+        let ref_params: HashSet<String> = param_sigs
+            .iter()
+            .filter(|(t, _)| {
+                let t = t.trim_start();
+                t.starts_with("ref ") || t.starts_with("out ") || t.starts_with("in ")
+            })
+            .map(|(_, n)| n.clone())
+            .collect();
+        let po_ctx = super::reconstruct::pointer_offsets::Ctx {
+            maps: resolve_maps,
+            local_types: &local_types,
+            local_mty: &local_mty,
+            ref_params: &ref_params,
+        };
+        let po = super::reconstruct::pointer_offsets::rewrite_stmts(&mut body_stmts, &po_ctx);
+        if po.total() > 0 && crate::recovery::env_flags::flag("ILR_POCOUNT") {
+            eprintln!(
+                "[po-count] {:#x} total={} refparam={} strlen={} arrlen={} arrelem={} list={}",
+                ir.base_rva,
+                po.total(),
+                po.ref_param,
+                po.str_len,
+                po.arr_len,
+                po.arr_elem,
+                po.list
+            );
+        }
+        // Diagnostic ceiling measurement over what survived (ILR_POCENSUS=1).
+        super::reconstruct::pointer_offsets::census_stmts(&mut body_stmts, &po_ctx, ir.base_rva);
+    }
+    // ALLOCATION TYPES: shared-generic metadata names a `new` with the generic
+    // definition and `object` arguments (`Dictionary<int, object>`), and a
+    // folded default ctor can leave `new Object()` for a typed local. Retype
+    // from the destination field's declared instantiation / the local's class.
+    let alloc_fixes = super::reconstruct::alloc_types::apply(
+        &mut body_stmts,
+        resolve_maps,
+        &local_types,
+        declaring_tdi,
+    );
+    if crate::recovery::env_flags::flag("ILR_ALLOCDBG") && alloc_fixes > 0 {
+        eprintln!("[alloc] retyped {alloc_fixes} allocation(s)");
+    }
+    // NAMED FIELD STORES: a raw target `*(T*)(typedLocal +off)` is
+    // `typedLocal.Field` once the base's class and the offset's layout are
+    // known (the structurer has no field map, so these targets are strings).
+    let store_fixes = super::reconstruct::store_sugar::apply(
+        &mut body_stmts,
+        resolve_maps,
+        &local_types,
+        declaring_tdi,
+    );
+    if crate::recovery::env_flags::flag("ILR_STOREDBG") && store_fixes > 0 {
+        eprintln!("[store] named {store_fixes} field store(s)");
+    }
+    // THIS ALIASES: `mov x27, x0` keeps the receiver in a callee-saved
+    // register; an `in_xNN` local typed as the declaring type (and with no
+    // same-type parameter in scope) is `this`.
+    let this_param_names: std::collections::HashSet<String> =
+        param_sigs.iter().map(|(_, n)| n.clone()).collect();
+    let this_fixes = super::reconstruct::this_sugar::apply(
+        &mut body_stmts,
+        resolve_maps,
+        &local_types,
+        declaring_tdi,
+        &this_param_names,
+    );
+    if crate::recovery::env_flags::flag("ILR_THISDBG") && this_fixes > 0 {
+        eprintln!("[this] rewrote {this_fixes} receiver(s)");
+    }
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
+        let mut r2 = Renderer::new();
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
+        let _ = std::fs::write(probe_dir().join("after_maps.txt"), r2.out.clone());
+    }
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
+        let mut r2 = Renderer::new();
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
         let _ = std::fs::write(probe_dir().join("after_clean2.txt"), r2.out.clone());
     }
-    drop_unreachable_gotos(&mut body_stmts);
+    trace_step!("drop1", drop_unreachable_gotos(&mut body_stmts));
+    dangle_checkpoint(&body_stmts, &dangle_post_repair, 1);
+    super::tm_add(&super::timing::R_L2, t_l2);
+    let t_l3 = std::time::Instant::now();
     // Second loop-exit rewrite, and the one that fires: the sweep above removed
     // the stale dangling `goto` that usually sat between a loop and the label
     // it falls out to (see `idioms::collapse_goto_to_loop_break`).
@@ -11133,33 +18470,91 @@ pub fn render_method_csharp_full_chains(
     // deletes them (the terminator that precedes them is now the last statement
     // of the structured body). The converted `break` leaving a dead tail is the
     // rarer cost, and the tail is still rendered.
-    super::idioms::collapse_goto_to_loop_break(&mut body_stmts);
-    if std::env::var("ILR_STMTS").is_ok() {
+    trace_step!("gotoloop1", super::idioms::collapse_goto_to_loop_break(&mut body_stmts));
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
         let mut r2 = Renderer::new();
-        for s in &body_stmts { r2.stmt(s); }
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
         let _ = std::fs::write(probe_dir().join("after_dug.txt"), r2.out.clone());
     }
-    sanitize_stmts(&mut body_stmts);
-    branch_repair(&mut body_stmts);
+    trace_step!("sanitize1", sanitize_stmts(&mut body_stmts));
+    trace_step!("branch_repair", branch_repair(&mut body_stmts));
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
+        let mut r2 = Renderer::new();
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
+        let _ = std::fs::write(
+            probe_dir().join("after_branch_repair_pre_strip.txt"),
+            r2.out.clone(),
+        );
+    }
+    // `branch_repair` folds branch-over-join diamonds into fresh if/else
+    // shells, including the runtime's null-raise guards whose raise arm
+    // `raise_to_throw` already materialized as a `throw new
+    // NullReferenceException(…)`. The last full cleanup round ran before this,
+    // so without this call those guards are never recognized as injected noise
+    // and survive into the text.
+    trace_step!("nullguards", super::reconstruct::il2cpp_cleanup::strip_null_guards(&mut body_stmts));
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
+        let mut r2 = Renderer::new();
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
+        let _ = std::fs::write(
+            probe_dir().join("after_branch_repair.txt"),
+            r2.out.clone(),
+        );
+    }
     // Fold guards an enclosing guard has already decided (`if (v != 0) { …
     // if (v == 0) … }` — IL2CPP's redundant managed null-check mirrored onto
     // a path where it is constant). Runs before the sanitize so the removal
     // markers it leaves are swept with every other marker.
-    fold_decided_guards(&mut body_stmts);
+    trace_step!("decided", fold_decided_guards(&mut body_stmts));
     // Second sanitize: branch_repair's inversions expose new empty else-
     // shells (payload arm moved to then); sweep them with the same rules.
-    sanitize_stmts(&mut body_stmts);
+    trace_step!("sanitize2", sanitize_stmts(&mut body_stmts));
     // Flatten `if (c) { if (¬c) { X } }` guard artifacts (see module docs).
-    fold_impossible_guards(&mut body_stmts);
-    // Event add/remove accessors: CAS-retry loop → single field store.
-    collapse_event_cas_accessors(&mut body_stmts, method_name);
+    trace_step!("impossible", fold_impossible_guards(&mut body_stmts));
+    // Event add/remove accessors: generated CAS-retry loop → `+=` / `-=`.
+    trace_step!("evecas", collapse_event_cas_accessors(&mut body_stmts, method_name));
     // Final dangling-goto sweep: the passes above (label stripping, guard
     // folding, CAS collapse, empty-shell removal) can orphan gotos whose
     // labels were never rendered — arm/handler exit edges to blocks the
     // walker emitted earlier without a label. Removing them leaves valid
     // fall-through pseudo-C#; keeping them emits `goto L<missing>`.
-    drop_unreachable_gotos(&mut body_stmts);
-    super::idioms::collapse_goto_to_loop_break(&mut body_stmts);
+    dangle_checkpoint(&body_stmts, &dangle_post_repair, 3);
+    if crate::recovery::env_flags::flag("ILR_DANGLE") {
+        let rendered = st.rendered.borrow();
+        let (n, has_sw, c) = dangle_census(
+            &body_stmts,
+            &dangle_post_repair,
+            &sc,
+            &ir.insns,
+            &reachable,
+            &rendered,
+        );
+        drop(rendered);
+        if n > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            DANGLE.gotos.fetch_add(n, Relaxed);
+            DANGLE.methods.fetch_add(1, Relaxed);
+            if has_sw {
+                DANGLE.methods_with_switch.fetch_add(1, Relaxed);
+            }
+            DANGLE.in_case.fetch_add(c[1], Relaxed);
+            DANGLE.in_switch_other.fetch_add(c[2], Relaxed);
+            DANGLE.was_labeled.fetch_add(c[3], Relaxed);
+            DANGLE.blk_unreachable.fetch_add(c[4], Relaxed);
+            DANGLE.blk_not_rendered.fetch_add(c[5], Relaxed);
+            DANGLE.blk_rendered.fetch_add(c[6], Relaxed);
+            DANGLE.label_unresolved.fetch_add(c[7], Relaxed);
+            DANGLE.blk_switch_target.fetch_add(c[8], Relaxed);
+        }
+    }
+    trace_step!("drop_final", drop_unreachable_gotos(&mut body_stmts));
+    trace_step!("gotoloop2", super::idioms::collapse_goto_to_loop_break(&mut body_stmts));
     // MASKED-ASSEMBLY FOLD, second (and effective) call site. The static-init
     // guard reaches `idioms::apply` in the FLAT-GUARD lowering
     // (`if (guard != 0) goto L0; <classinit>; <guard> = 1; L0:`), which the
@@ -11170,7 +18565,528 @@ pub fn render_method_csharp_full_chains(
     // wherever the guard is still flat, this one catches the rest.
     let mut cci_erased = cci_before;
     cci_erased.merge(&super::idioms::count_class_init_guards(&body_stmts));
-    super::idioms::collapse_class_init_guards(&mut body_stmts);
+    trace_step!("cci", super::idioms::collapse_class_init_guards(&mut body_stmts));
+    // Final null-raise sweep: `fold_decided_guards`, the second sanitize and
+    // the goto/loop repairs above all reshape branches, and any of them can
+    // materialize a fresh `if (x == 0) { throw new NullReferenceException }`
+    // arm that no cleanup round has seen. This is the last AST mutation point,
+    // so the injected guards get one chance to be recognized here. The rest of
+    // the cleanup round also re-inlines the temps whose only reads were in the
+    // guard conditions / folded arms just removed.
+    // EXPERIMENT GATE (ILR_NOCLEAN2): this direct cleanup exists for the
+    // guard shapes `branch_repair` creates. If a full-corpus A/B shows the
+    // text is identical without it, the call is pure cost; keep the gate
+    // until that is proven.
+    if !crate::recovery::env_flags::flag("ILR_NOCLEAN2") {
+        let n2 = trace_step_val!("clean2", super::reconstruct::il2cpp_cleanup::apply_tagged(&mut body_stmts, 1));
+        if crate::recovery::env_flags::flag("ILR_CLEAN2DBG") {
+            eprintln!("[clean2] {:#x}: {n2} rewrite(s)", ir.base_rva);
+        }
+    }
+    // A resolved metadata-usage TYPE slot is rendered as its klass accessor
+    // (`T.klass(T)`). At a static-field receiver the surrounding patterns have
+    // already consumed it; at a VALUE position nothing did, so normalize what
+    // is left before the helper folds read it (`IL2CPP_Box(int.klass(int), …)`
+    // must become `IL2CPP_Box(typeof(int), …)` and fold to `(object)value`).
+    trace_step!("normklass", super::reconstruct::il2cpp_cleanup::normalize_klass_accessors(&mut body_stmts));
+    // COPY PROPAGATION: `t = s` chains left by SSA destruction / merges. The
+    // IR-level alias proof refuses a source with several definitions (a phi
+    // destination materializes one copy per predecessor edge); here the
+    // reaching-copy analysis works on the reconstructed statements and drops
+    // the copies whose destinations nobody reads. This is the largest source
+    // of the remaining vN names (55% of unrenamed refs in the top methods).
+    let copy_folds = trace_step_val!("copy_prop", super::reconstruct::copy_prop::apply(&mut body_stmts));
+    if crate::recovery::env_flags::flag("ILR_RECON") && copy_folds > 0 {
+        eprintln!("[recon] copy_prop: {copy_folds} rewrite(s)");
+    }
+    // DEAD LOCAL STORES: a `t = <value-pure>` that the next definition of `t`
+    // overwrites before anything reads it (the SSA-destruction "clear" stores
+    // and the per-iteration re-initialisations of a merged slot).
+    let dead_stores = trace_step_val!("dead_store", super::reconstruct::dead_store::apply(&mut body_stmts));
+    if dead_stores > 0 && crate::recovery::env_flags::flag("ILR_RECON") {
+        eprintln!("[recon] dead_store: {dead_stores} store(s) removed");
+    }
+    // Redundant-guard dedup runs after all branch folding: it removes the
+    // repeated same-polarity null tests and same-value preheader copies that
+    // `branch_repair` materializes from IL2CPP's per-dereference checks.
+    trace_step!("guard_dedup", super::reconstruct::guard_dedup::apply(&mut body_stmts));
+    // Final raise handling: the synthesized null-check throws that survived
+    // guard stripping are IL2CPP raise noise except where an `if` arm tests a
+    // call result (a real managed error check). Drop the rest, along with the
+    // unreachable tail the noreturn raise guarded. This must run BEFORE the
+    // late goto round: a raise left at the tail of an arm is an executable
+    // statement that hides the real fall-through label from the fold.
+    trace_step!("finalraise", super::reconstruct::il2cpp_cleanup::finalize_raise_throws(&mut body_stmts));
+    // IL2CPP metadata/generic-context lazy-init guards (`if (!initialized)` /
+    // `if (slot == 0) { init; slot = reload; }`) are runtime plumbing with no
+    // managed counterpart. Strip them before the late goto round so the tails
+    // they hide become visible.
+    trace_step!("metainit", super::reconstruct::il2cpp_cleanup::strip_metadata_init_guards(&mut body_stmts));
+    // LATE GOTO STRUCTURING. `reconstruct::PASSES` folded goto shapes as they
+    // existed mid-pipeline; `branch_repair`, the sanitizer and
+    // `collapse_goto_to_loop_break` then reshape branches again (a
+    // `goto L` nested in an `else` is exactly what the loop-exit conversion
+    // above leaves behind). Run the fold + hoist + guard inversion once more
+    // on the settled tree: fold what is foldable, hoist merge tails out of
+    // arms, invert guard jumps over terminating blocks, then fold the
+    // fall-throughs this created. All three are idempotent.
+    // SINGLE-REFERENCE TAIL BLOCKS: a branch arm that jumps to one shared
+    // block which then jumps back to the join (`else goto L2; … L2: v=0;
+    // goto L3;`). Moving the block into its only-referencing arm removes the
+    // labels and the jumps; C# cannot enter a block from outside.
+    let tail_blocks = trace_step_val!("tail_inline", super::reconstruct::tail_block_inline::apply(&mut body_stmts));
+    if crate::recovery::env_flags::flag("ILR_TAILDBG") && tail_blocks > 0 {
+        eprintln!("[tailblock] inlined {tail_blocks} single-reference tail block(s)");
+    }
+    trace_step!("goto_fold1", super::reconstruct::goto_fold::apply(&mut body_stmts));
+    trace_step!("join_hoist", super::reconstruct::join_hoist::apply(&mut body_stmts));
+    trace_step!("goto_fold2", super::reconstruct::goto_fold::apply(&mut body_stmts));
+    // `for_loop` runs before `remove_continues`/`goto_fold` in PASSES, so a
+    // latch that still spells `if (…) { continue; } else { goto L; }` is
+    // refused ("unsafe tail after the update") even though the later folds
+    // turn that tail into Break/Break. Re-run it once on the settled tree;
+    // already-folded `for`s are untouched, and this is the same recognizer
+    // with the same guards.
+    let late_for_loops = trace_step_val!("for_loop_late", super::reconstruct::for_loop::apply(&mut body_stmts));
+    if late_for_loops > 0 && crate::recovery::env_flags::flag("ILR_RECON") {
+        eprintln!("[recon] for_loop (late): {late_for_loops} rewrite(s)");
+    }
+    // `goto_fold` spells a back-edge as `continue`, so the trailing
+    // `if (COND) continue;` inside a loop whose own test is COND only appears
+    // after `remove_continues` has already run in PASSES. It re-tests exactly
+    // what the loop is about to test, so sweep it on the settled tree.
+    let late_continues = trace_step_val!("remove_continues", super::reconstruct::remove_continues::apply(&mut body_stmts));
+    if late_continues > 0 && crate::recovery::env_flags::flag("ILR_RECON") {
+        eprintln!("[recon] remove_continues (late): {late_continues} rewrite(s)");
+    }
+    // The last fold can orphan the label of a jump it deleted.
+    super::reconstruct::join_hoist::drop_unreferenced_labels(&mut body_stmts);
+    // Postpasses can turn a branch into a terminator (for example a goto into
+    // `break`) or append coverage-repair regions after the method's normal
+    // return. Prune only statements after terminators, with labels acting as
+    // entry barriers, so dead repair tails disappear while every labelled
+    // recovery region remains available to its incoming edges.
+    super::idioms::prune_dead_code(&mut body_stmts);
+    dangle_checkpoint(&body_stmts, &dangle_post_repair, 2);
+    super::tm_add(&super::timing::R_L3, t_l3);
+    let t_l4 = std::time::Instant::now();
+    // GUARD CLAUSES: `if (C) { return; } else { BODY }` -> `if (C) return; BODY`.
+    // The else arm of a terminated then-arm IS the continuation; keeping it
+    // inside the `else` costs a nesting level on every early exit.
+    let inverted = trace_step_val!("guard_invert", super::reconstruct::guard_invert::apply(&mut body_stmts));
+    if inverted > 0 && crate::recovery::env_flags::flag("ILR_RECON") {
+        eprintln!("[recon] guard_invert: {inverted} guard(s) inverted");
+    }
+    // NESTED GUARDS: `if (A) { if (B) { BODY } }` -> `if (A && B) { BODY }`.
+    // IL2CPP tests every reference it dereferences, and `branch_repair` turns
+    // each test into a block, so the inner test ends up as the outer block's
+    // only statement. Runs after the last goto round (which materializes fresh
+    // guards) and before naming/declaration, so the reduced nesting is what
+    // `declare_locals` sees.
+    let merged_guards = trace_step_val!("merge_guards", super::reconstruct::merge_guards::apply(&mut body_stmts));
+    // NEW-RESULT NULL GUARDS + OBJECT INITIALIZERS. `branch_repair`/the
+    // allocator path leave `x = new T(); if (x == null) return; x.A = …;`
+    // shapes; the guard sits between the allocation and its initializer
+    // assignments, so the earlier `object_init` round could not fold them.
+    // Strip the (dead) guard, then re-run the initializer fold on the result.
+    {
+        let t = time_on.then(std::time::Instant::now);
+        let cut = strip_new_result_guards(&mut body_stmts);
+        let folded = super::reconstruct::object_init::apply(&mut body_stmts);
+        if (cut > 0 || folded > 0) && crate::recovery::env_flags::flag("ILR_RECON") {
+            eprintln!("[recon] objinit: {cut} guard(s) cut, {folded} initializer(s) folded");
+        }
+        if let Some(t) = t {
+            l3_add("objinit", t.elapsed().as_nanos() as u64);
+        }
+    }
+    if merged_guards > 0 && crate::recovery::env_flags::flag("ILR_RECON") {
+        eprintln!("[recon] merge_guards: {merged_guards} guard(s) merged");
+    }
+    // NAME THE REMAINING SLOT LOCALS. SSA versions are keyed by machine slot
+    // and non-parameter locals render as `vN` (a table index). This pass
+    // studies each local's definitions (field load, getter call, static field,
+    // induction) and renames when the provenance is unambiguous; the metadata
+    // type map is the fallback (`ListBox` → `listBox`). Pure renaming: values
+    // and control flow are untouched.
+    let naming_types: std::collections::HashMap<String, String> = local_types
+        .iter()
+        .filter_map(|(n, tdi)| {
+            resolve_maps
+                .tdi_names
+                .get(tdi)
+                .map(|(_, name)| (n.clone(), name.clone()))
+        })
+        .collect();
+    if crate::recovery::env_flags::flag("ILR_ASTDBG") {
+        let _ = std::fs::write(
+            probe_dir().join(format!("ast_debug.{:#x}.txt", ir.base_rva)),
+            format!("{:#?}", body_stmts),
+        );
+    }
+    let mut local_renames: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // `ILR_RAWDBG=1`: root-cause census BEFORE naming renames locals, so the
+    // display names still match `local_types`.
+    if crate::recovery::env_flags::flag("ILR_RAWDBG") {
+        super::reconstruct::field_annotation::raw_census(
+            &body_stmts,
+            ir.base_rva,
+            resolve_maps,
+            &local_types,
+        );
+    }
+    super::reconstruct::local_naming::apply_with_rva_map(
+        &mut body_stmts,
+        &naming_types,
+        ir.base_rva,
+        &ir.table,
+        &mut local_renames,
+    );
+    // OBJ PROVENANCE CENSUS (ILR_OBJCENSUS=path): for each local local_naming
+    // finally called `objN`, record where its versions come from at the IR
+    // level — slot origin, definition kinds and read contexts. This is the
+    // study that decides what the objN majority actually IS; it is not a
+    // naming heuristic.
+    if let Ok(path) = std::env::var("ILR_OBJCENSUS") {
+        let obj_lis: HashSet<usize> = local_renames
+            .iter()
+            .filter(|(_, v)| {
+                v.strip_prefix("obj")
+                    .is_some_and(|r| r.is_empty() || r.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .filter_map(|(k, _)| k.strip_prefix('v')?.parse::<usize>().ok())
+            .collect();
+        if !obj_lis.is_empty() {
+            let text = obj_census_text(&st.ctx, ir.base_rva, &obj_lis);
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(text.as_bytes());
+            }
+        }
+    }
+    // NAME -> C# TYPE, rekeyed through the renames just applied. `local_mty`
+    // is keyed by the recovered `vN` names, which `local_naming` replaces;
+    // without the rekey the metadata type of every renamed local was lost and
+    // `declare_locals` had nothing to declare it with.
+    let local_type_text: std::collections::HashMap<String, String> = local_mty
+        .iter()
+        .filter_map(|(n, t)| {
+            let n = local_renames.get(n).unwrap_or(n);
+            csharp_type(t).map(|s| (n.clone(), s))
+        })
+        .collect();
+    // ARRAY ALLOCATION HELPERS, BEFORE THE ARRAY PASSES. The full helper fold
+    // runs at the end of reconstruction, so `IL2CPP_ArrayNew(typeof(T[]), n)`
+    // reached the array passes as a raw call with no element type. With the
+    // metadata-usage slot resolved, the call now has its `typeof(T[])` token;
+    // folding it here seeds `new T[n]` for `array_init` and element sugar.
+    let _alloc_folds =
+        super::reconstruct::expr_cleanup::fold_allocation_helpers(&mut body_stmts);
+    // ARRAY INITIALIZERS, SECOND CHANCE. The early `array_init` pass runs
+    // before cleanup inlines the copy between the allocation temp and the
+    // local whose elements are filled:
+    //   v1 = IL2CPP_ArrayNew(type, 5); array = v1;
+    //   *(nint*)(array +32) = …;
+    // By the settled tree both statements name `array`, so the raw element
+    // stores can fold into one `ArrayInit` (0x160A6A0 has three 5-element
+    // initializers). The pass is idempotent.
+    let late_arrays = super::reconstruct::array_init::apply(&mut body_stmts);
+    if late_arrays > 0 && crate::recovery::env_flags::flag("ILR_RECON") {
+        eprintln!("[recon] array_init (late): {late_arrays} rewrite(s)");
+    }
+    // Remaining raw element stores are `*(nint*)(arr + idx*8 +32)` for an
+    // array local whose element type is known (declared `T[]`, `new T[n]`,
+    // or a folded initializer); rewrite them to `arr[idx]`. Metadata sizes
+    // let this cover named class/struct element types, not just primitives.
+    let array_elems = if crate::recovery::env_flags::flag("ILR_NOARR") {
+        0
+    } else {
+        super::reconstruct::array_element_sugar::apply_with_sizes_and_maps(
+            &mut body_stmts,
+            &resolve_maps.named_type_sizes,
+            resolve_maps,
+        )
+    };
+    if array_elems > 0 && crate::recovery::env_flags::flag("ILR_RECON") {
+        eprintln!("[recon] array_element_sugar: {array_elems} rewrite(s)");
+    }
+    // NULL/BOOL COMPARISON NORMALIZATION: IL2CPP lowers every reference and
+    // boolean test to `== 0` / `!= 0`. With usage evidence (receiver / deref
+    // base / boolean-producing defs) render `!= null`, a bare bool, or `!bool`.
+    super::reconstruct::compare_sugar::apply(&mut body_stmts);
+    // ARRAY-ELEMENT ADDRESSES. A value-type instance method receives its
+    // element BY REFERENCE, so after algebraic simplification a call receiver
+    // (or a load) is the raw address `(contents + (i << 2)) + 32`. Rewrite it
+    // to `contents[i]` — the address is never a C# value.
+    super::reconstruct::layout_sugar::apply(&mut body_stmts);
+    // FRAME-SPILL CLEANUP: a `*(T*)(&stack_N + k) = v` store whose cell is
+    // never read (no RawDeref of that key, no whole-cell value, no address
+    // escape) cannot be observed by managed code; the source never had it.
+    // Side-effecting RHS stays as an Eval. Runs after the structural folds so
+    // it sees the final set of stack accesses and before stack naming.
+    let spill_stores = super::reconstruct::stack_forward::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_STACKFWD") && spill_stores > 0 {
+        eprintln!("[stackfwd] removed {spill_stores} unobservable spill store(s)");
+    }
+    // FINAL ALGEBRA: `layout_sugar` created the array indexes and
+    // `stack_forward` substituted spilled values AFTER the last algebraic
+    // round, so the dominant `stack[i] + (stack[i] << 1)` stride shape never
+    // reached the `x + (x<<k) → x*(2^k+1)` rule. Fold once more on the settled
+    // tree (idempotent; the pass iterates to a fixpoint internally).
+    let alg_late = super::reconstruct::algebraic_simplify::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_RECON") && alg_late > 0 {
+        eprintln!("[alg-late] folded {alg_late} expression(s)");
+    }
+    super::reconstruct::clamp_sugar::apply(&mut body_stmts);
+    // STACK-CELL NAMING: `stack_N` frame cells proven to be struct
+    // enumerators/awaiters/out-buffers by the calls they are passed to, or
+    // typed from a resolved callee's ref/out signature. Struct cells whose
+    // metadata layout is proven also render `*(T*)(&cell +off)` as
+    // `cell.field`.
+    if !crate::recovery::env_flags::flag("ILR_NOSTACKTYPE") {
+        super::reconstruct::stack_naming::apply_with_maps(
+            &mut body_stmts,
+            resolve_maps,
+            &local_types,
+            &local_mty,
+            declaring_tdi,
+        );
+    }
+    // BYREF PARAMETERS: IL2CPP passes a `ref`/`out` parameter as an address,
+    // so every managed use lowers to a dereference (`*(float*)(inTotalProb)`).
+    // C# writes the parameter itself. Only offset 0 and primitive pointees
+    // fold: `*(float*)(p + 16)` is a field of the pointee, and for `ref
+    // Vector3` even offset 0 is the struct's first field.
+    let byref_names = super::reconstruct::byref_deref::primitive_byref_names(
+        &local_mty,
+        &resolve_maps.value_type_tdis,
+    );
+    let byref_folds = super::reconstruct::byref_deref::apply(&mut body_stmts, &byref_names);
+    if crate::recovery::env_flags::flag("ILR_BYREF") && byref_folds > 0 {
+        eprintln!("[byref] folded {byref_folds} byref access(es)");
+    }
+    // A `ref`/`out` parameter is READ BY THE CALLER: a store to it is the
+    // method's result. After `byref_deref` turns `*(T*)(p) = v` into `p = v`,
+    // no body pass may treat that store as dead because the body never reads
+    // the name again.
+    let byref_params: std::collections::HashSet<String> = local_mty
+        .iter()
+        .filter(|(_, t)| matches!(t, super::types::ManagedType::ByRef(_)))
+        .map(|(n, _)| n.clone())
+        .collect();
+    // RETURN-CONTEXT CLEANUP: fold conditional returns into ternaries, turn
+    // boolean `c ? e : false` into `c && e`, merge `new object(...)` +
+    // `..ctor(...)` (typing the allocation with the return type), drop the
+    // always-true null test on a fresh allocation, render `return 0` as
+    // `return null` for reference results, and drop duplicate `set_Item`.
+    let ret_ty_text = csharp_type(ret_type);
+    let ret_is_ref = matches!(
+        ret_type,
+        super::types::ManagedType::Object
+            | super::types::ManagedType::String
+            | super::types::ManagedType::Class(_)
+            | super::types::ManagedType::SzArray(_)
+            | super::types::ManagedType::Opaque(_)
+    );
+    let ret_info = super::reconstruct::expr_cleanup::RetInfo {
+        is_ref: ret_is_ref,
+        is_bool: ret_ty_text.as_deref() == Some("bool"),
+        type_name: ret_ty_text,
+        is_ctor: method_name.ends_with(".ctor"),
+    };
+    super::reconstruct::expr_cleanup::apply(&mut body_stmts, &ret_info);
+    // Stale-register tail arguments at UNRESOLVED calls: a trailing `vN` that
+    // is neither defined nor a parameter is register-dump garbage, not a value
+    // the source computed (`fn_1302420(…, v154, v155, v156, v157)` with
+    // v156/v157 defined nowhere). Resolved calls are untouched.
+    let param_names: std::collections::HashSet<String> =
+        param_sigs.iter().map(|(_, n)| n.clone()).collect();
+    let stale_args = super::reconstruct::undef_args::apply(&mut body_stmts, &param_names);
+    if crate::recovery::env_flags::flag("ILR_UNDEFARGS") && stale_args > 0 {
+        eprintln!("[undefargs] trimmed {stale_args} stale register argument(s)");
+    }
+    // CONSTANT LOCALS: a `vN` whose every definition is the SAME pure
+    // constant (`0f`, `12`, `null`, `typeof(T)`, …) carries no information;
+    // substitute the constant at every read and delete the definitions. This
+    // is the largest safe slice of the multi-def local class (two branch-local
+    // defs of one literal). Address-taken locals, name-only slots and complex
+    // assignment-target roots are refused.
+    // Alias chains fold one link per round (`vA = vB; vB = vC`): the pass
+    // deliberately leaves a source that is itself folded alone, so iterate to
+    // a fixpoint (bounded; each round strictly removes names or stops).
+    let mut const_locals = 0usize;
+    for _ in 0..4 {
+        let n = super::reconstruct::const_inline::apply(&mut body_stmts);
+        if n == 0 {
+            break;
+        }
+        const_locals += n;
+    }
+    if crate::recovery::env_flags::flag("ILR_CONSTINLINE") && const_locals > 0 {
+        eprintln!("[constinline] folded {const_locals} constant local read/def(s)");
+    }
+    // LAYOUT FIXUPS run LATE: the klass token only becomes `typeof(T)` after
+    // the type/naming passes, so the static-vector component rule needs the
+    // final expression shape (`*(TypeOf(Vector3)+8)`). The whole-field `.x`
+    // and float-deref rules are idempotent and see the same tree.
+    let field_fixes = super::reconstruct::field_fixups::apply(
+        &mut body_stmts,
+        resolve_maps,
+        declaring_tdi,
+    );
+    if crate::recovery::env_flags::flag("ILR_FIELDFIX") && field_fixes > 0 {
+        eprintln!("[fieldfix] {field_fixes} fixup(s)");
+    }
+    // INTERFACE-SCAN SCaffolding: after `resolve` proved an interface call,
+    // the inline `interfaces_count`/interfaceOffsets scan that produced the
+    // invoke-data pointer is dead. Remove it (and the count guard around it)
+    // when a method-wide read census proves every local it defines is dead.
+    let scan_strips = super::reconstruct::interface_scan::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_SCANDBG") && scan_strips > 0 {
+        eprintln!("[scans] {scan_strips} interface scan(s) removed");
+    }
+    // INLINED List<T>.Add: the capacity-check diamond is Add's own body; the
+    // source is one `list.Add(x)` call. Collapsing it removes the diamond,
+    // the _size increment and the raw element store.
+    let coll_adds = super::reconstruct::collection_add::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_COLLADDD") && coll_adds > 0 {
+        eprintln!("[colladd] {coll_adds} inlined Add body(ies) collapsed");
+    }
+    // FP RETURN REGISTERS: a dropped float-returning call whose result is
+    // read through the ABI register pseudo-locals (`in_vs0`, `in_vd2`) gets
+    // that result materialized under a source-style name and the reads bound
+    // to it (exactly one discarded call per method is required).
+    let fp_bound = super::reconstruct::fp_return_bind::apply(&mut body_stmts, &param_names);
+    if crate::recovery::env_flags::flag("ILR_FPRET") && fp_bound > 0 {
+        eprintln!("[fpret] bound {fp_bound} register read(s)");
+    }
+    // DUPLICATE-UPDATE TEMPS: a temp that recomputes a counter update and is
+    // read after that update (`v331 = v46 - 1; v46 = v46 - 1; if (v331 != 0)`)
+    // is the same value as the counter; fold the read and drop the temp. Also
+    // drops generated declarations whose value is never read. Runs again here
+    // because the late passes create both shapes (`for_loop`, `const_inline`).
+    let dup_folds = super::reconstruct::dup_update_fold::apply_protected(&mut body_stmts, &byref_params);
+    if crate::recovery::env_flags::flag("ILR_DUPUPDATE") && dup_folds > 0 {
+        eprintln!("[dupupdate] folded {dup_folds} duplicate-update/dead temp(s)");
+    }
+    // ROLE NAMES: the generated locals that survived every fold get a name
+    // only when their use proves one (loop counter, index, single destination
+    // field, single call producer, returned value). Everything else keeps the
+    // generated spelling rather than inventing a name.
+    let role_names = super::reconstruct::role_naming::apply(&mut body_stmts, Some(heuristic_index));
+    if crate::recovery::env_flags::flag("ILR_ROLENAMES") && role_names > 0 {
+        eprintln!("[rolenames] renamed {role_names} generated local reference(s)");
+    }
+    // ADJACENT SINGLE-USE RECEIVERS: `instance = this.RewardName;` immediately
+    // followed by the one statement that reads it is a materialized snapshot of
+    // a pure field/name/constant chain; move the load to the read and drop the
+    // assignment. Removing one receiver makes the next one adjacent, so iterate.
+    let mut adjacent_inlines = 0usize;
+    for _ in 0..4 {
+        let n = super::reconstruct::dup_update_fold::inline_adjacent_single_use(&mut body_stmts);
+        if n == 0 {
+            break;
+        }
+        adjacent_inlines += n;
+    }
+    if crate::recovery::env_flags::flag("ILR_ADJINLINE") && adjacent_inlines > 0 {
+        eprintln!("[adjinline] inlined {adjacent_inlines} adjacent single-use receiver(s)");
+    }
+    // DEAD STORES: a pure store whose value is overwritten on every path
+    // before any read (`instance3 = *(nint*)(this.RewardName +1376);` repeated
+    // for each branch of one coalesced slot) adds lines and nothing else.
+    // Backward liveness over the structured tree removes it; methods with
+    // arbitrary jumps are refused (the jump can bypass a lexical kill).
+    if !crate::recovery::env_flags::flag("ILR_NODSE") {
+        let dead_stores = super::reconstruct::liveness_dse::apply_protected(&mut body_stmts, &byref_params);
+        if crate::recovery::env_flags::flag("ILR_DSE") && dead_stores > 0 {
+            eprintln!("[dse] removed {dead_stores} dead store(s)");
+        }
+        // Methods with jumps are refused above, so the leftover staging of a
+        // rewritten call (`instance5 = inError;` with no reader left) survives
+        // there. A write-only local needs no control-flow proof.
+        let write_only = super::reconstruct::dead_write_only::apply_protected(&mut body_stmts, &byref_params);
+        if std::env::var("ILR_DBG845").is_ok() && ir.base_rva == 0x14F8228 {
+        }
+        if crate::recovery::env_flags::flag("ILR_DSE") && write_only > 0 {
+            eprintln!("[dse] dropped {write_only} write-only statement(s)");
+        }
+    }
+    if crate::recovery::env_flags::flag("ILR_ASTDBG") {
+        let _ = std::fs::write(
+            probe_dir().join(format!("ast_debug_after.{:#x}.txt", ir.base_rva)),
+            format!("{:#?}", body_stmts),
+        );
+    }
+    super::idioms::prune_dead_code(&mut body_stmts);
+    // DECLARE THE LOCALS. Nothing upstream ever set the declared type on a
+    // `Stmt::Assign`, so every recovered local was emitted as a bare
+    // assignment with no declaration anywhere in the method. `var` is always
+    // the right type for the initializer, so this can never contradict a use.
+    // FALL-THROUGH GOTOS, again: the if/else shells `branch_repair` and the
+    // final guard folds build are NEW, and they end their arms with a
+    // `goto` to the label that follows the shell. The pass in the recon
+    // pipeline ran before those existed.
+    let fallthrough = super::reconstruct::goto_fallthrough::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_DECLDBG") && fallthrough > 0 {
+        eprintln!("[goto] folded {fallthrough} fall-through jump(s)");
+    }
+    // FLOAT LANES: a local compared against a float immediate is
+    // single-precision, so its 4-byte loads are `*(float*)`, not `*(int*)`.
+    // Must run before `declare_locals` so the `var` it emits is inferred from
+    // the corrected initializer.
+    // A `return;` in a void method tail position is what falling off the
+    // end already does. Removed before the declaration pass so a hoisted
+    // local is never separated from the end of the body by a dead return.
+    if csharp_type(ret_type).is_none() {
+        let tail_returns = super::idioms::drop_tail_returns(&mut body_stmts);
+        if crate::recovery::env_flags::flag("ILR_DECLDBG") && tail_returns > 0 {
+            eprintln!("[tailret] dropped {tail_returns} trailing return(s)");
+        }
+    }
+    let float_lanes = super::reconstruct::float_locals::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_FLOATDBG") && float_lanes > 0 {
+        eprintln!("[float] retyped {float_lanes} load(s)");
+    }
+    // TYPE INFERENCE (4.2-4.4): the metadata map only knows a local type
+    // when the IL local signature survived; most recovered temporaries are
+    // `Unknown`. `local_types::infer` reads the type off the DEFINITIONS
+    // (`v = 512` -> int, `v = new Foo()` -> Foo, `v = (Vector3)x` ->
+    // Vector3) and refuses any local whose uses contradict the answer.
+    // Metadata wins where it has one.
+    let call_rets = super::reconstruct::local_types::call_return_types_cached(resolve_maps);
+    let inferred = super::reconstruct::local_types::infer(&body_stmts, call_rets);
+    let mut all_types = inferred;
+    for (k, v) in &local_type_text {
+        all_types.insert(k.clone(), v.clone());
+    }
+    let declared_locals =
+        super::reconstruct::declare_locals::apply(&mut body_stmts, &param_names, &all_types);
+    if crate::recovery::env_flags::flag("ILR_DECLDBG") && declared_locals > 0 {
+        eprintln!("[decl] {declared_locals} local declaration(s)");
+    }
+    super::tm_add(&super::timing::R_L4, t_l4);
+    let t_l5 = std::time::Instant::now();
+    // The coverage-repair counts were taken before branch_repair/goto_fold;
+    // report only the regions whose code survived, and drop the marker when
+    // the late folds owned every one of them. Skipped entirely when the
+    // method had no repair regions (markers/sentinels only originate there):
+    // this used to be three full-tree walks on all 24k methods.
+    if repaired_blocks > 0 {
+        super::reconstruct::finalize_recovery_markers(&mut body_stmts);
+    }
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
+        let mut r2 = Renderer::new();
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
+        let _ = std::fs::write(probe_dir().join("after_prune.txt"), r2.out.clone());
+    }
     // EXCUSE THE ERASED CALLS. `concord` scores every native call it cannot
     // find in the text as DROPPED, so a deliberate erasure must reach the verify
     // ledger — the same discipline `resolve::key_function_recovery` follows for
@@ -11201,7 +19117,9 @@ pub fn render_method_csharp_full_chains(
             }
         }
         for (target, folded) in &cci_erased.by_target {
-            let Some(at) = sites.get(target) else { continue };
+            let Some(at) = sites.get(target) else {
+                continue;
+            };
             if at.len() as u64 != *folded {
                 continue;
             }
@@ -11210,12 +19128,16 @@ pub fn render_method_csharp_full_chains(
             }
         }
     }
-    if std::env::var("ILR_STMTS").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_STMTS") {
         let mut r2 = Renderer::new();
-        for s in &body_stmts { r2.stmt(s); }
+        for s in &body_stmts {
+            r2.stmt(s);
+        }
         let _ = std::fs::write(probe_dir().join("after_cleanup.txt"), r2.out.clone());
     }
-    if prof { eprintln!("[render] rewrites+cleanup {}us", t_rw.elapsed().as_micros()); }
+    if prof {
+        eprintln!("[render] rewrites+cleanup {}us", t_rw.elapsed().as_micros());
+    }
     // Fidelity audit: which native instructions the output accounted for.
     // Claims made while BUILDING an expression that was then discarded are
     // not representations of the output — subtract them before judging.
@@ -11230,6 +19152,13 @@ pub fn render_method_csharp_full_chains(
     // and then discarded never claimed its instructions, so intersecting with
     // `claims` keeps a discarded fold from hiding a genuinely dropped call.
     for &i in st.ctx.property_fold_sites.borrow().iter() {
+        // The structured body may have been built on the DUPLICATED listing,
+        // whose clones are appended past the original instruction count: those
+        // indices have no native instruction to attribute (the clone is a copy
+        // of one that does), so skip them instead of indexing out of bounds.
+        if i >= ir.insns.len() {
+            continue;
+        }
         if claims.contains(&i) {
             super::verify::ledger_note(
                 ir.insns[i].address,
@@ -11250,7 +19179,7 @@ pub fn render_method_csharp_full_chains(
     // supposed to annotate (the reference dumps carried ~49,000 of these
     // lines, together roughly half the file). `ILR_LOCALS=1` brings it back
     // when a refactor pass wants the slot→type map.
-    let with_locals = std::env::var("ILR_LOCALS").is_ok();
+    let with_locals = crate::recovery::env_flags::flag("ILR_LOCALS");
     let mut typed: Vec<String> = Vec::new();
     for li in 0..ir.table.infos.len() {
         let info = &ir.table.infos[li];
@@ -11261,6 +19190,71 @@ pub fn render_method_csharp_full_chains(
             let name = st_name(li);
             typed.push(format!("{t} {name}"));
         }
+    }
+
+    // FINAL GUARD POLISH. The late goto rounds build their join regions after
+    // the main guard merge, and the labels that block a merge only disappear
+    // once every goto is gone. By here the tree is final: one last bottom-up
+    // merge collapses the remaining single-statement guard chains, and the
+    // ternary fold consumes the two-tail returns the merge exposes. Declarations
+    // are already in place; merging keeps the inner body's statements in the
+    // same order and scope.
+    // CLOSURE FIELDS: `new <>c__DisplayClass…()` names the captured layout,
+    // so the raw `*(nint*)(closure +off)` accesses can become named fields.
+    let closure_fields = super::reconstruct::closure_fields::apply(
+        &mut body_stmts,
+        resolve_maps,
+        method_name,
+    );
+    if crate::recovery::env_flags::flag("ILR_RECON") && closure_fields > 0 {
+        eprintln!("[recon] closure_fields: {closure_fields} raw access(es) named");
+    }
+    // CLASS-INIT STORES: the guard already names the flag (`ClassInit.init_…`);
+    // the raw store of the same flag takes the same name.
+    let class_init_stores = super::reconstruct::class_init_stores::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_RECON") && class_init_stores > 0 {
+        eprintln!("[recon] class_init_stores: {class_init_stores} flag store(s) named");
+    }
+    // DELEGATE TAIL INVOCATIONS: `fnptr_0x…(del.method_code, args, del.method,
+    // del.invoke_impl)` is the native delegate call convention; C# writes
+    // `del(args)`.
+    let delegate_calls = super::reconstruct::delegate_invoke::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_RECON") && delegate_calls > 0 {
+        eprintln!("[recon] delegate_invoke: {delegate_calls} call(s) folded");
+    }
+    // VALUE TAIL BINDING. In a value-returning method `E; return;` can only
+    // mean `return E;` — the link between the call's result slot and the
+    // return register is what got lost (`Camera.get_current` `blr`s the
+    // resolved `get_currentInternal` pointer and x0 never reaches the
+    // `Return`). Before the ternary fold so a bound value can still join a
+    // merged guard.
+    let tail_values = if ir.returns_value {
+        super::reconstruct::return_tail_fold::apply(&mut body_stmts)
+    } else {
+        0
+    };
+    if crate::recovery::env_flags::flag("ILR_RECON") && tail_values > 0 {
+        eprintln!("[recon] return_tail_fold: {tail_values} tail value(s) bound");
+    }
+    // TAIL GUARD CASCADE. A flat sequence of early exits arrives as a stair
+    // of nested `if`s. At the tail of a VOID method that stair is exactly the
+    // flat guard list (`if (x == null) return; use(x); …`), so unroll it
+    // before the final merge. Value-returning methods are refused: falling
+    // off their end is not a `return`.
+    let flattened = if csharp_type(ret_type).is_none() {
+        super::reconstruct::tail_guard_flatten::apply(&mut body_stmts)
+    } else {
+        0
+    };
+    if crate::recovery::env_flags::flag("ILR_RECON") && flattened > 0 {
+        eprintln!("[recon] tail_guard_flatten: {flattened} guard level(s) unrolled");
+    }
+    let merged_final = super::reconstruct::merge_guards::apply(&mut body_stmts);
+    let ternary_final = super::reconstruct::return_ternary::apply(&mut body_stmts);
+    if crate::recovery::env_flags::flag("ILR_RECON") && (merged_final > 0 || ternary_final > 0) {
+        eprintln!(
+            "[recon] final polish: {merged_final} guard(s) merged, {ternary_final} tail return(s) folded"
+        );
     }
 
     let mut r = Renderer::new();
@@ -11287,20 +19281,37 @@ pub fn render_method_csharp_full_chains(
         ));
     }
     if with_locals && !typed.is_empty() && !body_stmts.is_empty() {
-        r.out.push_str(&format!("    // locals: {}\n", typed.join(", ")));
+        r.out
+            .push_str(&format!("    // locals: {}\n", typed.join(", ")));
     }
     if body_stmts.is_empty() {
-        // The renderer produced a header and NO statements. Distinct from the
-        // three markers above: the IR was recovered, but nothing structured, so
-        // the body is an empty shell rather than a refusal.
+        // The renderer produced a header and NO statements. When the lift is
+        // nothing but the method's own return (or empty), the source body is
+        // genuinely empty — `void M() { }` — and the marker would be a false
+        // refusal. Only refuse when real work was lifted and left uncovered.
         FALLBACK
             .empty_body
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        r.line("// body not recoverable");
+        // A body the walk filled and the sweeps then proved dead is EMPTY,
+        // not unrecovered. Restricted to VOID methods on purpose: a
+        // value-returning method that lost every statement also lost its
+        // return, which is precisely the over-deletion this marker exists to
+        // catch, so it keeps refusing.
+        let soundly_emptied = recovered_statements && !ir.returns_value;
+        if !soundly_emptied
+            && !ir
+                .insns
+                .iter()
+                .all(|i| matches!(i.op, Op::Nop | Op::Return))
+        {
+            r.line("// body not recoverable");
+        }
     } else {
-        if std::env::var("ILR_STMTS").is_ok() {
+        if crate::recovery::env_flags::flag("ILR_STMTS") {
             let mut r2 = Renderer::new();
-            for s in &body_stmts { r2.stmt(s); }
+            for s in &body_stmts {
+                r2.stmt(s);
+            }
             let _ = std::fs::write(probe_dir().join("final_stmts.txt"), r2.out.clone());
         }
         for s in &body_stmts {
@@ -11312,9 +19323,12 @@ pub fn render_method_csharp_full_chains(
     strip_undefined_gotos(&mut r.out);
     strip_unread_bindings(&mut r.out);
     undef_dbg_records(&ir.table, &ir.insns, ir.base_rva, &r.out);
+    vncensus_record(ir.base_rva, &ir.table, &ir.insns, &r.out);
+    super::tm_add(&super::timing::R_L5, t_l5);
+    super::tm_add(&super::timing::R_LATE, t_late);
+    super::tm_add(&super::timing::R_TOTAL, t0);
     r.out
 }
-
 
 /// Whole-binary native pseudo-C# generation (replaces Ghidra for supported
 /// architectures). Parallel over methods; returns RVA → C# text merged into
@@ -11434,12 +19448,13 @@ pub fn decompile_methods_to_csharp(
             .unwrap_or_default();
         let type_end = image_def.type_start as usize + image_def.type_count as usize;
         for tdi in image_def.type_start as usize..type_end {
-            let Some(td) = metadata.type_defs.get(tdi) else { continue };
+            let Some(td) = metadata.type_defs.get(tdi) else {
+                continue;
+            };
             let m_end = td.method_start as usize + td.method_count as usize;
             // Union: whole selected DLLs plus any specifically checked types.
             let picker = crate::output::pseudo_c::picker_type_name(metadata, td);
-            let dump_name =
-                executor.get_type_def_name(td, tdi, metadata, il2cpp, true, false);
+            let dump_name = executor.get_type_def_name(td, tdi, metadata, il2cpp, true, false);
             if !crate::output::pseudo_c::method_body_filter_allows_names(
                 &image_name,
                 &picker,
@@ -11450,7 +19465,9 @@ pub fn decompile_methods_to_csharp(
                 continue;
             }
             for mi in td.method_start as usize..m_end {
-                let Some(md) = metadata.method_defs.get(mi) else { continue };
+                let Some(md) = metadata.method_defs.get(mi) else {
+                    continue;
+                };
                 let ptr = il2cpp.get_method_pointer(&image_name, md);
                 if ptr == 0 {
                     continue;
@@ -11494,18 +19511,15 @@ pub fn decompile_methods_to_csharp(
                     .filter_map(|j| {
                         let pidx = md.parameter_start as usize + j;
                         let pd = metadata.parameter_defs.get(pidx)?;
-                        il2cpp
-                            .types
-                            .get(pd.type_index as usize)
-                            .map(|t| {
-                                super::managed_type_of_gn(
-                                    t,
-                                    metadata,
-                                    il2cpp,
-                                    0,
-                                    Some(&ctx.generic_names),
-                                )
-                            })
+                        il2cpp.types.get(pd.type_index as usize).map(|t| {
+                            super::managed_type_of_gn(
+                                t,
+                                metadata,
+                                il2cpp,
+                                0,
+                                Some(&ctx.generic_names),
+                            )
+                        })
                     })
                     .collect();
                 // HFA float components per parameter (Vector3 → x/y/z):
@@ -11519,11 +19533,7 @@ pub fn decompile_methods_to_csharp(
                             if nt.type_def_index >= 0
                                 && nt.type_def_index < metadata.type_defs.len() as i32 =>
                         {
-                            super::hfa_float_components(
-                                nt.type_def_index,
-                                metadata,
-                                il2cpp,
-                            )
+                            super::hfa_float_components(nt.type_def_index, metadata, il2cpp)
                         }
                         _ => Vec::new(),
                     })
@@ -11532,13 +19542,7 @@ pub fn decompile_methods_to_csharp(
                     .types
                     .get(md.return_type as usize)
                     .map(|t| {
-                        super::managed_type_of_gn(
-                            t,
-                            metadata,
-                            il2cpp,
-                            0,
-                            Some(&ctx.generic_names),
-                        )
+                        super::managed_type_of_gn(t, metadata, il2cpp, 0, Some(&ctx.generic_names))
                     })
                     .unwrap_or(ManagedType::Unknown);
                 sigs.insert(
@@ -11615,11 +19619,11 @@ pub fn decompile_methods_to_csharp(
             Some(name)
         }
     };
-    let eh_regions: HashMap<u64, Vec<super::exceptions::EhRegion>> = if il2cpp.eh_tables.is_empty() {
+    let eh_regions: HashMap<u64, Vec<super::exceptions::EhRegion>> = if il2cpp.eh_tables.is_empty()
+    {
         HashMap::new()
     } else {
-        sigs
-            .par_iter()
+        sigs.par_iter()
             .filter_map(|(rva, _)| {
                 let size = il2cpp.get_method_body_size(*rva, &sorted);
                 if size == 0 {
@@ -11634,9 +19638,7 @@ pub fn decompile_methods_to_csharp(
                 let mut seen = std::collections::HashSet::new();
                 let regs: Vec<super::exceptions::EhRegion> = regs
                     .into_iter()
-                    .filter(|r| {
-                        seen.insert((r.try_start, r.try_end, r.landing_pad, r.is_cleanup))
-                    })
+                    .filter(|r| seen.insert((r.try_start, r.try_end, r.landing_pad, r.is_cleanup)))
                     .collect();
                 if regs.is_empty() {
                     None
@@ -11653,11 +19655,21 @@ pub fn decompile_methods_to_csharp(
         ));
     }
 
+    // Build the heuristic type index ONCE globally (not per-method).
+    // This avoids O(n²) cost where n = number of methods.
+    let heuristic_index = super::heuristic_types::HeuristicIndex::build(&ctx.maps);
+
+    // Build the generic instantiation map ONCE globally (not per-method).
+    // This avoids O(n * m) cost where n = methods, m = generic specs.
+    let generic_map = super::reconstruct::generic_inference::build_generic_instantiation_map(&ctx.maps);
+
+    // Initialize ptr_no_offset resolution tracking (accumulates during rendering).
+    super::reconstruct::ptr_resolution::init();
+
     // Every method WITH native bytes gets a body: recovered C# on success,
     // an explicit failure marker otherwise — so dump.cs never mixes
     // mysterious `{ }` with pseudo-code for the same class.
-    let mut method_list: Vec<(u64, &Sig)> =
-        sigs.iter().map(|(r, s)| (*r, s)).collect();
+    let mut method_list: Vec<(u64, &Sig)> = sigs.iter().map(|(r, s)| (*r, s)).collect();
     method_list.sort_by_key(|(rva, _)| *rva);
     // `ILR_DET_LIMIT=<n>`: keep ~n methods STRIDED across the RVA-sorted list
     // rather than the first n. The first n would all sit in one assembly's
@@ -11676,7 +19688,23 @@ pub fn decompile_methods_to_csharp(
             method_list = kept;
         }
     }
-    let results: HashMap<u64, String> = method_list.par_iter()
+    // ILR_ONLY=0x<rva>[,0x<rva>…] — decompile just the named method(s)
+    // (debugging). Filter the list BEFORE the parallel walk so the per-method
+    // body-size probe is not paid for every method in the image: on a
+    // 80k-method binary that probe dominates a single-method diagnostic run.
+    let only_rvas: Option<Vec<String>> = std::env::var("ILR_ONLY").ok().map(|only| {
+        only.split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    if let Some(wanted) = &only_rvas {
+        method_list.retain(|(rva, _)| wanted.iter().any(|w| format!("{rva:#x}").eq_ignore_ascii_case(w)));
+    }
+    let results: HashMap<u64, String> = {
+        let t_render = std::time::Instant::now();
+        let r: HashMap<u64, String> = method_list
+        .par_iter()
         .filter_map(|(rva, sig)| {
             // The largest body this pass will decompile.
             //
@@ -11690,9 +19718,8 @@ pub fn decompile_methods_to_csharp(
             // probe the message quotes.
             const MAX_TEXT_BODY_BYTES: usize = 0x4000;
             let size = il2cpp.get_method_body_size(*rva, &sorted);
-            // ILR_ONLY=0x<rva> — decompile just one method (debugging)
-            if let Ok(only) = std::env::var("ILR_ONLY") {
-                if !format!("{:#x}", rva).eq_ignore_ascii_case(&only) {
+            if let Some(wanted) = &only_rvas {
+                if !wanted.iter().any(|w| format!("{rva:#x}").eq_ignore_ascii_case(w)) {
                     return None;
                 }
             }
@@ -11701,21 +19728,26 @@ pub fn decompile_methods_to_csharp(
             }
             // Denominator for the fallback census: a method with real bytes that
             // this pass was asked to turn into C#.
-            FALLBACK.attempted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FALLBACK
+                .attempted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if size > MAX_TEXT_BODY_BYTES.min(ctx.max_method_bytes) {
-                FALLBACK.too_large.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                FALLBACK
+                    .too_large
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some((
                     *rva,
-                    format!(
-                        "        // [recovery skipped: method too large ({size} bytes)]"
-                    ),
+                    format!("        // [recovery skipped: method too large ({size} bytes)]"),
                 ));
             }
             let Some(bytes) = il2cpp.read_bytes_at_rva(*rva, size) else {
                 FALLBACK
                     .bytes_unreadable
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some((*rva, "        // [recovery failed: body bytes unreadable]".into()));
+                return Some((
+                    *rva,
+                    "        // [recovery failed: body bytes unreadable]".into(),
+                ));
             };
             let declaring = if sig.tdi >= 0 {
                 metadata.type_defs.get(sig.tdi as usize).and_then(|td| {
@@ -11738,18 +19770,22 @@ pub fn decompile_methods_to_csharp(
             // AAPCS32 passes value-type arguments as one or more core words.
             // Keep their native size beside the signature so the local seeder
             // does not shift later parameters into the wrong registers.
-            let arm32_param_words: Vec<usize> = sig.param_types.iter().map(|ty| {
-                let ManagedType::Class(nt) = ty else { return 1 };
-                super::arm32_value_type_size(nt.type_def_index, metadata, il2cpp)
-                    .map(|size| size.saturating_add(3) / 4)
-                    .unwrap_or(1)
-            }).collect();
+            let arm32_param_words: Vec<usize> = sig
+                .param_types
+                .iter()
+                .map(|ty| {
+                    let ManagedType::Class(nt) = ty else { return 1 };
+                    super::arm32_value_type_size(nt.type_def_index, metadata, il2cpp)
+                        .map(|size| size.saturating_add(3) / 4)
+                        .unwrap_or(1)
+                })
+                .collect();
             // ARM32 composite results ride in a caller-allocated buffer passed
             // in `r0`, which pushes `this` to `r1` and every parameter up one
             // register. Decided here (metadata + size table are available) and
             // applied in `locals::create`.
-            let ret_hidden_buffer = ctx.is_arm32
-                && super::arm32_ret_uses_hidden_buffer(&sig.ret, metadata, il2cpp);
+            let ret_hidden_buffer =
+                ctx.is_arm32 && super::arm32_ret_uses_hidden_buffer(&sig.ret, metadata, il2cpp);
             let seed = super::locals::SeedInfo {
                 param_types,
                 ret_type: sig.ret.clone(),
@@ -11761,12 +19797,15 @@ pub fn decompile_methods_to_csharp(
                 is_arm32: ctx.is_arm32,
                 ret_hidden_buffer,
             };
-            if std::env::var("ILR_SIG").is_ok() {
-                eprintln!("[sig] {:#x} static={} params={:?} ptypes={:?} ret={:?}", rva, sig.is_static, sig.params, sig.param_types, sig.ret);
+            if crate::recovery::env_flags::flag("ILR_SIG") {
+                eprintln!(
+                    "[sig] {:#x} static={} params={:?} ptypes={:?} ret={:?}",
+                    rva, sig.is_static, sig.params, sig.param_types, sig.ret
+                );
             }
-            let trace = std::env::var("ILR_TRACE").is_ok();
-            let rssdbg = std::env::var("ILR_RSSDBG").is_ok();
-            let concord_on = std::env::var("ILR_CONCORD").is_ok();
+            let trace = crate::recovery::env_flags::flag("ILR_TRACE");
+            let rssdbg = crate::recovery::env_flags::flag("ILR_RSSDBG");
+            let concord_on = crate::recovery::env_flags::flag("ILR_CONCORD");
             if trace {
                 eprintln!("[m+] {:#x} {}B", rva, size);
             }
@@ -11777,7 +19816,9 @@ pub fn decompile_methods_to_csharp(
                 .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
             super::verify::clear_graded();
             super::verify::set_tv_source("cs");
-            let result = match ctx.recover_ir_deadline(&bytes, *rva, &seed, metadata, il2cpp, deadline) {
+            let result = match ctx
+                .recover_ir_deadline(&bytes, *rva, &seed, metadata, il2cpp, deadline)
+            {
                 Some(ir) => {
                     // `ILR_VERIFY=1` inside the pipeline can only run when
                     // `recover_ir_deadline` reaches its verification stage. A
@@ -11793,7 +19834,7 @@ pub fn decompile_methods_to_csharp(
                         );
                     }
                     let t = std::time::Instant::now();
-                    if std::env::var("ILR_STAGES").is_ok() {
+                    if crate::recovery::env_flags::flag("ILR_STAGES") {
                         eprintln!("[stage] {:#x} render", rva);
                     }
                     // EH regions come from the binary's exception tables and
@@ -11810,19 +19851,30 @@ pub fn decompile_methods_to_csharp(
                         render_deadline(),
                         &ctx.parent_chains,
                         regions,
+                        &ctx.maps,
+                        &heuristic_index,
+                        &generic_map,
                     );
                     if let Ok(want) = std::env::var("ILR_CALLDBG") {
                         if want == "all" || want.eq_ignore_ascii_case(&format!("{:#x}", rva)) {
                             let calls = ir
                                 .insns
                                 .iter()
-                                .filter(|k| matches!(k.op, super::ir::Op::Call | super::ir::Op::CallVoid))
+                                .filter(|k| {
+                                    matches!(k.op, super::ir::Op::Call | super::ir::Op::CallVoid)
+                                })
                                 .count();
-                            eprintln!("[calldbg] {rva:#x} final-ir insns={} calls={calls}", ir.insns.len());
+                            eprintln!(
+                                "[calldbg] {rva:#x} final-ir insns={} calls={calls}",
+                                ir.insns.len()
+                            );
                         }
                     }
                     if let Ok(dump) = std::env::var("ILR_DUMP") {
-                        let _ = std::fs::write(&dump, format!("// method {:#x} size={}\n{}\n", rva, text.len(), text));
+                        let _ = std::fs::write(
+                            &dump,
+                            format!("// method {:#x} size={}\n{}\n", rva, text.len(), text),
+                        );
                     }
                     super::tm_add(&super::timing::RENDER, t);
                     // C#-vs-disassembly concordance: read the EMITTED text back
@@ -11873,26 +19925,51 @@ pub fn decompile_methods_to_csharp(
             result
         })
         .collect();
+        eprintln!("[perf] parallel method rendering: {:.1}ms ({} methods)", t_render.elapsed().as_secs_f64() * 1000.0, r.len());
+        
+        // Resolve ptr_no_offset patterns using method context
+        let resolved_ptrs = super::reconstruct::ptr_resolution::resolve();
+        let mut r = r;
+        if !resolved_ptrs.is_empty() {
+            eprintln!("[ptr_resolution] resolved {} ptr_no_offset patterns", resolved_ptrs.len());
+            // Build replacement tables once (not per method)
+            let t_ptr = std::time::Instant::now();
+            let (ptr_tables, deref_tables) = super::reconstruct::ptr_resolution::build_replacement_tables(&resolved_ptrs);
+            // Apply replacements to all rendered method bodies (parallelized)
+            r.par_iter_mut().for_each(|(_rva, text)| {
+                super::reconstruct::ptr_resolution::apply_replacements_with_tables(text, &ptr_tables, &deref_tables);
+            });
+            eprintln!("[perf] ptr_resolution replacement: {:.1}ms", t_ptr.elapsed().as_secs_f64() * 1000.0);
+            // NOTE: no early `return r` here. It used to skip the timing /
+            // concord / verify / conform reports below, so a run that resolved
+            // any ptr pattern silently produced no aggregate audit at all.
+        }
+        r
+    };
 
-    if std::env::var("ILR_TIMING").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_TIMING") {
         eprintln!("{}", super::timing::report());
+        eprintln!(
+            "{}",
+            super::reconstruct::field_annotation::timing_report()
+        );
     }
-    if std::env::var("ILR_CONCORD").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_CONCORD") {
         let report = super::concord::report();
         if !report.is_empty() {
             eprint!("{report}");
         }
     }
-    if std::env::var("ILR_VERIFY").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_VERIFY") {
         eprintln!("{}", super::verify::VerifyStats::report());
     }
-    if std::env::var("ILR_VERIFY").is_ok() || std::env::var("ILR_CONFORM").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_VERIFY") || crate::recovery::env_flags::flag("ILR_CONFORM") {
         let conform = super::conform::report();
         if !conform.is_empty() {
             eprintln!("{conform}");
         }
     }
-    if std::env::var("ILR_MEM").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_MEM") {
         let total: usize = results.values().map(|s| s.len()).sum();
         let max: usize = results.values().map(|s| s.len()).max().unwrap_or(0);
         let mut lens: Vec<usize> = results.values().map(|s| s.len()).collect();
@@ -11903,7 +19980,11 @@ pub fn decompile_methods_to_csharp(
             "[mem] results={} entries total_bytes={} avg={} med={} p90={} max={}",
             results.len(),
             total,
-            if results.is_empty() { 0 } else { total / results.len() },
+            if results.is_empty() {
+                0
+            } else {
+                total / results.len()
+            },
             med,
             p90,
             max
@@ -11914,7 +19995,7 @@ pub fn decompile_methods_to_csharp(
             eprintln!("[mem] top {:#x} {}B", r, l);
         }
     }
-    if std::env::var("ILR_LIFT_CENSUS").is_ok() {
+    if crate::recovery::env_flags::flag("ILR_LIFT_CENSUS") {
         eprintln!("{}", super::lift::lift_census_summary());
     }
     if let Ok(path) = std::env::var("ILR_LIFT_CENSUS_FILE") {
@@ -11976,10 +20057,418 @@ pub struct CoverageRepairCounters {
     pub methods: std::sync::atomic::AtomicU64,
 }
 
+/// Call results whose binding never reached the text, expanded at the read
+/// site instead of being left as a name nothing assigns.
+pub static CALL_REPAIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static COVERAGE_REPAIR: CoverageRepairCounters = CoverageRepairCounters {
     blocks: std::sync::atomic::AtomicU64::new(0),
     methods: std::sync::atomic::AtomicU64::new(0),
 };
+
+/// Dangling-goto census (`ILR_DANGLE=1`): gotos whose label the final tree
+/// never defines, split by where the goto sits and what happened to its block.
+pub struct DangleCounters {
+    pub gotos: std::sync::atomic::AtomicU64,
+    pub methods: std::sync::atomic::AtomicU64,
+    pub methods_with_switch: std::sync::atomic::AtomicU64,
+    /// Goto sits inside a `case` body / inside a switch tail or default.
+    pub in_case: std::sync::atomic::AtomicU64,
+    pub in_switch_other: std::sync::atomic::AtomicU64,
+    /// The label WAS defined right after coverage repair: a later pass dropped it.
+    pub was_labeled: std::sync::atomic::AtomicU64,
+    /// Target block state (when the label maps to a block id).
+    pub blk_unreachable: std::sync::atomic::AtomicU64,
+    pub blk_not_rendered: std::sync::atomic::AtomicU64,
+    pub blk_rendered: std::sync::atomic::AtomicU64,
+    pub label_unresolved: std::sync::atomic::AtomicU64,
+    /// Target block is a jump-table's case target.
+    pub blk_switch_target: std::sync::atomic::AtomicU64,
+}
+
+pub static DANGLE: DangleCounters = DangleCounters {
+    gotos: std::sync::atomic::AtomicU64::new(0),
+    methods: std::sync::atomic::AtomicU64::new(0),
+    methods_with_switch: std::sync::atomic::AtomicU64::new(0),
+    in_case: std::sync::atomic::AtomicU64::new(0),
+    in_switch_other: std::sync::atomic::AtomicU64::new(0),
+    was_labeled: std::sync::atomic::AtomicU64::new(0),
+    blk_unreachable: std::sync::atomic::AtomicU64::new(0),
+    blk_not_rendered: std::sync::atomic::AtomicU64::new(0),
+    blk_rendered: std::sync::atomic::AtomicU64::new(0),
+    label_unresolved: std::sync::atomic::AtomicU64::new(0),
+    blk_switch_target: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// Dangling references whose label EXISTED after coverage repair, sampled at
+/// the end of each late phase (L1, L2, L3, final). The increment between two
+/// entries is the number of labels that phase dropped while a goto still
+/// named them.
+pub static DANGLE_CKPT: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Count gotos whose label was defined by `post` (the post-repair tree) but is
+/// not defined now, and add the total to `DANGLE_CKPT[slot]` (`ILR_DANGLE`).
+fn dangle_checkpoint(stmts: &[Stmt], post: &HashSet<String>, slot: usize) {
+    if !crate::recovery::env_flags::flag("ILR_DANGLE") || post.is_empty() {
+        return;
+    }
+    let mut defined: HashSet<String> = HashSet::new();
+    let mut targets: HashSet<String> = HashSet::new();
+    collect_label_refs(stmts, &mut defined, &mut targets);
+    let n = targets
+        .iter()
+        .filter(|l| !defined.contains(*l) && post.contains(*l))
+        .count() as u64;
+    DANGLE_CKPT[slot].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Wall-clock nanos per late-pipeline (L3+) step, `ILR_TIMING` only.
+/// The steps are the `trace_step!` call sites in `render_method_csharp_full`.
+static L3_NANOS: std::sync::Mutex<Option<std::collections::HashMap<&'static str, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn l3_add(name: &'static str, ns: u64) {
+    if let Ok(mut g) = L3_NANOS.lock() {
+        let map = g.get_or_insert_with(std::collections::HashMap::new);
+        *map.entry(name).or_default() += ns;
+    }
+}
+
+/// Top late steps by cumulative time (`[l3-split]`).
+pub fn l3_timing_report(top: usize) -> String {
+    let Ok(g) = L3_NANOS.lock() else {
+        return String::new();
+    };
+    let Some(map) = g.as_ref() else {
+        return String::new();
+    };
+    let mut rows: Vec<(&str, u64)> = map.iter().map(|(k, v)| (*k, *v)).collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    rows.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+    let total: u64 = rows.iter().map(|(_, v)| *v).sum();
+    let mut out = format!("[l3-split] total={:.0}ms", total as f64 / 1e6);
+    for (n, v) in rows.into_iter().take(top) {
+        out.push_str(&format!(" {n}={:.0}", v as f64 / 1e6));
+    }
+    out
+}
+
+pub fn dangle_report() -> String {
+    let g = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    if g(&DANGLE.gotos) == 0 {
+        return String::new();
+    }
+    let mut s = format!(
+        "\n[dangle] gotos={} methods={} methods_with_switch={} in_case={} in_switch_other={} \
+         was_labeled_post_repair={} blk_unreachable={} blk_not_rendered={} blk_rendered={} \
+         label_unresolved={} blk_switch_target={}",
+        g(&DANGLE.gotos),
+        g(&DANGLE.methods),
+        g(&DANGLE.methods_with_switch),
+        g(&DANGLE.in_case),
+        g(&DANGLE.in_switch_other),
+        g(&DANGLE.was_labeled),
+        g(&DANGLE.blk_unreachable),
+        g(&DANGLE.blk_not_rendered),
+        g(&DANGLE.blk_rendered),
+        g(&DANGLE.label_unresolved),
+        g(&DANGLE.blk_switch_target),
+    );
+    s.push_str(&format!(
+        " ckpt_l1={} ckpt_l2={} ckpt_l3={} ckpt_end={}",
+        g(&DANGLE_CKPT[0]),
+        g(&DANGLE_CKPT[1]),
+        g(&DANGLE_CKPT[2]),
+        g(&DANGLE_CKPT[3]),
+    ));
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Lambda body production for closure reconstruction (Phase 5A)
+// ---------------------------------------------------------------------------
+//
+// IL2CPP lowers each lambda to a compiler-generated method on a display class
+// (e.g. `<>c.<M>b__1_0`) and a delegate construction that references it. The
+// closures reconstruction pass (`closures.rs`) can fold the construction back
+// into `Expr::Lambda { params, body }` — but only if the lambda's body is
+// available. Previously nothing in the pipeline produced those bodies, so the
+// pass was provably inert.
+//
+// This module fills the gap: when the renderer processes a method whose name
+// matches the compiler-generated lambda pattern (`<…>b__N_M`), it extracts the
+// body (conservatively: only single-expression methods) and registers it in a
+// global map. When another method's statement tree is about to enter the
+// reconstruction passes, synthetic `Assign(name, None, Expr::Lambda)` bindings
+// are injected for every lambda body the global map holds that the statement
+// tree references. The existing `closures.rs` machinery then folds the
+// delegate construction into the lambda — no modification to that pass needed.
+//
+// Thread safety: rendering runs on a rayon worker pool, so the map is a
+// `Mutex<HashMap>`. The timing is best-effort: if method M references lambda L
+// but L has not been rendered yet on any thread, the fold is missed for M.
+// With many methods rendered in parallel, most lambdas are registered before
+// their use sites are processed.
+
+/// Is `name` a compiler-generated lambda method (`<…>b__N_M`)?
+///
+/// Matches the C# compiler's naming convention for lifted lambda bodies:
+/// `<>c.<M>b__1_0`, `<MyClass>o__DisplayClass3.<Method>b__0`, etc.
+/// The last dot-separated segment must start with `<` and contain `b__`.
+pub fn is_lambda_method(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name);
+    last.starts_with('<') && last.contains("b__")
+}
+
+/// Extract a single-expression body from a lambda method's statement list.
+///
+/// Conservative by design: only two shapes are accepted:
+///   - `[Stmt::Return(Some(expr))]` — the common `x => x.Value` case
+///   - `[Stmt::Eval(expr)]` — a void lambda like `x => DoSomething(x)`
+///
+/// Anything else (multiple statements, conditional returns, local
+/// declarations) returns `None` and the lambda is not registered.
+pub fn extract_lambda_body(stmts: &[Stmt]) -> Option<Expr> {
+    match stmts {
+        [Stmt::Return(Some(expr))] => Some(expr.clone()),
+        [Stmt::Eval(expr)] => Some(expr.clone()),
+        _ => None,
+    }
+}
+
+/// Global map of compiler-generated lambda method bodies.
+///
+/// Key: fully-qualified method name (e.g. `<>c.<M>b__1_0`).
+/// Value: `(parameter_names, body_expression)`.
+///
+/// Populated during rendering when a lambda method is processed; consumed by
+/// `inject_lambda_bodies` before the reconstruction passes run on each method.
+static LAMBDA_BODIES: std::sync::Mutex<Option<std::collections::HashMap<String, (Vec<String>, Expr)>>> =
+    std::sync::Mutex::new(None);
+
+/// Register a lambda method's body in the global map.
+///
+/// Called from the renderer when a compiler-generated lambda method is
+/// processed. Thread-safe: acquires the mutex for the duration of the insert.
+pub fn register_lambda_body(name: String, params: Vec<String>, body: Expr) {
+    let mut guard = LAMBDA_BODIES.lock().unwrap();
+    guard.get_or_insert_with(std::collections::HashMap::new).insert(name, (params, body));
+}
+
+/// Look up a lambda method's body from the global map.
+///
+/// Returns `Some((params, body))` if the lambda has been registered, `None`
+/// otherwise (the lambda method has not been rendered yet, or is not a
+/// single-expression body).
+pub fn lookup_lambda_body(name: &str) -> Option<(Vec<String>, Expr)> {
+    let guard = LAMBDA_BODIES.lock().unwrap();
+    guard.as_ref().and_then(|m| m.get(name).cloned())
+}
+
+/// Clear the global lambda body map. For testing only.
+pub fn clear_lambda_bodies() {
+    let mut guard = LAMBDA_BODIES.lock().unwrap();
+    *guard = None;
+}
+
+/// Scan a statement tree for delegate constructions that reference registered
+/// lambda methods, and inject synthetic `Assign(name, None, Expr::Lambda)`
+/// bindings at the front of the list so the existing `closures.rs` machinery
+/// can fold them.
+///
+/// This is the bridge between the renderer (which produces lambda bodies) and
+/// the reconstruction pass (which consumes them). The injected assignments are
+/// invisible to the reader: they carry the generated method's name, which no
+/// other statement references except the delegate construction that
+/// `closures.rs` folds away.
+fn inject_lambda_bodies(stmts: &mut Vec<Stmt>) {
+    // Collect the set of lambda method names referenced in this statement tree.
+    let mut referenced = std::collections::HashSet::new();
+    collect_lambda_refs(stmts, &mut referenced);
+    if referenced.is_empty() {
+        return;
+    }
+    // For each referenced lambda, look up its body and inject a binding.
+    let guard = LAMBDA_BODIES.lock().unwrap();
+    let map = match guard.as_ref() {
+        Some(m) => m,
+        None => return,
+    };
+    let mut injections = Vec::new();
+    for name in &referenced {
+        if let Some((params, body)) = map.get(name) {
+            injections.push(Stmt::Assign(
+                name.clone(),
+                None,
+                Expr::Lambda {
+                    params: params.clone(),
+                    body: Box::new(body.clone()),
+                },
+            ));
+        }
+    }
+    if !injections.is_empty() {
+        // Prepend the synthetic bindings so they precede any delegate
+        // construction that references them.
+        let old = std::mem::take(stmts);
+        stmts.extend(injections);
+        stmts.extend(old);
+    }
+}
+
+/// Walk a statement tree and collect the names of compiler-generated lambda
+/// methods referenced by delegate constructions.
+fn collect_lambda_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign(_, _, e) | Stmt::Eval(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) => {
+                collect_lambda_refs_expr(e, out);
+            }
+            Stmt::If { cond, then_body, else_body } => {
+                collect_lambda_refs_expr(cond, out);
+                collect_lambda_refs(then_body, out);
+                collect_lambda_refs(else_body, out);
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                collect_lambda_refs_expr(cond, out);
+                collect_lambda_refs(body, out);
+            }
+            Stmt::For { init, cond, incr, body } => {
+                collect_lambda_refs(init, out);
+                if let Some(c) = cond {
+                    collect_lambda_refs_expr(c, out);
+                }
+                collect_lambda_refs(incr, out);
+                collect_lambda_refs(body, out);
+            }
+            Stmt::Try { try_body, catches, finally_body } => {
+                collect_lambda_refs(try_body, out);
+                for (_, cb) in catches {
+                    collect_lambda_refs(cb, out);
+                }
+                if let Some(fb) = finally_body {
+                    collect_lambda_refs(fb, out);
+                }
+            }
+            Stmt::Using { decl, body } => {
+                if let Stmt::Assign(_, _, e) = decl.as_ref() {
+                    collect_lambda_refs_expr(e, out);
+                }
+                collect_lambda_refs(body, out);
+            }
+            Stmt::Lock { body, .. } => {
+                collect_lambda_refs(body, out);
+            }
+            Stmt::Switch {
+                cases,
+                tail,
+                default,
+                ..
+            } => {
+                for (_, cb) in cases {
+                    collect_lambda_refs(cb, out);
+                }
+                if let Some(arm) = default {
+                    collect_lambda_refs(arm, out);
+                }
+                collect_lambda_refs(tail, out);
+            }
+            Stmt::ForEach { body, .. } => {
+                collect_lambda_refs(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Check one expression for delegate constructions referencing lambda methods.
+fn collect_lambda_refs_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    use super::reconstruct::{is_ctor_name, ctor_type_name};
+    match e {
+        Expr::Call { name, args, recv } => {
+            if is_ctor_name(name) {
+                if let Some(ty) = ctor_type_name(name) {
+                    if is_delegate_type_name(ty) && args.len() == 2 {
+                        if let Some(m) = extract_method_group_name(&args[1]) {
+                            if is_lambda_method(m) {
+                                out.insert(m.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(r) = recv {
+                collect_lambda_refs_expr(r, out);
+            }
+            for a in args {
+                collect_lambda_refs_expr(a, out);
+            }
+        }
+        Expr::NewObj(ty, args) => {
+            if is_delegate_type_name(ty) && args.len() == 2 {
+                if let Some(m) = extract_method_group_name(&args[1]) {
+                    if is_lambda_method(m) {
+                        out.insert(m.to_string());
+                    }
+                }
+            }
+            for a in args {
+                collect_lambda_refs_expr(a, out);
+            }
+        }
+        Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) => {
+            collect_lambda_refs_expr(a, out);
+            collect_lambda_refs_expr(b, out);
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::Cast(_, x) | Expr::AddressOf(x) | Expr::Await(x) => {
+            collect_lambda_refs_expr(x, out);
+        }
+        Expr::Field(r, _) | Expr::RawDeref(r, _, _) | Expr::RawAddr(r, _) => {
+            collect_lambda_refs_expr(r, out);
+        }
+        Expr::Index { collection, index } => {
+            collect_lambda_refs_expr(collection, out);
+            collect_lambda_refs_expr(index, out);
+        }
+        Expr::NullConditional { receiver, access } => {
+            collect_lambda_refs_expr(receiver, out);
+            collect_lambda_refs_expr(access, out);
+        }
+        Expr::Cond(c, a, d) => {
+            collect_lambda_refs_expr(c, out);
+            collect_lambda_refs_expr(a, out);
+            collect_lambda_refs_expr(d, out);
+        }
+        Expr::Lambda { body, .. } => {
+            collect_lambda_refs_expr(body, out);
+        }
+        _ => {}
+    }
+}
+
+/// Is `ty` plausibly a delegate type name? (Mirrors `closures.rs`.)
+fn is_delegate_type_name(ty: &str) -> bool {
+    let t = ty.rsplit('.').next().unwrap_or(ty);
+    let base = t.split('`').next().unwrap_or(t);
+    base.starts_with("Action")
+        || base.starts_with("Func")
+        || base == "Predicate"
+        || base == "Comparison"
+        || base.ends_with("EventHandler")
+        || base.ends_with("Delegate")
+        || base.ends_with("Callback")
+}
+
+/// Extract the method name from a `MethodGroup` or `Var` expression.
+fn extract_method_group_name(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::MethodGroup(m) => Some(m.as_str()),
+        _ => None,
+    }
+}
 
 /// `(regions repaired, methods repaired)` for the run report.
 pub fn coverage_repair_totals() -> (u64, u64) {
@@ -12060,10 +20549,13 @@ pub enum GotoReason {
     /// label the coverage repair renders. Before this, the edge was dropped and
     /// the exited block was never emitted at all.
     LoopExit,
+    /// Both branch successors are fenced by an enclosing construct; preserve
+    /// their distinct edges so the parent can resume each path correctly.
+    SplitBoundary,
 }
 
 impl GotoReason {
-    const COUNT: usize = 10;
+    const COUNT: usize = 11;
     fn idx(self) -> usize {
         match self {
             GotoReason::AlreadyEmitted => 0,
@@ -12076,6 +20568,7 @@ impl GotoReason {
             GotoReason::NoMerge => 7,
             GotoReason::Uncategorised => 8,
             GotoReason::LoopExit => 9,
+            GotoReason::SplitBoundary => 10,
         }
     }
     fn label(self) -> &'static str {
@@ -12090,6 +20583,7 @@ impl GotoReason {
             GotoReason::NoMerge => "no reconverging join (find_merge returned None)",
             GotoReason::Uncategorised => "unclassified call site",
             GotoReason::LoopExit => "fall out of a loop body at a secondary exit",
+            GotoReason::SplitBoundary => "branch between distinct enclosing stop blocks",
         }
     }
 }
@@ -12131,6 +20625,10 @@ pub struct StructCensus {
     /// `goto_sites` split by the call site that produced them. This is the
     /// number that says WHICH shape to fix: the largest bucket is the leverage.
     pub goto_by_reason: [std::sync::atomic::AtomicU64; GotoReason::COUNT],
+    /// Jump sites where a small straight-line return tail was DUPLICATED
+    /// instead of jumped to (`duplicable_tail`). Each one is a goto the text
+    /// does not contain.
+    pub tail_duplications: std::sync::atomic::AtomicU64,
     /// Flat-guard chains seen (each is one collapsible `if (c1 || c2 || …)`
     /// candidate).
     pub flat_guard_chains: std::sync::atomic::AtomicU64,
@@ -12198,7 +20696,9 @@ pub static STRUCT_CENSUS: StructCensus = StructCensus {
     flat_empty_same: std::sync::atomic::AtomicU64::new(0),
     flat_empty_stop: std::sync::atomic::AtomicU64::new(0),
     flat_empty_other: std::sync::atomic::AtomicU64::new(0),
+    tail_duplications: std::sync::atomic::AtomicU64::new(0),
     goto_by_reason: [
+        std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
@@ -12242,7 +20742,8 @@ fn classify_structure(sc: &StructuredCfg, loops: &HashMap<usize, LoopInfo>, insn
     use std::sync::atomic::Ordering;
     let m = &STRUCT_CENSUS;
     m.methods.fetch_add(1, Ordering::Relaxed);
-    m.blocks.fetch_add(sc.blocks.len() as u64, Ordering::Relaxed);
+    m.blocks
+        .fetch_add(sc.blocks.len() as u64, Ordering::Relaxed);
 
     // Irreducible edges: non-dominated edges that still close a cycle.
     let n = sc.blocks.len();
@@ -12452,10 +20953,15 @@ pub fn struct_census_report() -> String {
         GotoReason::HandlerPad,
         GotoReason::Uncategorised,
         GotoReason::LoopExit,
+        GotoReason::SplitBoundary,
     ]
     .into_iter()
     .map(|r| (r, g(&m.goto_by_reason[r.idx()])))
     .collect();
+    s.push_str(&format!(
+        "[struct]   shared return tails duplicated instead of jumped to: {}\n",
+        g(&m.tail_duplications)
+    ));
     s.push_str(&format!(
         "[struct]   gotos folded to void returns: {}\n",
         g(&m.goto_return_folds)
@@ -12598,7 +21104,9 @@ fn adjoined_blocks(sc: &StructuredCfg, insns: &[Insn]) -> Vec<bool> {
     // Components of the not-yet-adopted blocks. UNDIRECTED over the CFG's edges:
     // a landing pad reached from another pad has to land in the same component,
     // or the fixpoint below needs one pass per chain link.
-    let mut component: Vec<usize> = (0..n).map(|b| if adopted[b] { b } else { usize::MAX }).collect();
+    let mut component: Vec<usize> = (0..n)
+        .map(|b| if adopted[b] { b } else { usize::MAX })
+        .collect();
     let mut comps: Vec<Vec<usize>> = Vec::new();
     for root in 0..n {
         if adopted[root] || component[root] != usize::MAX {
@@ -12697,10 +21205,7 @@ pub(crate) fn unemitted_blocks() -> (usize, usize) {
 /// or parsing the rendered text.
 #[cfg(test)]
 pub(crate) fn def_resolution_counts() -> (u64, u64) {
-    (
-        DEF_CALLS.with(|c| c.get()),
-        DEF_MAXDEPTH.with(|m| m.get()),
-    )
+    (DEF_CALLS.with(|c| c.get()), DEF_MAXDEPTH.with(|m| m.get()))
 }
 
 /// Test hook: resolve a USE of local `v` at `use_insn` through the real
@@ -12716,7 +21221,7 @@ pub(crate) fn resolve_local_use_for_test(
     v: u32,
 ) -> String {
     let parent_chain: HashMap<i32, Vec<i32>> = HashMap::new();
-    let ctx = MethodCtx::build(&ir.insns, &ir.table, -1, &parent_chain, false);
+    let ctx = MethodCtx::build(&ir.insns, &ir.table, -1, &parent_chain, false, None);
     ctx.cur_insn.set(use_insn);
     let e = ctx.operand_expr(&Operand::Local(v), 0);
     let mut buf = String::new();
@@ -12871,13 +21376,21 @@ pub mod catalog {
         // post-order: children first
         for s in stmts.iter_mut() {
             match s {
-                Stmt::If { then_body, else_body, .. } => {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     apply(then_body);
                     apply(else_body);
                 }
                 Stmt::While { body, .. } => apply(body),
                 Stmt::DoWhile { body, .. } => apply(body),
-                Stmt::Try { try_body, catches, finally_body } => {
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
                     apply(try_body);
                     for (_, body) in catches.iter_mut() {
                         apply(body);
@@ -12893,7 +21406,7 @@ pub mod catalog {
         // ILR_BINDINGS=1 reports per-binding rewrite counts — the only way to
         // tell which catalog entry is actually doing work on real methods, and
         // which one silently never fires.
-        let tally = std::env::var("ILR_BINDINGS").is_ok();
+        let tally = crate::recovery::env_flags::flag("ILR_BINDINGS");
         for b in BINDINGS {
             let mut iters = 0;
             let mut hits = 0usize;
@@ -12934,16 +21447,16 @@ pub mod catalog {
                 _ => continue,
             };
             let Expr::Cmp(k, a, b) = cond else { continue };
-            let alloc_zero = |x: &Expr, y: &Expr| {
-                is_alloc(x) && matches!(y, Expr::Int(0) | Expr::Null)
-            };
+            let alloc_zero =
+                |x: &Expr, y: &Expr| is_alloc(x) && matches!(y, Expr::Int(0) | Expr::Null);
             let eq = matches!(k, CmpKind::Eq);
             let ne = matches!(k, CmpKind::Ne);
             if alloc_zero(a, b) || alloc_zero(b, a) {
                 if eq || ne {
                     *cond = Expr::Bool(ne); // Eq → false, Ne → true
                     n += 1;
-                }            }
+                }
+            }
         }
         n
     }
@@ -13027,7 +21540,7 @@ mod reaching_def_tests {
             address: 0x101c,
         });
 
-        let r = compute_reaching_definitions(&insns);
+        let r = compute_reaching_definitions(&insns, None);
         // Find the join block (the one holding the Return).
         let ret_idx = insns.len() - 1;
         let join = r
@@ -13078,7 +21591,7 @@ mod reaching_def_tests {
             address: 0x2018,
         });
 
-        let r = compute_reaching_definitions(&insns);
+        let r = compute_reaching_definitions(&insns, None);
         let ret_idx = insns.len() - 1;
         let join = r
             .blocks
@@ -13130,14 +21643,22 @@ mod structurer_goto_tests {
         for s in stmts {
             match s {
                 Stmt::Goto(_) => n += 1,
-                Stmt::If { then_body, else_body, .. } => {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     n += count_gotos(then_body);
                     n += count_gotos(else_body);
                 }
                 Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
                     n += count_gotos(body);
                 }
-                Stmt::Try { try_body, catches, finally_body } => {
+                Stmt::Try {
+                    try_body,
+                    catches,
+                    finally_body,
+                } => {
                     n += count_gotos(try_body);
                     for (_, b) in catches {
                         n += count_gotos(b);
@@ -13146,9 +21667,17 @@ mod structurer_goto_tests {
                         n += count_gotos(f);
                     }
                 }
-                Stmt::Switch { cases, tail, .. } => {
+                Stmt::Switch {
+                    cases,
+                    tail,
+                    default,
+                    ..
+                } => {
                     for (_, b) in cases {
                         n += count_gotos(b);
+                    }
+                    if let Some(arm) = default {
+                        n += count_gotos(arm);
                     }
                     n += count_gotos(tail);
                 }
@@ -13163,7 +21692,7 @@ mod structurer_goto_tests {
     }
 
     #[test]
-    fn goto_to_void_return_folds_globally_but_never_in_finally() {
+    fn goto_to_return_folds_globally_but_never_in_finally() {
         let mut stmts = vec![
             Stmt::If {
                 cond: var("nested"),
@@ -13185,13 +21714,25 @@ mod structurer_goto_tests {
             Stmt::Label("Lfinally".into()),
             Stmt::Return(None),
         ];
-        fold_gotos_to_void_return(&mut stmts);
-        assert_eq!(count_gotos(&stmts), 1, "only finally source remains: {stmts:?}");
-        let Stmt::If { then_body, .. } = &stmts[0] else { panic!("missing if"); };
+        fold_gotos_to_return(&mut stmts);
+        assert_eq!(
+            count_gotos(&stmts),
+            1,
+            "only finally source remains: {stmts:?}"
+        );
+        let Stmt::If { then_body, .. } = &stmts[0] else {
+            panic!("missing if");
+        };
         assert!(matches!(then_body.as_slice(), [Stmt::Return(None)]));
-        let Stmt::While { body, .. } = &stmts[1] else { panic!("missing while"); };
+        let Stmt::While { body, .. } = &stmts[1] else {
+            panic!("missing while");
+        };
         assert!(matches!(body.as_slice(), [Stmt::Return(None)]));
-        let Stmt::Try { finally_body: Some(body), .. } = &stmts[5] else {
+        let Stmt::Try {
+            finally_body: Some(body),
+            ..
+        } = &stmts[5]
+        else {
             panic!("missing finally");
         };
         assert!(matches!(body.as_slice(), [Stmt::Goto(label)] if label == "Lfinally"));
@@ -13213,7 +21754,11 @@ mod structurer_goto_tests {
             Stmt::Eval(var("after")),
         ];
         fold_gotos_to_break(&mut loop_stmts);
-        assert_eq!(count_gotos(&loop_stmts), 0, "loop continuation goto remains: {loop_stmts:?}");
+        assert_eq!(
+            count_gotos(&loop_stmts),
+            0,
+            "loop continuation goto remains: {loop_stmts:?}"
+        );
         assert!(render_stmts(&loop_stmts).contains("break;"));
 
         let mut switch_stmts = vec![
@@ -13221,12 +21766,17 @@ mod structurer_goto_tests {
                 disc: "selector".into(),
                 cases: vec![(0, vec![Stmt::Goto("Lafter_switch".into())])],
                 tail: vec![],
-            },
+            
+                default: None,},
             Stmt::Label("Lafter_switch".into()),
             Stmt::Return(None),
         ];
         fold_gotos_to_break(&mut switch_stmts);
-        assert_eq!(count_gotos(&switch_stmts), 0, "switch continuation goto remains: {switch_stmts:?}");
+        assert_eq!(
+            count_gotos(&switch_stmts),
+            0,
+            "switch continuation goto remains: {switch_stmts:?}"
+        );
         assert!(render_stmts(&switch_stmts).contains("break;"));
     }
 
@@ -13243,7 +21793,14 @@ mod structurer_goto_tests {
             else_body: vec![Stmt::Eval(var("else_prefix")), Stmt::Goto("Lshared".into())],
         }];
         fold_shared_if_suffixes(&mut stmts);
-        let Stmt::If { then_body, else_body, .. } = &stmts[0] else { panic!("if lost"); };
+        let Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } = &stmts[0]
+        else {
+            panic!("if lost");
+        };
         assert!(matches!(then_body.as_slice(), [Stmt::Eval(_)]));
         assert!(matches!(else_body.as_slice(), [Stmt::Eval(_)]));
         assert!(matches!(
@@ -13266,7 +21823,11 @@ mod structurer_goto_tests {
         }];
         let mut declaration = declaration;
         fold_shared_if_suffixes(&mut declaration);
-        assert_eq!(count_gotos(&declaration), 1, "declaration scope was moved: {declaration:?}");
+        assert_eq!(
+            count_gotos(&declaration),
+            1,
+            "declaration scope was moved: {declaration:?}"
+        );
 
         let mut external_ref = vec![
             Stmt::If {
@@ -13277,12 +21838,19 @@ mod structurer_goto_tests {
             Stmt::Goto("Lshared".into()),
         ];
         fold_shared_if_suffixes(&mut external_ref);
-        assert_eq!(count_gotos(&external_ref), 1, "the arm continuation goto should fold: {external_ref:?}");
-        assert!(matches!(
-            external_ref.as_slice(),
-            [Stmt::If { .. }, Stmt::Label(label), Stmt::Eval(_), Stmt::Goto(target)]
-                if label == "Lshared" && target == "Lshared"
-        ), "external goto must retain its target after hoisting: {external_ref:?}");
+        assert_eq!(
+            count_gotos(&external_ref),
+            1,
+            "the arm continuation goto should fold: {external_ref:?}"
+        );
+        assert!(
+            matches!(
+                external_ref.as_slice(),
+                [Stmt::If { .. }, Stmt::Label(label), Stmt::Eval(_), Stmt::Goto(target)]
+                    if label == "Lshared" && target == "Lshared"
+            ),
+            "external goto must retain its target after hoisting: {external_ref:?}"
+        );
     }
 
     #[test]
@@ -13295,7 +21863,8 @@ mod structurer_goto_tests {
                         disc: "selector".into(),
                         cases: vec![(0, vec![Stmt::Goto("Lafter_outer".into())])],
                         tail: vec![],
-                    },
+                    
+                        default: None,},
                     Stmt::Try {
                         try_body: vec![],
                         catches: vec![],
@@ -13307,7 +21876,11 @@ mod structurer_goto_tests {
             Stmt::Return(None),
         ];
         fold_gotos_to_break(&mut stmts);
-        assert_eq!(count_gotos(&stmts), 2, "outer-scope or finally goto was folded: {stmts:?}");
+        assert_eq!(
+            count_gotos(&stmts),
+            2,
+            "outer-scope or finally goto was folded: {stmts:?}"
+        );
         assert!(!render_stmts(&stmts).contains("break;"));
     }
 
@@ -13333,10 +21906,16 @@ mod structurer_goto_tests {
             "both guards must fold to nested `if (!c)` shells, got: {stmts:?}"
         );
         // The predicates survive (inverted), the bodies survive nested.
-        let Stmt::If { cond, then_body, .. } = &stmts[0] else {
+        let Stmt::If {
+            cond, then_body, ..
+        } = &stmts[0]
+        else {
             panic!("outer guard did not fold to an if head: {stmts:?}");
         };
-        assert!(matches!(cond, Expr::Not(_)), "outer predicate not inverted: {cond:?}");
+        assert!(
+            matches!(cond, Expr::Not(_)),
+            "outer predicate not inverted: {cond:?}"
+        );
         assert!(
             then_body.iter().any(|s| matches!(s, Stmt::Eval(_))),
             "prelude lost in the fold: {stmts:?}"
@@ -13401,10 +21980,16 @@ mod structurer_goto_tests {
             0,
             "a dead anchor must not block the fold, got: {stmts:?}"
         );
-        let Stmt::If { cond, then_body, .. } = &stmts[0] else {
+        let Stmt::If {
+            cond, then_body, ..
+        } = &stmts[0]
+        else {
             panic!("outer guard did not fold to an if head: {stmts:?}");
         };
-        assert!(matches!(cond, Expr::Not(_)), "outer predicate not inverted: {cond:?}");
+        assert!(
+            matches!(cond, Expr::Not(_)),
+            "outer predicate not inverted: {cond:?}"
+        );
         assert!(
             then_body.iter().any(|s| matches!(s, Stmt::Eval(_))),
             "prelude/body lost in the fold: {stmts:?}"
@@ -13418,7 +22003,10 @@ mod structurer_goto_tests {
 
     #[test]
     fn flat_guard_body_nesting_refuses_scope_changes_and_labels() {
-        let safe_body = vec![Stmt::Eval(var("side_effect")), Stmt::Assign("v1".into(), None, var("value"))];
+        let safe_body = vec![
+            Stmt::Eval(var("side_effect")),
+            Stmt::Assign("v1".into(), None, var("value")),
+        ];
         assert_eq!(flat_guard_body_nesting_refusal(&safe_body, 0, false), None);
         assert_eq!(
             flat_guard_body_nesting_refusal(
@@ -13433,40 +22021,56 @@ mod structurer_goto_tests {
             Some(FlatGuardNestingRefusal::Label)
         );
         let nested = vec![Stmt::If {
-            cond: var("c"), then_body: vec![Stmt::Eval(var("x"))], else_body: vec![]
+            cond: var("c"),
+            then_body: vec![Stmt::Eval(var("x"))],
+            else_body: vec![],
         }];
         assert_eq!(
             flat_guard_body_nesting_refusal(&nested, MAX_NEST_DEPTH, false),
             Some(FlatGuardNestingRefusal::Depth)
         );
-        let replacement = flat_guard_replacement(
-            &var("condition"),
-            &[Stmt::Eval(var("body"))],
-            0,
-            false,
-        ).expect("safe guard gets structured");
-        let Stmt::If { cond: Expr::Not(inner), then_body, else_body } = replacement else {
+        let replacement =
+            flat_guard_replacement(&var("condition"), &[Stmt::Eval(var("body"))], 0, false)
+                .expect("safe guard gets structured");
+        let Stmt::If {
+            cond: Expr::Not(inner),
+            then_body,
+            else_body,
+        } = replacement
+        else {
             panic!("flat guard did not become an inverted if");
         };
         assert!(matches!(*inner, Expr::Var(ref name) if name == "condition"));
         assert_eq!(then_body.len(), 1);
         assert!(else_body.is_empty());
-        assert!(flat_guard_replacement(
-            &var("condition"),
-            &[Stmt::Label("L1".into())],
-            0,
-            false,
-        )
-        .is_none());
+        assert!(
+            flat_guard_replacement(&var("condition"), &[Stmt::Label("L1".into())], 0, false,)
+                .is_none()
+        );
     }
 
     #[test]
     fn flat_guard_allows_labels_with_only_fall_arm_predecessors() {
         let sc = StructuredCfg {
             blocks: vec![
-                BlockInfo { start: 0, end: 1, succ_taken: Some(2), succ_fall: Some(1) },
-                BlockInfo { start: 1, end: 2, succ_taken: None, succ_fall: None },
-                BlockInfo { start: 2, end: 3, succ_taken: None, succ_fall: None },
+                BlockInfo {
+                    start: 0,
+                    end: 1,
+                    succ_taken: Some(2),
+                    succ_fall: Some(1),
+                },
+                BlockInfo {
+                    start: 1,
+                    end: 2,
+                    succ_taken: None,
+                    succ_fall: None,
+                },
+                BlockInfo {
+                    start: 2,
+                    end: 3,
+                    succ_taken: None,
+                    succ_fall: None,
+                },
             ],
             block_of: vec![],
             full_succ: vec![vec![1], vec![], vec![]],
@@ -13474,6 +22078,7 @@ mod structurer_goto_tests {
             label_names: HashSet::from(["L0".into()]),
             idom: vec![None; 3],
             ipdom: vec![None; 3],
+            preds: vec![vec![], vec![0], vec![]],
         };
         let body = vec![Stmt::Label("L0".into()), Stmt::Eval(var("inside"))];
         let fall_blocks = HashSet::from([1]);
@@ -13545,10 +22150,7 @@ mod structurer_goto_tests {
             guard("c1", "J"),
             Stmt::If {
                 cond: var("d"),
-                then_body: vec![
-                    Stmt::Label("Lnested".into()),
-                    Stmt::Eval(var("x")),
-                ],
+                then_body: vec![Stmt::Label("Lnested".into()), Stmt::Eval(var("x"))],
                 else_body: vec![],
             },
             Stmt::Eval(var("body")),
@@ -13620,11 +22222,7 @@ mod structurer_goto_tests {
     #[test]
     fn switch_arms_keep_their_own_guards() {
         let arm = |c: &str, b: &str, t: &str| {
-            vec![
-                guard(c, t),
-                Stmt::Eval(var(b)),
-                Stmt::Label(t.into()),
-            ]
+            vec![guard(c, t), Stmt::Eval(var(b)), Stmt::Label(t.into())]
         };
         let mut stmts = vec![Stmt::Switch {
             disc: "v".into(),
@@ -13634,7 +22232,8 @@ mod structurer_goto_tests {
                 (2, arm("c2", "b2", "T2")),
             ],
             tail: vec![Stmt::Label("Tshared".into())],
-        }];
+        
+            default: None,}];
         branch_repair(&mut stmts);
         let Stmt::Switch { cases, .. } = &stmts[0] else {
             panic!("the switch shell must survive, got: {stmts:?}");
@@ -13665,9 +22264,7 @@ mod structurer_goto_tests {
     /// Predicates are inverted, never deleted; arms are kept.
     #[test]
     fn decided_guard_keeps_the_live_arm() {
-        let ne0 = |v: &str| {
-            Expr::Cmp(CmpKind::Ne, Box::new(var(v)), Box::new(Expr::Int(0)))
-        };
+        let ne0 = |v: &str| Expr::Cmp(CmpKind::Ne, Box::new(var(v)), Box::new(Expr::Int(0)));
         let mut stmts = vec![Stmt::If {
             cond: ne0("v125"),
             then_body: vec![Stmt::If {
@@ -13696,15 +22293,1600 @@ mod structurer_goto_tests {
         let mut stmts = vec![Stmt::Switch {
             disc: "selector".into(),
             cases: vec![
-                (0, vec![Stmt::Label("Lcase1".into()), Stmt::Goto("Lcase2".into())]),
+                (
+                    0,
+                    vec![Stmt::Label("Lcase1".into()), Stmt::Goto("Lcase2".into())],
+                ),
                 (1, vec![Stmt::Label("Lcase2".into()), Stmt::Return(None)]),
             ],
             tail: vec![Stmt::Label("Loutside".into())],
-        }];
+        
+            default: None,}];
         branch_repair(&mut stmts);
         let out = render_stmts(&stmts);
-        assert!(out.contains("goto case 1;"), "case jump was not lowered:\n{out}");
-        assert!(!out.contains("goto Lcase2;"), "old label jump remains:\n{out}");
+        assert!(
+            out.contains("goto case 1;"),
+            "case jump was not lowered:\n{out}"
+        );
+        assert!(
+            !out.contains("goto Lcase2;"),
+            "old label jump remains:\n{out}"
+        );
         assert!(out.contains("return;"), "target arm was lost:\n{out}");
+    }
+}
+
+#[cfg(test)]
+mod array_init_tests {
+    use super::*;
+
+    fn render_expr(e: &Expr) -> String {
+        let mut out = String::new();
+        e.render(&mut out);
+        out
+    }
+
+    #[test]
+    fn render_basic_array_init() {
+        let e = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)],
+        };
+        let out = render_expr(&e);
+        assert_eq!(out, "new int[] { 1, 2, 3 }");
+    }
+
+    #[test]
+    fn render_empty_array_init() {
+        let e = Expr::ArrayInit {
+            elem_type: "string".into(),
+            items: vec![],
+        };
+        let out = render_expr(&e);
+        assert_eq!(out, "new string[] {}");
+    }
+
+    #[test]
+    fn render_array_init_with_complex_items() {
+        let e = Expr::ArrayInit {
+            elem_type: "float".into(),
+            items: vec![
+                Expr::Float(1.0),
+                Expr::Bin(BinOp::Add, Box::new(Expr::Var("x".into())), Box::new(Expr::Int(1))),
+            ],
+        };
+        let out = render_expr(&e);
+        assert_eq!(out, "new float[] { 1f, x + 1 }");
+    }
+
+    #[test]
+    fn precedence_is_leaf() {
+        let e = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1)],
+        };
+        assert_eq!(e.precedence(), 15);
+    }
+
+    #[test]
+    fn structural_equal() {
+        let a = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1), Expr::Int(2)],
+        };
+        let b = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1), Expr::Int(2)],
+        };
+        assert!(exprs_eq(&a, &b));
+    }
+
+    #[test]
+    fn structural_not_equal_different_type() {
+        let a = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1)],
+        };
+        let b = Expr::ArrayInit {
+            elem_type: "float".into(),
+            items: vec![Expr::Int(1)],
+        };
+        assert!(!exprs_eq(&a, &b));
+    }
+
+    #[test]
+    fn structural_not_equal_different_items() {
+        let a = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1), Expr::Int(2)],
+        };
+        let b = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1), Expr::Int(3)],
+        };
+        assert!(!exprs_eq(&a, &b));
+    }
+
+    #[test]
+    fn expr_has_call_true_when_item_has_call() {
+        let e = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![
+                Expr::Int(1),
+                Expr::Call {
+                    recv: None,
+                    name: "Foo".into(),
+                    args: vec![],
+                },
+            ],
+        };
+        assert!(expr_has_call(&e));
+    }
+
+    #[test]
+    fn expr_has_call_false_for_pure_items() {
+        let e = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1), Expr::Int(2)],
+        };
+        assert!(!expr_has_call(&e));
+    }
+
+    #[test]
+    fn expr_effectful_when_item_effectful() {
+        let e = Expr::ArrayInit {
+            elem_type: "object".into(),
+            items: vec![Expr::NewObj("List".into(), vec![])],
+        };
+        assert!(expr_effectful(&e));
+    }
+
+    #[test]
+    fn expr_not_effectful_for_pure_items() {
+        let e = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Int(1), Expr::Int(2)],
+        };
+        assert!(!expr_effectful(&e));
+    }
+
+    #[test]
+    fn collect_used_vars_from_items() {
+        let e = Expr::ArrayInit {
+            elem_type: "int".into(),
+            items: vec![Expr::Var("x".into()), Expr::Var("y".into())],
+        };
+        let mut vars = HashSet::new();
+        collect_used_vars(&e, &mut vars);
+        assert!(vars.contains("x"));
+        assert!(vars.contains("y"));
+        assert_eq!(vars.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lambda body production tests (Phase 5A)
+    // -----------------------------------------------------------------------
+
+    /// `is_lambda_method` matches the compiler-generated lambda pattern.
+    #[test]
+    fn is_lambda_method_detects_generated_names() {
+        assert!(is_lambda_method("<>c.<M>b__1_0"));
+        assert!(is_lambda_method("<>c.<Method>b__0"));
+        assert!(is_lambda_method(
+            "<MyClass>o__DisplayClass3.<Method>b__0"
+        ));
+        assert!(is_lambda_method("<>c__DisplayClass5.<M>b__1"));
+    }
+
+    /// `is_lambda_method` rejects ordinary method names.
+    #[test]
+    fn is_lambda_method_rejects_ordinary_names() {
+        assert!(!is_lambda_method("MyClass.MyMethod"));
+        assert!(!is_lambda_method("Update"));
+        assert!(!is_lambda_method("<>c..cctor"));
+        assert!(!is_lambda_method("<>c.ToString"));
+        assert!(!is_lambda_method(""));
+    }
+
+    /// `extract_lambda_body` accepts a single return statement.
+    #[test]
+    fn extract_lambda_body_accepts_single_return() {
+        let expr = Expr::Field(Box::new(Expr::Var("x".into())), "Value".into());
+        let stmts = vec![Stmt::Return(Some(expr.clone()))];
+        let result = extract_lambda_body(&stmts);
+        assert!(result.is_some(), "a single return must extract");
+        assert!(matches!(result.unwrap(), Expr::Field(..)));
+    }
+
+    /// `extract_lambda_body` accepts a single eval statement (void lambda).
+    #[test]
+    fn extract_lambda_body_accepts_single_eval() {
+        let expr = Expr::Call {
+            recv: None,
+            name: "DoSomething".into(),
+            args: vec![Expr::Var("x".into())],
+        };
+        let stmts = vec![Stmt::Eval(expr)];
+        assert!(extract_lambda_body(&stmts).is_some());
+    }
+
+    /// `extract_lambda_body` rejects multi-statement bodies.
+    #[test]
+    fn extract_lambda_body_rejects_multi_statement() {
+        let stmts = vec![
+            Stmt::Eval(Expr::Var("setup".into())),
+            Stmt::Return(Some(Expr::Var("x".into()))),
+        ];
+        assert!(
+            extract_lambda_body(&stmts).is_none(),
+            "multi-statement bodies must not extract"
+        );
+    }
+
+    /// `extract_lambda_body` rejects a bare return (no expression).
+    #[test]
+    fn extract_lambda_body_rejects_bare_return() {
+        let stmts = vec![Stmt::Return(None)];
+        assert!(extract_lambda_body(&stmts).is_none());
+    }
+
+    /// `extract_lambda_body` rejects an empty body.
+    #[test]
+    fn extract_lambda_body_rejects_empty_body() {
+        let stmts: Vec<Stmt> = vec![];
+        assert!(extract_lambda_body(&stmts).is_none());
+    }
+
+    /// The global registration and lookup round-trips correctly.
+    #[test]
+    fn lambda_body_registration_round_trips() {
+        clear_lambda_bodies();
+        let body = Expr::Var("x".into());
+        register_lambda_body(
+            "<>c.<M>b__1_0".to_string(),
+            vec!["x".to_string()],
+            body.clone(),
+        );
+        let result = lookup_lambda_body("<>c.<M>b__1_0");
+        assert!(result.is_some(), "registered body must be found");
+        let (params, expr) = result.unwrap();
+        assert_eq!(params, vec!["x".to_string()]);
+        assert!(matches!(expr, Expr::Var(ref v) if v == "x"));
+        // An unregistered name returns None.
+        assert!(lookup_lambda_body("<>c.<Other>b__2_0").is_none());
+        clear_lambda_bodies();
+    }
+
+    /// `inject_lambda_bodies` prepends synthetic Assign statements for
+    /// delegate constructions that reference registered lambdas.
+    #[test]
+    fn inject_lambda_bodies_prepends_synthetic_bindings() {
+        clear_lambda_bodies();
+        // Register a lambda body.
+        let body = Expr::Field(Box::new(Expr::Var("x".into())), "Value".into());
+        register_lambda_body(
+            "<>c.<M>b__1_0".to_string(),
+            vec!["x".to_string()],
+            body,
+        );
+        // Build a statement list with a delegate construction referencing it.
+        let mut stmts = vec![Stmt::Assign(
+            "action".to_string(),
+            None,
+            Expr::Call {
+                recv: None,
+                name: "System.Action`1..ctor".into(),
+                args: vec![
+                    Expr::This,
+                    Expr::MethodGroup("<>c.<M>b__1_0".to_string()),
+                ],
+            },
+        )];
+        inject_lambda_bodies(&mut stmts);
+        // The synthetic binding must be prepended.
+        assert!(
+            stmts.len() == 2,
+            "expected 2 statements (injected + original), got {}",
+            stmts.len()
+        );
+        assert!(
+            matches!(&stmts[0], Stmt::Assign(name, None, Expr::Lambda { .. }) if name == "<>c.<M>b__1_0"),
+            "first statement must be the injected lambda binding, got: {:?}",
+            stmts[0]
+        );
+        clear_lambda_bodies();
+    }
+
+    /// `inject_lambda_bodies` is a no-op when no lambdas are referenced.
+    #[test]
+    fn inject_lambda_bodies_is_noop_without_references() {
+        clear_lambda_bodies();
+        let mut stmts = vec![Stmt::Return(Some(Expr::Var("x".into())))];
+        inject_lambda_bodies(&mut stmts);
+        assert_eq!(stmts.len(), 1, "no injection expected");
+        clear_lambda_bodies();
+    }
+
+    /// End-to-end integration: register a lambda body, inject it into a
+    /// statement list with a delegate construction, then run closures::apply
+    /// and verify the construction folds to Expr::Lambda.
+    #[test]
+    fn end_to_end_lambda_body_production_and_closure_folding() {
+        clear_lambda_bodies();
+        // Step 1: Simulate the renderer processing a lambda method.
+        let lambda_body = Expr::Field(Box::new(Expr::Var("x".into())), "Value".into());
+        register_lambda_body(
+            "<>c.<M>b__1_0".to_string(),
+            vec!["x".to_string()],
+            lambda_body,
+        );
+        // Step 2: Build a statement list with a delegate construction.
+        let mut stmts = vec![
+            Stmt::Assign(
+                "action".to_string(),
+                None,
+                Expr::Call {
+                    recv: None,
+                    name: "System.Action`1..ctor".into(),
+                    args: vec![
+                        Expr::This,
+                        Expr::MethodGroup("<>c.<M>b__1_0".to_string()),
+                    ],
+                },
+            ),
+        ];
+        // Step 3: Inject lambda bodies (what render_method_csharp_full_chains does).
+        inject_lambda_bodies(&mut stmts);
+        assert_eq!(stmts.len(), 2, "injected binding + original");
+        // Step 4: Run closures::apply (what reconstruct::apply does).
+        let n = super::super::reconstruct::closures::apply(&mut stmts);
+        assert_eq!(n, 1, "the delegate construction must fold to a lambda");
+        // Step 5: Verify the result is an Expr::Lambda.
+        match &stmts[1] {
+            Stmt::Assign(_, _, Expr::Lambda { params, body }) => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0], "x");
+                assert!(matches!(body.as_ref(), Expr::Field(..)));
+            }
+            other => panic!("expected folded lambda, got: {other:?}"),
+        }
+        clear_lambda_bodies();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Base-call reconstruction tests (Phase 5B)
+// ---------------------------------------------------------------------------
+//
+// The rewrite lives in `call_parts`: when the callee's declaring type is a
+// STRICT ANCESTOR of the current method's declaring type AND the receiver is
+// `this`, the receiver is rewritten to `base`. These tests exercise the
+// detection through `MethodCtx::call_parts` with synthetic parent chains.
+#[cfg(test)]
+mod base_call_tests {
+    use super::*;
+    use crate::recovery::ir::{Insn, Op, Operand};
+    use crate::recovery::locals::{LocalInfo, LocalTable};
+    use crate::recovery::types::{ManagedType, MethodRef, MethodSigInfo};
+    use std::collections::HashMap;
+
+    /// Build a minimal `MethodCtx` with the given declaring TDI and parent chain.
+    fn ctx_with_chain<'a>(
+        insns: &'a [Insn],
+        table: &'a LocalTable,
+        declaring_tdi: i32,
+        parent_chain: &'a HashMap<i32, Vec<i32>>,
+    ) -> MethodCtx<'a> {
+        MethodCtx::build(insns, table, declaring_tdi, parent_chain, false, None)
+    }
+
+    /// Build a `LocalTable` with a `this` local (version 0) and optionally
+    /// extra locals.
+    fn this_table(extra: &[(u32, &str)]) -> LocalTable {
+        let mut t = LocalTable::default();
+        // version 0 = this
+        t.infos.push(LocalInfo {
+            slot_origin: "x0".into(),
+            ty: ManagedType::Object,
+            is_this: true,
+            is_param: None,
+            param_comp: None,
+            is_return_buffer: false,
+            is_incoming_arg: false,
+            is_call_clobber: false,
+        });
+        t.index_of.insert(0, 0);
+        for (v, origin) in extra {
+            let idx = t.infos.len();
+            t.infos.push(LocalInfo {
+                slot_origin: origin.to_string(),
+                ty: ManagedType::Object,
+                is_this: false,
+                is_param: None,
+                param_comp: None,
+                is_return_buffer: false,
+                is_incoming_arg: false,
+                is_call_clobber: false,
+            });
+            t.index_of.insert(*v, idx);
+        }
+        t
+    }
+
+    /// Build a `MethodRef` for an instance method on the given TDI.
+    fn instance_mref(name: &str, tdi: i32) -> MethodRef {
+        MethodRef {
+            image_index: 0,
+            type_def_index: tdi,
+            method_index: 0,
+            name: name.into(),
+            declaring_namespace: "Test".into(),
+            declaring_type_name: format!("Type{tdi}"),
+            assembly: String::new(),
+            sig: MethodSigInfo {
+                ret: ManagedType::Primitive(crate::recovery::types::PrimKind::Void),
+                params: vec![],
+                is_static: false,
+            },
+        }
+    }
+
+    /// Build a `MethodRef` for a static method on the given TDI.
+    fn static_mref(name: &str, tdi: i32) -> MethodRef {
+        MethodRef {
+            image_index: 0,
+            type_def_index: tdi,
+            method_index: 0,
+            name: name.into(),
+            declaring_namespace: "Test".into(),
+            declaring_type_name: format!("Type{tdi}"),
+            assembly: String::new(),
+            sig: MethodSigInfo {
+                ret: ManagedType::Primitive(crate::recovery::types::PrimKind::Void),
+                params: vec![],
+                is_static: true,
+            },
+        }
+    }
+
+    /// Build an `Op::Call` instruction with the given method and receiver local.
+    fn call_insn(m: MethodRef, recv_local: u32) -> Insn {
+        Insn::new(
+            Op::Call,
+            vec![
+                Operand::Method(m),
+                Operand::Unknown, // retv slot
+                Operand::Local(recv_local),
+            ],
+            0x1000,
+        )
+    }
+
+    /// `is_strict_ancestor` returns true for a type in the parent chain that is
+    /// NOT the declaring type itself.
+    #[test]
+    fn is_strict_ancestor_excludes_self() {
+        // Chain: Type10 -> [10, 20, 30] (self first)
+        let mut chain = HashMap::new();
+        chain.insert(10, vec![10, 20, 30]);
+        let table = this_table(&[]);
+        let insns = vec![Insn::new(Op::Nop, vec![], 0x1000)];
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        assert!(!ctx.is_strict_ancestor(10), "self is not a strict ancestor");
+        assert!(ctx.is_strict_ancestor(20), "parent should be a strict ancestor");
+        assert!(ctx.is_strict_ancestor(30), "grandparent should be a strict ancestor");
+        assert!(!ctx.is_strict_ancestor(99), "unrelated type is not an ancestor");
+    }
+
+    /// `is_strict_ancestor` returns false when the parent chain is empty.
+    #[test]
+    fn is_strict_ancestor_false_with_empty_chain() {
+        let chain = HashMap::new();
+        let table = this_table(&[]);
+        let insns = vec![Insn::new(Op::Nop, vec![], 0x1000)];
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        assert!(!ctx.is_strict_ancestor(20), "no chain means no ancestor");
+    }
+
+    /// Instance call on a strict ancestor with `this` receiver → `base.Method()`.
+    #[test]
+    fn base_call_rewrite_on_strict_ancestor() {
+        // Declaring type: TDI 10, parent chain: [10, 20]
+        // Callee: instance method "OnEnter" declared on TDI 20 (the parent)
+        let mut chain = HashMap::new();
+        chain.insert(10, vec![10, 20]);
+        let table = this_table(&[]);
+        let m = instance_mref("OnEnter", 20);
+        let insns = vec![call_insn(m, 0)]; // receiver is local 0 (this)
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        let (recv, name, args) = ctx.call_parts(0, 0).expect("call_parts should succeed");
+        assert!(
+            matches!(recv.as_deref(), Some(Expr::Var(n)) if n == "base"),
+            "receiver should be rewritten to `base`, got {recv:?}"
+        );
+        assert_eq!(name, "OnEnter");
+        assert!(args.is_empty(), "no extra params in this test");
+    }
+
+    /// Instance call on the SAME type is NOT a base call — stays `this.Method()`.
+    #[test]
+    fn same_type_call_is_not_a_base_call() {
+        let mut chain = HashMap::new();
+        chain.insert(10, vec![10, 20]);
+        let table = this_table(&[]);
+        let m = instance_mref("DoStuff", 10); // same declaring type
+        let insns = vec![call_insn(m, 0)];
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        let (recv, name, _) = ctx.call_parts(0, 0).expect("call_parts should succeed");
+        // Receiver should remain `this`, not `base`
+        assert!(
+            matches!(recv.as_deref(), Some(Expr::Var(n)) if n == "this"),
+            "same-type call should keep `this` receiver, got {recv:?}"
+        );
+        assert_eq!(name, "DoStuff");
+    }
+
+    /// Static calls are never rewritten, even if the TDI is an ancestor.
+    #[test]
+    fn static_call_is_never_a_base_call() {
+        let mut chain = HashMap::new();
+        chain.insert(10, vec![10, 20]);
+        let table = this_table(&[]);
+        let m = static_mref("Helper", 20); // static on ancestor
+        let insns = vec![call_insn(m, 0)];
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        let (recv, name, _) = ctx.call_parts(0, 0).expect("call_parts should succeed");
+        // Static calls have no receiver
+        assert!(recv.is_none(), "static call should have no receiver, got {recv:?}");
+        // Name should be qualified: "Type20.Helper"
+        assert!(name.contains("Helper"), "name should contain the method name");
+    }
+
+    /// Call with a non-`this` receiver is NOT rewritten, even on an ancestor.
+    #[test]
+    fn foreign_receiver_is_not_a_base_call() {
+        let mut chain = HashMap::new();
+        chain.insert(10, vec![10, 20]);
+        // Local 5 is NOT `this`
+        let table = this_table(&[(5, "x1")]);
+        let m = instance_mref("OnEnter", 20);
+        let insns = vec![call_insn(m, 5)]; // receiver is local 5, not this
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        let (recv, _, _) = ctx.call_parts(0, 0).expect("call_parts should succeed");
+        // Receiver should NOT be `base` — it's some other object
+        assert!(
+            !matches!(recv.as_deref(), Some(Expr::Var(n)) if n == "base"),
+            "non-this receiver should not become `base`, got {recv:?}"
+        );
+    }
+
+    /// Multiple inheritance levels: grandparent call is also a base call.
+    #[test]
+    fn grandparent_call_is_also_a_base_call() {
+        // Chain: Type10 -> [10, 20, 30] (30 is the grandparent)
+        let mut chain = HashMap::new();
+        chain.insert(10, vec![10, 20, 30]);
+        let table = this_table(&[]);
+        let m = instance_mref("Init", 30); // grandparent
+        let insns = vec![call_insn(m, 0)];
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        let (recv, name, _) = ctx.call_parts(0, 0).expect("call_parts should succeed");
+        assert!(
+            matches!(recv.as_deref(), Some(Expr::Var(n)) if n == "base"),
+            "grandparent call should also be `base`, got {recv:?}"
+        );
+        assert_eq!(name, "Init");
+    }
+
+    /// Call on an unrelated type (not in the chain) is NOT a base call.
+    #[test]
+    fn unrelated_type_call_is_not_a_base_call() {
+        let mut chain = HashMap::new();
+        chain.insert(10, vec![10, 20]);
+        let table = this_table(&[]);
+        let m = instance_mref("Other", 99); // not in chain
+        let insns = vec![call_insn(m, 0)];
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        let (recv, _, _) = ctx.call_parts(0, 0).expect("call_parts should succeed");
+        assert!(
+            !matches!(recv.as_deref(), Some(Expr::Var(n)) if n == "base"),
+            "unrelated type call should not become `base`, got {recv:?}"
+        );
+    }
+
+    /// No parent chain metadata → conservative: no rewrite.
+    #[test]
+    fn no_parent_chain_means_no_rewrite() {
+        let chain = HashMap::new(); // empty — no ancestry info
+        let table = this_table(&[]);
+        let m = instance_mref("OnEnter", 20);
+        let insns = vec![call_insn(m, 0)];
+        let ctx = ctx_with_chain(&insns, &table, 10, &chain);
+
+        let (recv, _, _) = ctx.call_parts(0, 0).expect("call_parts should succeed");
+        assert!(
+            !matches!(recv.as_deref(), Some(Expr::Var(n)) if n == "base"),
+            "without ancestry metadata, must not rewrite, got {recv:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Renderer cleanup tests: negation spelling, early-exit layout, indentation
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod renderer_cleanup_tests {
+    use super::*;
+
+    fn v(n: &str) -> Expr {
+        Expr::Var(n.into())
+    }
+    fn int(n: i64) -> Expr {
+        Expr::Int(n)
+    }
+    fn cmp(k: CmpKind, a: Expr, b: Expr) -> Expr {
+        Expr::Cmp(k, Box::new(a), Box::new(b))
+    }
+    fn not(e: Expr) -> Expr {
+        Expr::Not(Box::new(e))
+    }
+    fn call(name: &str) -> Expr {
+        Expr::Call {
+            recv: None,
+            name: name.into(),
+            args: vec![],
+        }
+    }
+    fn render(e: &Expr) -> String {
+        let mut s = String::new();
+        e.render(&mut s);
+        s
+    }
+
+    #[test]
+    fn double_negation_of_a_call_collapses() {
+        assert_eq!(render(&not(not(call("fn")))), "fn()");
+        // Odd chains leave exactly one `!`.
+        assert_eq!(render(&not(not(not(call("fn"))))), "!fn()");
+        assert_eq!(render(&not(not(call("fn")))), "fn()");
+    }
+
+    #[test]
+    fn double_negation_of_a_comparison_collapses() {
+        let e = not(not(cmp(CmpKind::Lt, v("a"), v("b"))));
+        assert_eq!(render(&e), "a < b");
+    }
+
+    #[test]
+    fn negated_integer_ordering_renders_the_complement() {
+        let e = not(cmp(CmpKind::Gt, v("v66"), v("centeredContentID")));
+        assert_eq!(render(&e), "v66 <= centeredContentID");
+        // Pointer derefs are non-float too.
+        let deref = Expr::RawDeref(Box::new(v("p")), 24, 0);
+        let e = not(cmp(CmpKind::Lt, deref, int(1)));
+        assert_eq!(render(&e), "*(nint*)(p +24) >= 1");
+    }
+
+    #[test]
+    fn negated_equality_renders_the_complement_for_unknown_types() {
+        let field = Expr::Field(Box::new(Expr::This), "flag".into());
+        let e = not(cmp(CmpKind::Eq, field, int(0)));
+        assert_eq!(render(&e), "this.flag != 0");
+    }
+
+    #[test]
+    fn negated_float_ordering_keeps_the_exact_not() {
+        // NaN: !(x >= 30f) is TRUE while x < 30f is false. Both the literal
+        // and the vs-register name prove a float, so the spelling must not
+        // change.
+        let e = not(cmp(CmpKind::Ge, v("in_vs33"), Expr::Float(30.0)));
+        assert_eq!(render(&e), "!(in_vs33 >= 30f)");
+        let e = not(cmp(CmpKind::Gt, v("vs0"), Expr::Double(0.0)));
+        assert_eq!(render(&e), "!(vs0 > 0.0)");
+    }
+
+    #[test]
+    fn collapsed_double_negation_reports_the_operands_precedence() {
+        // `1 + a < b` would re-associate; the effective precedence of `!!cmp`
+        // is comparison precedence, so the parent must parenthesize.
+        let e = Expr::Bin(
+            BinOp::Add,
+            Box::new(int(1)),
+            Box::new(not(not(cmp(CmpKind::Lt, v("a"), v("b"))))),
+        );
+        assert_eq!(render(&e), "1 + (a < b)");
+    }
+
+    #[test]
+    fn non_comparison_negation_keeps_minimal_parens() {
+        let and = Expr::Bin(BinOp::AndAlso, Box::new(cmp(CmpKind::Eq, v("a"), int(0))), Box::new(cmp(CmpKind::Eq, v("b"), int(0))));
+        assert_eq!(render(&not(and)), "!(a == 0 && b == 0)");
+    }
+
+    #[test]
+    fn else_return_becomes_an_early_exit_guard() {
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![
+                Stmt::Assign("y".into(), None, int(1)),
+                Stmt::Eval(call("fn")),
+            ],
+            else_body: vec![Stmt::Return(None)],
+        };
+        assert_eq!(
+            render_stmts(&[s]),
+            "if (x == 0) return;\ny = 1;\nfn();\n"
+        );
+    }
+
+    #[test]
+    fn early_exit_is_refused_when_the_then_arm_has_a_label() {
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Label("L1".into()), Stmt::Assign("y".into(), None, int(1))],
+            else_body: vec![Stmt::Return(None)],
+        };
+        let out = render_stmts(&[s]);
+        assert!(out.contains("if (x != 0)"), "{out}");
+        assert!(out.contains("L1:"), "label definition must survive: {out}");
+        assert!(out.contains("} else"), "braced if/else kept: {out}");
+        assert!(!out.contains("return;\ny = 1;"), "nothing hoisted past a label: {out}");
+    }
+
+    #[test]
+    fn early_exit_is_refused_when_the_then_arm_terminates() {
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Return(None)],
+            else_body: vec![Stmt::Return(None)],
+        };
+        let out = render_stmts(&[s]);
+        assert!(out.contains("} else"), "both-returning arms keep their shape: {out}");
+    }
+
+    #[test]
+    fn early_exit_is_refused_when_a_declaration_would_be_hoisted() {
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Assign("y".into(), Some("int".into()), int(1))],
+            else_body: vec![Stmt::Return(None)],
+        };
+        let out = render_stmts(&[s]);
+        assert!(out.contains("} else"), "declaration stays block-scoped: {out}");
+    }
+
+    #[test]
+    fn early_exit_is_refused_in_an_else_if_position() {
+        let inner = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Assign("y".into(), None, int(1))],
+            else_body: vec![Stmt::Return(None)],
+        };
+        let outer = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("a"), int(0)),
+            then_body: vec![Stmt::Eval(call("t"))],
+            else_body: vec![inner],
+        };
+        let out = render_stmts(&[outer]);
+        assert!(out.contains("else if (x != 0)"), "{out}");
+        assert!(!out.contains("if (x == 0) return;"), "must not hoist past the else: {out}");
+    }
+
+    #[test]
+    fn single_statement_arms_render_braceless() {
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Return(None)],
+            else_body: vec![],
+        };
+        assert_eq!(render_stmts(&[s]), "if (x != 0) return;\n");
+    }
+
+    #[test]
+    fn double_negated_if_condition_prints_once() {
+        let s = Stmt::If {
+            cond: not(not(call("isActive"))),
+            then_body: vec![Stmt::Assign("y".into(), None, int(1)), Stmt::Assign("z".into(), None, int(2))],
+            else_body: vec![],
+        };
+        let out = render_stmts(&[s]);
+        assert!(out.contains("if (isActive())\n"), "{out}");
+        assert!(!out.contains("!("), "{out}");
+    }
+
+    #[test]
+    fn switch_expression_arms_follow_the_statement_indent() {
+        let sw = Expr::SwitchExpr {
+            discrim: Box::new(v("d")),
+            arms: vec![(int(0), int(1))],
+            default_arm: Some(Box::new(int(2))),
+        };
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Assign("y".into(), None, sw)],
+            else_body: vec![],
+        };
+        let out = render_stmts(&[s]);
+        assert!(
+            out.contains("\ty = d switch {\n\t\t0 => 1,\n\t\t_ => 2,\n\t};\n"),
+            "arms must sit one level under the statement, not at column 1:\n{out}"
+        );
+    }
+
+    #[test]
+    fn else_opens_its_brace_on_the_closing_brace_line() {
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Assign("a".into(), None, int(1))],
+            else_body: vec![Stmt::Assign("b".into(), None, int(2))],
+        };
+        let out = render_stmts(&[s]);
+        assert!(out.contains("} else {"), "{out}");
+        assert!(!out.contains("} else\n{"), "{out}");
+    }
+
+    #[test]
+    fn else_if_opens_its_brace_on_the_header_line() {
+        let inner = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("y"), int(0)),
+            then_body: vec![
+                Stmt::Assign("a".into(), None, int(1)),
+                Stmt::Assign("c".into(), None, int(3)),
+            ],
+            else_body: vec![],
+        };
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Assign("b".into(), None, int(2))],
+            else_body: vec![inner],
+        };
+        let out = render_stmts(&[s]);
+        assert!(out.contains("} else if (y != 0) {"), "{out}");
+    }
+
+    #[test]
+    fn multi_line_statement_keeps_braces() {
+        let sw = Expr::SwitchExpr {
+            discrim: Box::new(v("d")),
+            arms: vec![(int(0), int(1))],
+            default_arm: None,
+        };
+        let s = Stmt::If {
+            cond: cmp(CmpKind::Ne, v("x"), int(0)),
+            then_body: vec![Stmt::Assign("y".into(), None, sw)],
+            else_body: vec![],
+        };
+        let out = render_stmts(&[s]);
+        assert!(out.contains("if (x != 0)\n{\n\ty = d switch {"), "{out}");
+    }
+}
+
+fn obj_census_text(ctx: &MethodCtx, rva: u64, obj_lis: &HashSet<usize>) -> String {
+    let mut versions_by_li: HashMap<usize, Vec<u32>> = HashMap::new();
+    for (&v, &li) in &ctx.table.index_of {
+        versions_by_li.entry(li).or_default().push(v);
+    }
+    let mut lis: Vec<usize> = obj_lis.iter().copied().collect();
+    lis.sort_unstable();
+    let mut out = String::new();
+    for li in lis {
+        let Some(info) = ctx.table.infos.get(li) else {
+            continue;
+        };
+        let Some(vers) = versions_by_li.get(&li) else {
+            continue;
+        };
+        let vset: HashSet<u32> = vers.iter().copied().collect();
+        if vset.is_empty() {
+            continue;
+        }
+        let mut defs: HashMap<&'static str, usize> = HashMap::new();
+        let mut ndefs = 0usize;
+        for &v in vers {
+            if let Some(sites) = ctx.def_sites.get(&v) {
+                for &d in sites {
+                    ndefs += 1;
+                    *defs.entry(def_kind(&ctx.insns[d])).or_default() += 1;
+                }
+            }
+        }
+        let mut reads: HashMap<&'static str, usize> = HashMap::new();
+        for insn in ctx.insns {
+            let dst = insn.dest().and_then(|d| d.as_local());
+            let def_pos = match &insn.op {
+                Op::Move => Some(0),
+                Op::Call | Op::CallVoid => Some(1),
+                _ => None,
+            };
+            for (pos, op) in insn.operands.iter().enumerate() {
+                if Some(pos) == def_pos {
+                    continue;
+                }
+                if let (Some(d), Operand::Local(v)) = (dst, op) {
+                    if *v == d {
+                        continue;
+                    }
+                }
+                let role: &'static str = match &insn.op {
+                    Op::Call | Op::CallVoid => {
+                        if pos == 2 {
+                            "call_recv"
+                        } else if pos >= 3 {
+                            "call_arg"
+                        } else {
+                            "call_target"
+                        }
+                    }
+                    Op::Move => "src",
+                    Op::Compare(_) => "cmp",
+                    Op::CondJump(_) => "cond",
+                    Op::Return => "return",
+                    Op::Throw => "throw",
+                    Op::Arith(_) => "arith",
+                    _ => "other",
+                };
+                walk_operand_census(op, role, &vset, &mut reads);
+            }
+        }
+        let addr = vers.iter().any(|v| ctx.address_taken.contains(v));
+        let sret = vers.iter().any(|v| ctx.sret_buffers.contains(v));
+        let mut roots: HashMap<&'static str, usize> = HashMap::new();
+        for &v in vers {
+            let mut seen = HashSet::new();
+            root_kinds(ctx, v, 0, &mut seen, &mut roots);
+        }
+        out.push_str(&format!(
+            "{:#x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\n",
+            rva,
+            li,
+            vers.len(),
+            ndefs,
+            fmt_counts(&defs),
+            reads.values().sum::<usize>(),
+            fmt_counts(&reads),
+            addr as u8,
+            sret as u8,
+            info.slot_origin,
+            fmt_counts(&roots),
+            info.ty,
+        ));
+    }
+    out
+}
+
+fn def_kind(insn: &Insn) -> &'static str {
+    match &insn.op {
+        Op::Call | Op::CallVoid => match insn.operands.first() {
+            Some(Operand::Method(_)) => "call_named",
+            Some(Operand::Immediate(a)) => {
+                if super::runtime_helpers::role_of(*a as u64).is_some() {
+                    "call_helper"
+                } else {
+                    "call_imm"
+                }
+            }
+            _ => "call_other",
+        },
+        Op::Move => match insn.operands.get(1) {
+            Some(Operand::Local(_)) => "alias",
+            Some(Operand::Field(_)) => "field_static",
+            Some(Operand::InstanceField { .. }) => "field_inst",
+            Some(Operand::Memory {
+                index: Some(_), ..
+            }) => "mem_index",
+            Some(Operand::Memory { .. }) => "mem",
+            Some(Operand::ArrayAccess { .. }) => "array_access",
+            Some(Operand::ArrayLength(_)) => "array_len",
+            Some(Operand::Immediate(0)) => "zero",
+            Some(Operand::Immediate(_)) => "imm",
+            Some(Operand::AddressOf(_)) => "addr",
+            Some(Operand::Type(_)) => "type",
+            _ => "move_other",
+        },
+        Op::Phi => "phi",
+        Op::NewObj(_) => "newobj",
+        Op::NewArr(_) => "newarr",
+        _ => "other",
+    }
+}
+
+fn walk_operand_census(
+    op: &Operand,
+    role: &'static str,
+    vset: &HashSet<u32>,
+    out: &mut HashMap<&'static str, usize>,
+) {
+    match op {
+        Operand::Local(v) => {
+            if vset.contains(v) {
+                *out.entry(role).or_default() += 1;
+            }
+        }
+        Operand::Memory { base, index, .. } => {
+            walk_operand_census(base, "mem_base", vset, out);
+            if let Some(i) = index {
+                walk_operand_census(i, "mem_index", vset, out);
+            }
+        }
+        Operand::InstanceField { base, .. } => {
+            walk_operand_census(base, "field_recv", vset, out);
+        }
+        Operand::AddressOf(inner) => walk_operand_census(inner, "addr", vset, out),
+        Operand::ArrayAccess { array, index } => {
+            walk_operand_census(array, "array", vset, out);
+            walk_operand_census(index, "array_index", vset, out);
+        }
+        Operand::ArrayLength(a) => walk_operand_census(a, "array_len", vset, out),
+        _ => {}
+    }
+}
+
+fn root_kinds(
+    ctx: &MethodCtx,
+    v: u32,
+    depth: usize,
+    seen: &mut HashSet<u32>,
+    out: &mut HashMap<&'static str, usize>,
+) {
+    if depth > 16 || !seen.insert(v) {
+        *out.entry("cycle").or_default() += 1;
+        return;
+    }
+    let sites = ctx.def_sites.get(&v).filter(|s| !s.is_empty());
+    let Some(sites) = sites else {
+        classify_leaf(ctx, v, out);
+        seen.remove(&v);
+        return;
+    };
+    for &d in sites {
+        let insn = &ctx.insns[d];
+        match &insn.op {
+            Op::Move => match insn.operands.get(1) {
+                Some(Operand::Local(src)) if *src != v => {
+                    root_kinds(ctx, *src, depth + 1, seen, out);
+                }
+                Some(Operand::Field(_)) | Some(Operand::InstanceField { .. }) => {
+                    *out.entry("field").or_default() += 1;
+                }
+                Some(Operand::Memory { .. })
+                | Some(Operand::ArrayAccess { .. })
+                | Some(Operand::ArrayLength(_)) => {
+                    *out.entry("mem").or_default() += 1;
+                }
+                Some(Operand::Immediate(0)) => {
+                    *out.entry("zero").or_default() += 1;
+                }
+                Some(Operand::Immediate(_)) => {
+                    *out.entry("imm").or_default() += 1;
+                }
+                Some(Operand::AddressOf(_)) => {
+                    *out.entry("addr").or_default() += 1;
+                }
+                _ => {
+                    *out.entry("other").or_default() += 1;
+                }
+            },
+            Op::Call | Op::CallVoid => match insn.operands.first() {
+                Some(Operand::Method(_)) => {
+                    *out.entry("call_named").or_default() += 1;
+                }
+                Some(Operand::Immediate(a)) => {
+                    if super::runtime_helpers::role_of(*a as u64).is_some() {
+                        *out.entry("call_helper").or_default() += 1;
+                    } else {
+                        *out.entry("call_imm").or_default() += 1;
+                    }
+                }
+                _ => {
+                    *out.entry("call_other").or_default() += 1;
+                }
+            },
+            Op::Phi => {
+                let mut any = false;
+                for op in &insn.operands {
+                    if let Operand::Local(src) = op {
+                        if *src != v {
+                            root_kinds(ctx, *src, depth + 1, seen, out);
+                            any = true;
+                        }
+                    }
+                }
+                if !any {
+                    *out.entry("phi_leaf").or_default() += 1;
+                }
+            }
+            Op::NewObj(_) => {
+                *out.entry("newobj").or_default() += 1;
+            }
+            Op::NewArr(_) => {
+                *out.entry("newarr").or_default() += 1;
+            }
+            _ => {
+                *out.entry("other").or_default() += 1;
+            }
+        }
+    }
+    seen.remove(&v);
+}
+
+fn classify_leaf(ctx: &MethodCtx, v: u32, out: &mut HashMap<&'static str, usize>) {
+    if let Some(&li) = ctx.table.index_of.get(&v) {
+        let info = &ctx.table.infos[li];
+        if info.is_this {
+            *out.entry("root_this").or_default() += 1;
+            return;
+        }
+        if info.is_param.is_some() {
+            *out.entry("root_param").or_default() += 1;
+            return;
+        }
+        if MethodCtx::stack_cell_name(&info.slot_origin).is_some() {
+            *out.entry("root_stack").or_default() += 1;
+            return;
+        }
+        if ctx.entry_register_name(v, info).is_some() {
+            *out.entry("root_entry").or_default() += 1;
+            return;
+        }
+    }
+    *out.entry("root_undef").or_default() += 1;
+}
+
+fn fmt_counts(m: &HashMap<&'static str, usize>) -> String {
+    let mut v: Vec<(&str, usize)> = m.iter().map(|(k, c)| (*k, *c)).collect();
+    v.sort_by_key(|(k, _)| *k);
+    v.into_iter()
+        .map(|(k, c)| format!("{k}:{c}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+mod eh_merge_tests {
+    use super::*;
+    use crate::recovery::exceptions::{Clause, EhRegion};
+
+    fn nop(a: u64) -> Insn {
+        Insn::nop(a)
+    }
+    fn jump(a: u64, t: usize) -> Insn {
+        Insn::new(Op::Jump(t), vec![], a)
+    }
+
+    /// Two landing pads (0x1008 in B1, 0x1020 in B4) that both trampoline
+    /// onto the SAME dispatcher root (B3), with ordinary code in B2 between
+    /// them — the shape every multi-call-site try in this corpus has.
+    fn two_rows_one_dispatcher() -> (Vec<Insn>, StructuredCfg) {
+        let insns = vec![
+            nop(0x1000),
+            jump(0x1004, 2),
+            nop(0x1008),
+            jump(0x100c, 6),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(1), Operand::Immediate(7)],
+                0x1010,
+            ),
+            jump(0x1014, 6),
+            Insn::new(Op::Compare(CompareKind::Equal), vec![], 0x1018),
+            Insn::new(Op::CondJump(9), vec![], 0x101c),
+            nop(0x1020),
+            jump(0x1024, 6),
+        ];
+        let sc = analyze_blocks(&insns);
+        (insns, sc)
+    }
+
+    fn catch_row(s: u64, e: u64, pad: u64) -> EhRegion {
+        EhRegion::new(
+            s,
+            e,
+            pad,
+            vec![Clause::Catch {
+                name: "Il2CppExceptionWrapper /* managed catch */".into(),
+            }],
+        )
+    }
+
+    /// E3: two call-site rows of ONE try share a handler, and the handler is a
+    /// selector DISPATCHER, not a trampoline. The old fence required every
+    /// block between the two pads to be a trampoline onto one root, so it
+    /// refused the pair; each row then folded alone and the second rendered
+    /// `catch { goto L<pad> }` because the pad was already consumed.
+    #[test]
+    fn rows_sharing_a_dispatcher_root_are_one_try() {
+        let (insns, sc) = two_rows_one_dispatcher();
+        let rows = [catch_row(0x2000, 0x2010, 0x1008), catch_row(0x2010, 0x2020, 0x1020)];
+        let merged = merge_eh_regions(&rows, &sc, &insns);
+        assert_eq!(merged.len(), 1, "one handler root = one try: {merged:?}");
+        assert_eq!((merged[0].try_start, merged[0].try_end), (0x2000, 0x2020));
+        assert_eq!(merged[0].landing_pad, 0x1008, "the first row names the try");
+    }
+
+    /// Rows with different handler roots are different tries and must never
+    /// fuse, however adjacent their ranges are.
+    #[test]
+    fn rows_with_different_roots_stay_separate() {
+        let (insns, sc) = two_rows_one_dispatcher();
+        // 0x1010 is B2, which does work, so its root is itself — not the
+        // dispatcher B3 that the first row's pad funnels into.
+        let rows = [catch_row(0x2000, 0x2010, 0x1008), catch_row(0x2010, 0x2020, 0x1010)];
+        let merged = merge_eh_regions(&rows, &sc, &insns);
+        assert_eq!(merged.len(), 2, "different roots must not merge: {merged:?}");
+    }
+
+    /// Rows of one try are address-ordered; an overlapping pair must not fuse
+    /// (that would reorder control flow).
+    #[test]
+    fn overlapping_rows_do_not_merge() {
+        let (insns, sc) = two_rows_one_dispatcher();
+        let rows = [catch_row(0x2000, 0x2020, 0x1008), catch_row(0x2010, 0x2030, 0x1020)];
+        let merged = merge_eh_regions(&rows, &sc, &insns);
+        assert_eq!(merged.len(), 2, "overlap must not merge: {merged:?}");
+    }
+
+    /// E8: a chain with no typed arm is the compiler's terminate guard, not a
+    /// C# catch. It must not fold a `try`/`catch` around code that terminates.
+    #[test]
+    fn a_chain_with_no_typed_arm_is_a_terminate_guard() {
+        assert!(is_terminate_guard(&EhRegion::new(
+            0,
+            1,
+            0,
+            vec![Clause::CatchAll]
+        )));
+        assert!(!is_terminate_guard(&EhRegion::new(
+            0,
+            1,
+            0,
+            vec![Clause::Catch { name: "w".into() }, Clause::Cleanup]
+        )));
+        assert!(!is_terminate_guard(&EhRegion::new(
+            0,
+            1,
+            0,
+            vec![Clause::Cleanup]
+        )));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared-return-tail duplication
+// ---------------------------------------------------------------------------
+
+/// The compiler merges every `return x;` of a method into ONE shared epilogue
+/// and the structurer used to emit that epilogue once, turning every other
+/// return site into `goto L`. `duplicable_tail` inlines a small
+/// straight-line chain that ends in Return/Throw at the jump site instead.
+#[cfg(test)]
+mod shared_tail_tests {
+    use super::*;
+
+    fn table(ids: &[u32]) -> LocalTable {
+        let mut t = LocalTable::default();
+        for (i, id) in ids.iter().enumerate() {
+            t.infos.push(super::super::locals::LocalInfo {
+                // Distinct origins: the synthetic IR uses one slot per value, so
+                // a shared origin would give every local the SAME rendered name
+                // and let text-based dedup passes fold genuinely different
+                // conditions into one.
+                slot_origin: format!("x{}", i + 9),
+                ty: ManagedType::Unknown,
+                is_this: false,
+                is_param: None,
+                param_comp: None,
+                is_incoming_arg: false,
+                is_call_clobber: false,
+                is_return_buffer: false,
+            });
+            t.index_of.insert(*id, i);
+        }
+        t
+    }
+
+    fn render(insns: Vec<Insn>) -> String {
+        let ids: Vec<u32> = (1..=6).collect();
+        let ir = super::super::RecoveredIr {
+            insns,
+            table: table(&ids),
+            returns_value: false,
+            base_rva: 0x9000,
+        };
+        render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1)
+    }
+
+    /// A local defined by an allocation and read at a use site must have its
+    /// allocation STATEMENT. The use site never inlines a `new` (that would
+    /// allocate a second object and abandon the first), so it references the
+    /// name — and with no statement the name is undefined. That is the
+    /// `def-dropped:NewObj` class: `return this.Set<object>(v62);` with no
+    /// `v62 = new JSONObject();` anywhere in the body.
+    #[test]
+    fn an_allocation_read_at_a_use_site_is_defined() {
+        let insns = vec![
+            Insn::new(
+                Op::NewObj(Some(crate::recovery::ir::NamedTypeRef {
+                    ty: crate::recovery::types::NamedType {
+                        namespace: "HoudiniEngineUnity".into(),
+                        name: "JSONObject".into(),
+                        assembly: None,
+                        type_def_index: 7398,
+                    },
+                })),
+                vec![Operand::Local(5)],
+                0x9000,
+            ),
+            Insn::new(
+                Op::Call,
+                vec![Operand::imm(0x2222), Operand::Local(6), Operand::Local(5)],
+                0x9004,
+            ),
+            Insn::new(Op::Return, vec![], 0x9008),
+        ];
+        let out = render(insns);
+        assert!(
+            out.contains("new JSONObject()"),
+            "the allocation must reach the text:\n{out}"
+        );
+        assert!(
+            !out.contains("v5"),
+            "a use site must not reference an unbound allocation name:\n{out}"
+        );
+    }
+
+
+    /// Two guards, one shared `call; return` epilogue. The epilogue is emitted
+    /// inside the FIRST guard's arm, so the second guard's edge to it is a
+    /// backward jump to an already-emitted block — the exact shape of the
+    /// canary 0x18141F0. The source had two copies, so both must be emitted.
+    #[test]
+    fn a_shared_return_tail_is_duplicated_not_jumped_to() {
+        let insns = vec![
+            //  B0: if (v1 != 0) goto B3
+            Insn::new(
+                Op::Compare(CompareKind::NotEqual),
+                vec![Operand::Local(3), Operand::Local(1), Operand::imm(0)],
+                0x9000,
+            ),
+            Insn::new(Op::CondJump(5), vec![Operand::Local(3)], 0x9004),
+            //  B1: if (v2 != 0) goto B3
+            Insn::new(
+                Op::Compare(CompareKind::NotEqual),
+                vec![Operand::Local(4), Operand::Local(2), Operand::imm(0)],
+                0x9008,
+            ),
+            Insn::new(Op::CondJump(5), vec![Operand::Local(4)], 0x900c),
+            //  B2: goto B4
+            Insn::new(Op::Jump(7), vec![], 0x9010),
+            //  B3: the shared tail — v5 = fn_2222(v1); goto B4
+            Insn::new(
+                Op::Call,
+                vec![Operand::imm(0x2222), Operand::Local(5), Operand::Local(1)],
+                0x9014,
+            ),
+            Insn::new(Op::Jump(7), vec![], 0x9018),
+            //  B4: return
+            Insn::new(Op::Return, vec![], 0x901c),
+        ];
+        let out = render(insns);
+        assert!(
+            !out.contains("goto"),
+            "the shared tail must be inlined at the second site, not jumped to:\n{out}"
+        );
+        assert_eq!(
+            out.matches("fn_2222(").count(),
+            2,
+            "both source sites must carry the tail:\n{out}"
+        );
+    }
+
+
+
+    /// The same shape, but the chain is CONDITIONAL — it is not a tail, it is
+    /// structure of its own, so the jump must survive (the copy would need its
+    /// own arms and could duplicate a side effect on one path).
+    #[test]
+    fn a_conditional_chain_is_not_duplicated() {
+        let insns = vec![
+            //  B0: if (v1 != 0) goto B3
+            Insn::new(
+                Op::Compare(CompareKind::NotEqual),
+                vec![Operand::Local(3), Operand::Local(1), Operand::imm(0)],
+                0x9000,
+            ),
+            Insn::new(Op::CondJump(5), vec![Operand::Local(3)], 0x9004),
+            //  B1: if (v2 != 0) goto B3
+            Insn::new(
+                Op::Compare(CompareKind::NotEqual),
+                vec![Operand::Local(4), Operand::Local(2), Operand::imm(0)],
+                0x9008,
+            ),
+            Insn::new(Op::CondJump(5), vec![Operand::Local(4)], 0x900c),
+            //  B2: goto B4
+            Insn::new(Op::Jump(7), vec![], 0x9010),
+            //  B3: the shared tail — v5 = fn_2222(v1); goto B4
+            Insn::new(
+                Op::Call,
+                vec![Operand::imm(0x2222), Operand::Local(5), Operand::Local(1)],
+                0x9014,
+            ),
+            Insn::new(Op::CondJump(7), vec![Operand::Local(5)], 0x9018),
+            //  B4: return
+            Insn::new(Op::Return, vec![], 0x901c),
+        ];
+        let out = render(insns);
+        // The tail must not be COPIED (that is what this test is about): a
+        // conditional tail would need its own arms at each site and could run
+        // its side effect on one path only. Whether the surviving structure is
+        // a jump or a folded guard is the structurer's choice — the fold that
+        // removes the jump is sound as long as the call survives exactly once.
+        assert_eq!(
+            out.matches("fn_2222(").count(),
+            1,
+            "a conditional tail must not be duplicated:\n{out}"
+        );
+        assert!(
+            out.contains("fn_2222("),
+            "the tail's call must survive the guard fold:\n{out}"
+        );
+        // ...and no dangling reference is left behind. The rejected tail was
+        // the binding's only reader, so the dead `v4 = …` store is dropped by
+        // `dead_write_only`; the call itself must survive, and nothing may
+        // still spell the unbound name.
+        assert!(
+            !out.contains("v4"),
+            "the rejected tail must not leave an unbound name:\n{out}"
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod type_text_tests {
+    use super::expand_arity;
+
+    /// A backtick is metadata arity syntax and cannot appear in a C#
+    /// identifier, so a type rendered from the bare definition does not
+    /// compile. With no instantiation available the metadata's own
+    /// shared-generic argument is `object`.
+    #[test]
+    fn an_open_generic_expands_to_object_arguments() {
+        assert_eq!(expand_arity("Dictionary`2"), "Dictionary<object, object>");
+        assert_eq!(expand_arity("List`1"), "List<object>");
+        assert_eq!(expand_arity("Action`3"), "Action<object, object, object>");
+    }
+
+    #[test]
+    fn a_closed_or_plain_name_is_untouched() {
+        assert_eq!(expand_arity("Dictionary<int, object>"), "Dictionary<int, object>");
+        assert_eq!(expand_arity("Token"), "Token");
+        assert_eq!(expand_arity("Dictionary`0"), "Dictionary`0");
+        assert_eq!(expand_arity("Dictionary`x"), "Dictionary`x");
+    }
+}
+
+#[cfg(test)]
+mod switch_group_tests {
+    use super::*;
+
+    fn render(s: &Stmt) -> String {
+        let mut r = Renderer::new();
+        r.stmt(s);
+        r.out
+    }
+
+    #[test]
+    fn identical_adjacent_arms_share_one_label_run() {
+        let sw = Stmt::Switch {
+            disc: "x".into(),
+            cases: vec![
+                (1, vec![Stmt::Return(None)]),
+                (2, vec![Stmt::Return(None)]),
+                (3, vec![Stmt::Break]),
+            ],
+            tail: vec![],
+            default: None,
+        };
+        let out = render(&sw);
+        assert_eq!(out.matches("return;").count(), 1, "{out}");
+        let one = out.find("case 1:").unwrap();
+        let two = out.find("case 2:").unwrap();
+        let ret = out.find("return;").unwrap();
+        assert!(one < two && two < ret, "{out}");
+    }
+
+    #[test]
+    fn a_trailing_default_with_the_same_body_joins_the_run() {
+        let sw = Stmt::Switch {
+            disc: "x".into(),
+            cases: vec![(9, vec![Stmt::Break]), (10, vec![Stmt::Break])],
+            tail: vec![],
+            default: Some(vec![Stmt::Break]),
+        };
+        let out = render(&sw);
+        assert_eq!(out.matches("break;").count(), 1, "{out}");
+        assert!(out.find("case 9:").unwrap() < out.find("case 10:").unwrap());
+        assert!(out.find("case 10:").unwrap() < out.find("default:").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod new_result_guard_tests {
+    use super::*;
+
+    fn new_assign(name: &str) -> Stmt {
+        Stmt::Assign(name.into(), None, Expr::NewObj("T".into(), vec![]))
+    }
+
+    fn guard(name: &str) -> Stmt {
+        Stmt::If {
+            cond: Expr::Cmp(
+                CmpKind::Eq,
+                Box::new(Expr::Var(name.into())),
+                Box::new(Expr::Null),
+            ),
+            then_body: vec![Stmt::Return(None)],
+            else_body: vec![],
+        }
+    }
+
+    #[test]
+    fn a_null_guard_on_a_fresh_allocation_is_removed() {
+        let mut s = vec![new_assign("x"), guard("x")];
+        assert_eq!(strip_new_result_guards(&mut s), 1);
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn a_guard_after_unrelated_statements_is_removed() {
+        let mut s = vec![
+            new_assign("x"),
+            Stmt::If {
+                cond: Expr::Cmp(
+                    CmpKind::Eq,
+                    Box::new(Expr::StaticField("T".into(), "Init".into())),
+                    Box::new(Expr::Int(0)),
+                ),
+                then_body: vec![Stmt::Assign(
+                    "boxed".into(),
+                    Some("var".into()),
+                    Expr::Call {
+                        recv: None,
+                        name: "Box".into(),
+                        args: vec![Expr::Var("y".into())],
+                    },
+                )],
+                else_body: vec![],
+            },
+            guard("x"),
+        ];
+        assert_eq!(strip_new_result_guards(&mut s), 1);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn a_guard_after_the_local_is_reassigned_is_kept() {
+        let mut s = vec![
+            new_assign("x"),
+            Stmt::Assign("x".into(), None, Expr::Null),
+            guard("x"),
+        ];
+        assert_eq!(strip_new_result_guards(&mut s), 0);
+        assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn a_guard_on_an_ordinary_local_is_kept() {
+        let mut s = vec![Stmt::Eval(Expr::Var("x".into())), guard("x")];
+        assert_eq!(strip_new_result_guards(&mut s), 0);
+        assert_eq!(s.len(), 2);
     }
 }

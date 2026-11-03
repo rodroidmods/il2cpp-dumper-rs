@@ -96,10 +96,14 @@ impl CppType {
     pub fn size_bytes(&self) -> u32 {
         match self {
             CppType::Primitive { size_bytes, .. } => *size_bytes,
-            CppType::Pointer { word_size_bytes, .. } => *word_size_bytes,
+            CppType::Pointer {
+                word_size_bytes, ..
+            } => *word_size_bytes,
             CppType::Array { element, length } => element.size_bytes().saturating_mul(*length),
             CppType::Alias { element, .. } => element.size_bytes(),
-            CppType::FnPtr { word_size_bytes, .. } => *word_size_bytes,
+            CppType::FnPtr {
+                word_size_bytes, ..
+            } => *word_size_bytes,
             CppType::Complex { size_bytes, .. } => *size_bytes,
             CppType::Enum { underlying, .. } => underlying.size_bytes(),
             CppType::ForwardDeclaration { .. } => 0,
@@ -108,12 +112,20 @@ impl CppType {
 
     pub fn alignment_bytes(&self) -> u32 {
         match self {
-            CppType::Primitive { alignment_bytes, .. } => *alignment_bytes,
-            CppType::Pointer { word_size_bytes, .. } => *word_size_bytes,
+            CppType::Primitive {
+                alignment_bytes, ..
+            } => *alignment_bytes,
+            CppType::Pointer {
+                word_size_bytes, ..
+            } => *word_size_bytes,
             CppType::Array { element, .. } => element.alignment_bytes(),
             CppType::Alias { element, .. } => element.alignment_bytes(),
-            CppType::FnPtr { word_size_bytes, .. } => *word_size_bytes,
-            CppType::Complex { alignment_bytes, .. } => *alignment_bytes,
+            CppType::FnPtr {
+                word_size_bytes, ..
+            } => *word_size_bytes,
+            CppType::Complex {
+                alignment_bytes, ..
+            } => *alignment_bytes,
             CppType::Enum { underlying, .. } => underlying.alignment_bytes(),
             CppType::ForwardDeclaration { .. } => 0,
         }
@@ -126,7 +138,10 @@ impl CppType {
     pub fn is_complex_struct(&self) -> bool {
         matches!(
             self,
-            CppType::Complex { kind: ComplexValueKind::Struct | ComplexValueKind::Class, .. }
+            CppType::Complex {
+                kind: ComplexValueKind::Struct | ComplexValueKind::Class,
+                ..
+            }
         )
     }
 
@@ -170,7 +185,11 @@ impl CppType {
             CppType::Array { element, length } => {
                 format!("{} [{length}]", element.to_field_string(field_name))
             }
-            CppType::FnPtr { return_type, arguments, .. } => {
+            CppType::FnPtr {
+                return_type,
+                arguments,
+                ..
+            } => {
                 let args = arguments
                     .iter()
                     .map(|(n, t)| {

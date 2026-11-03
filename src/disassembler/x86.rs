@@ -1,5 +1,7 @@
-use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter, Mnemonic, OpKind, Register};
-use super::{DisassembledInstruction, RegRegAccess, ConstantOp, LoadInfo};
+use super::{ConstantOp, DisassembledInstruction, LoadInfo, RegRegAccess};
+use iced_x86::{
+    Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter, Mnemonic, OpKind, Register,
+};
 
 pub const RIP_PSEUDO_REG: u16 = u16::MAX;
 
@@ -14,7 +16,9 @@ pub fn disassemble_x86(
     let mut formatter = IntelFormatter::new();
 
     formatter.options_mut().set_uppercase_mnemonics(true);
-    formatter.options_mut().set_space_after_operand_separator(true);
+    formatter
+        .options_mut()
+        .set_space_after_operand_separator(true);
     formatter.options_mut().set_hex_prefix("0x");
     formatter.options_mut().set_hex_suffix("");
     formatter.options_mut().set_branch_leading_zeros(false);
@@ -32,10 +36,7 @@ pub fn disassemble_x86(
 
         let (mnemonic_str, operands) = split_mnemonic_operands(&output);
 
-        let is_return = matches!(
-            instruction.mnemonic(),
-            Mnemonic::Ret | Mnemonic::Retf
-        );
+        let is_return = matches!(instruction.mnemonic(), Mnemonic::Ret | Mnemonic::Retf);
 
         let is_call = matches!(instruction.mnemonic(), Mnemonic::Call);
 
@@ -72,7 +73,9 @@ pub fn disassemble_x86(
         let load_info = extract_x86_load_info(&instruction);
         let indirect_call_reg = if is_call && call_target.is_none() {
             extract_x86_indirect_call_reg(&instruction)
-        } else { None };
+        } else {
+            None
+        };
 
         let jmp_mem_reg = if matches!(instruction.mnemonic(), Mnemonic::Jmp) {
             extract_x86_jmp_mem_reg(&instruction)
@@ -135,12 +138,27 @@ fn split_mnemonic_operands(text: &str) -> (String, String) {
 fn is_jcc_mnemonic(instruction: &Instruction) -> bool {
     matches!(
         instruction.mnemonic(),
-        Mnemonic::Ja | Mnemonic::Jae | Mnemonic::Jb | Mnemonic::Jbe
-        | Mnemonic::Je | Mnemonic::Jne | Mnemonic::Jg | Mnemonic::Jge
-        | Mnemonic::Jl | Mnemonic::Jle | Mnemonic::Jo | Mnemonic::Jno
-        | Mnemonic::Jp | Mnemonic::Jnp | Mnemonic::Js | Mnemonic::Jns
-        | Mnemonic::Jecxz | Mnemonic::Jrcxz
-        | Mnemonic::Loop | Mnemonic::Loope | Mnemonic::Loopne
+        Mnemonic::Ja
+            | Mnemonic::Jae
+            | Mnemonic::Jb
+            | Mnemonic::Jbe
+            | Mnemonic::Je
+            | Mnemonic::Jne
+            | Mnemonic::Jg
+            | Mnemonic::Jge
+            | Mnemonic::Jl
+            | Mnemonic::Jle
+            | Mnemonic::Jo
+            | Mnemonic::Jno
+            | Mnemonic::Jp
+            | Mnemonic::Jnp
+            | Mnemonic::Js
+            | Mnemonic::Jns
+            | Mnemonic::Jecxz
+            | Mnemonic::Jrcxz
+            | Mnemonic::Loop
+            | Mnemonic::Loope
+            | Mnemonic::Loopne
     )
 }
 
@@ -211,32 +229,55 @@ fn extract_memory_offset(instruction: &Instruction) -> Option<i64> {
 }
 
 fn extract_x86_load_info(instruction: &Instruction) -> Option<LoadInfo> {
-    let is_load = matches!(instruction.mnemonic(),
+    let is_load = matches!(
+        instruction.mnemonic(),
         Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Movbe
     );
-    if !is_load { return None; }
-    if instruction.op_count() < 2 { return None; }
-    if instruction.op0_kind() != OpKind::Register { return None; }
-    if instruction.op1_kind() != OpKind::Memory { return None; }
-    if instruction.memory_index() != Register::None { return None; }
+    if !is_load {
+        return None;
+    }
+    if instruction.op_count() < 2 {
+        return None;
+    }
+    if instruction.op0_kind() != OpKind::Register {
+        return None;
+    }
+    if instruction.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    if instruction.memory_index() != Register::None {
+        return None;
+    }
 
     let base = instruction.memory_base();
     let dest = normalize_x86_reg(instruction.op0_register());
 
     if base == Register::RIP {
         let abs_va = instruction.ip_rel_memory_address();
-        return Some(LoadInfo { dest_reg: dest, base_reg: RIP_PSEUDO_REG, offset: abs_va as i64 });
+        return Some(LoadInfo {
+            dest_reg: dest,
+            base_reg: RIP_PSEUDO_REG,
+            offset: abs_va as i64,
+        });
     }
 
-    if base == Register::None { return None; }
+    if base == Register::None {
+        return None;
+    }
 
     let base_norm = normalize_x86_reg(base);
     let offset = instruction.memory_displacement64() as i64;
-    Some(LoadInfo { dest_reg: dest, base_reg: base_norm, offset })
+    Some(LoadInfo {
+        dest_reg: dest,
+        base_reg: base_norm,
+        offset,
+    })
 }
 
 fn extract_x86_indirect_call_reg(instruction: &Instruction) -> Option<u16> {
-    if instruction.mnemonic() != Mnemonic::Call { return None; }
+    if instruction.mnemonic() != Mnemonic::Call {
+        return None;
+    }
     if instruction.op0_kind() == OpKind::Register {
         return Some(normalize_x86_reg(instruction.op0_register()));
     }
@@ -244,7 +285,9 @@ fn extract_x86_indirect_call_reg(instruction: &Instruction) -> Option<u16> {
 }
 
 fn extract_x86_jmp_mem_reg(instruction: &Instruction) -> Option<u16> {
-    if instruction.mnemonic() != Mnemonic::Jmp { return None; }
+    if instruction.mnemonic() != Mnemonic::Jmp {
+        return None;
+    }
     if instruction.op0_kind() == OpKind::Register {
         return Some(normalize_x86_reg(instruction.op0_register()));
     }
@@ -262,7 +305,9 @@ fn extract_x86_reg_reg_access(instruction: &Instruction) -> Option<RegRegAccess>
         };
         kind == OpKind::Memory
     });
-    if !has_mem_op { return None; }
+    if !has_mem_op {
+        return None;
+    }
 
     let index = instruction.memory_index();
     if index != Register::None {
@@ -292,21 +337,46 @@ pub fn normalize_x86_reg(reg: Register) -> u16 {
 
 fn is_x86_gp_register(reg: Register) -> bool {
     let full = reg.full_register();
-    matches!(full,
-        Register::RAX | Register::RCX | Register::RDX | Register::RBX
-        | Register::RSP | Register::RBP | Register::RSI | Register::RDI
-        | Register::R8 | Register::R9 | Register::R10 | Register::R11
-        | Register::R12 | Register::R13 | Register::R14 | Register::R15
-        | Register::EAX | Register::ECX | Register::EDX | Register::EBX
-        | Register::ESP | Register::EBP | Register::ESI | Register::EDI
+    matches!(
+        full,
+        Register::RAX
+            | Register::RCX
+            | Register::RDX
+            | Register::RBX
+            | Register::RSP
+            | Register::RBP
+            | Register::RSI
+            | Register::RDI
+            | Register::R8
+            | Register::R9
+            | Register::R10
+            | Register::R11
+            | Register::R12
+            | Register::R13
+            | Register::R14
+            | Register::R15
+            | Register::EAX
+            | Register::ECX
+            | Register::EDX
+            | Register::EBX
+            | Register::ESP
+            | Register::EBP
+            | Register::ESI
+            | Register::EDI
     )
 }
 
 fn is_x86_immediate(kind: OpKind) -> bool {
-    matches!(kind,
-        OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate32
-        | OpKind::Immediate64 | OpKind::Immediate8to16 | OpKind::Immediate8to32
-        | OpKind::Immediate8to64 | OpKind::Immediate32to64
+    matches!(
+        kind,
+        OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64
     )
 }
 
@@ -321,56 +391,99 @@ fn get_x86_immediate(instruction: &Instruction, op_index: u32) -> u64 {
 fn extract_x86_constant_op(instruction: &Instruction) -> Option<ConstantOp> {
     match instruction.mnemonic() {
         Mnemonic::Mov => {
-            if instruction.op_count() < 2 { return None; }
-            if instruction.op0_kind() != OpKind::Register { return None; }
+            if instruction.op_count() < 2 {
+                return None;
+            }
+            if instruction.op0_kind() != OpKind::Register {
+                return None;
+            }
             let dest = normalize_x86_reg(instruction.op0_register());
             if is_x86_immediate(instruction.op1_kind()) {
                 let value = get_x86_immediate(instruction, 1);
-                return Some(ConstantOp::MovImm { dest_reg: dest, value });
+                return Some(ConstantOp::MovImm {
+                    dest_reg: dest,
+                    value,
+                });
             }
             if instruction.op1_kind() == OpKind::Register {
                 let src = normalize_x86_reg(instruction.op1_register());
-                return Some(ConstantOp::MovReg { dest_reg: dest, src_reg: src });
+                return Some(ConstantOp::MovReg {
+                    dest_reg: dest,
+                    src_reg: src,
+                });
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
         Mnemonic::Xor => {
-            if instruction.op_count() < 2 { return None; }
-            if instruction.op0_kind() != OpKind::Register { return None; }
+            if instruction.op_count() < 2 {
+                return None;
+            }
+            if instruction.op0_kind() != OpKind::Register {
+                return None;
+            }
             let dest = normalize_x86_reg(instruction.op0_register());
             if instruction.op1_kind() == OpKind::Register
-                && instruction.op0_register().full_register() == instruction.op1_register().full_register()
+                && instruction.op0_register().full_register()
+                    == instruction.op1_register().full_register()
             {
-                return Some(ConstantOp::MovImm { dest_reg: dest, value: 0 });
+                return Some(ConstantOp::MovImm {
+                    dest_reg: dest,
+                    value: 0,
+                });
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
         Mnemonic::Add | Mnemonic::Sub => {
-            if instruction.op_count() < 2 { return None; }
-            if instruction.op0_kind() != OpKind::Register { return None; }
+            if instruction.op_count() < 2 {
+                return None;
+            }
+            if instruction.op0_kind() != OpKind::Register {
+                return None;
+            }
             let dest = normalize_x86_reg(instruction.op0_register());
             if instruction.op1_kind() == OpKind::Register {
                 let src = normalize_x86_reg(instruction.op1_register());
-                let imm: i64 = if instruction.mnemonic() == Mnemonic::Sub { -1 } else { 1 };
+                let imm: i64 = if instruction.mnemonic() == Mnemonic::Sub {
+                    -1
+                } else {
+                    1
+                };
                 let _ = imm;
-                return Some(ConstantOp::AddSubImm { dest_reg: dest, src_reg: src, imm: 0 });
+                return Some(ConstantOp::AddSubImm {
+                    dest_reg: dest,
+                    src_reg: src,
+                    imm: 0,
+                });
             }
             if is_x86_immediate(instruction.op1_kind()) {
                 let imm = get_x86_immediate(instruction, 1) as i64;
-                let imm = if instruction.mnemonic() == Mnemonic::Sub { -imm } else { imm };
-                return Some(ConstantOp::AddSubImm { dest_reg: dest, src_reg: dest, imm });
+                let imm = if instruction.mnemonic() == Mnemonic::Sub {
+                    -imm
+                } else {
+                    imm
+                };
+                return Some(ConstantOp::AddSubImm {
+                    dest_reg: dest,
+                    src_reg: dest,
+                    imm,
+                });
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
         Mnemonic::Lea => {
-            if instruction.op0_kind() != OpKind::Register { return None; }
+            if instruction.op0_kind() != OpKind::Register {
+                return None;
+            }
             let dest = normalize_x86_reg(instruction.op0_register());
             if instruction.op1_kind() == OpKind::Memory
                 && instruction.memory_base() == Register::RIP
                 && instruction.memory_index() == Register::None
             {
                 let abs_va = instruction.ip_rel_memory_address();
-                return Some(ConstantOp::Adrp { dest_reg: dest, page: abs_va });
+                return Some(ConstantOp::Adrp {
+                    dest_reg: dest,
+                    page: abs_va,
+                });
             }
             if instruction.op1_kind() == OpKind::Memory
                 && instruction.memory_index() == Register::None
@@ -379,7 +492,11 @@ fn extract_x86_constant_op(instruction: &Instruction) -> Option<ConstantOp> {
             {
                 let src = normalize_x86_reg(instruction.memory_base());
                 let imm = instruction.memory_displacement64() as i64;
-                return Some(ConstantOp::AddSubImm { dest_reg: dest, src_reg: src, imm });
+                return Some(ConstantOp::AddSubImm {
+                    dest_reg: dest,
+                    src_reg: src,
+                    imm,
+                });
             }
             if instruction.op1_kind() == OpKind::Memory
                 && instruction.memory_index() == Register::None
@@ -387,25 +504,38 @@ fn extract_x86_constant_op(instruction: &Instruction) -> Option<ConstantOp> {
             {
                 let disp = instruction.memory_displacement64();
                 if disp > 0 {
-                    return Some(ConstantOp::MovImm { dest_reg: dest, value: disp });
+                    return Some(ConstantOp::MovImm {
+                        dest_reg: dest,
+                        value: disp,
+                    });
                 }
             }
             Some(ConstantOp::Kill { dest_reg: dest })
         }
         Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Movbe => {
-            if instruction.op0_kind() != OpKind::Register { return None; }
+            if instruction.op0_kind() != OpKind::Register {
+                return None;
+            }
             let dest = normalize_x86_reg(instruction.op0_register());
             Some(ConstantOp::Kill { dest_reg: dest })
         }
         Mnemonic::And => {
-            if instruction.op_count() < 2 { return None; }
-            if instruction.op0_kind() != OpKind::Register { return None; }
+            if instruction.op_count() < 2 {
+                return None;
+            }
+            if instruction.op0_kind() != OpKind::Register {
+                return None;
+            }
             let dest = normalize_x86_reg(instruction.op0_register());
             Some(ConstantOp::Kill { dest_reg: dest })
         }
         Mnemonic::Or => {
-            if instruction.op_count() < 2 { return None; }
-            if instruction.op0_kind() != OpKind::Register { return None; }
+            if instruction.op_count() < 2 {
+                return None;
+            }
+            if instruction.op0_kind() != OpKind::Register {
+                return None;
+            }
             let dest = normalize_x86_reg(instruction.op0_register());
             Some(ConstantOp::Kill { dest_reg: dest })
         }
@@ -414,18 +544,27 @@ fn extract_x86_constant_op(instruction: &Instruction) -> Option<ConstantOp> {
                 let dest = normalize_x86_reg(instruction.op0_register());
                 if instruction.op_count() == 1 {
                     let rdx = normalize_x86_reg(Register::RDX);
-                    return Some(ConstantOp::KillPair { dest_reg1: dest, dest_reg2: rdx });
+                    return Some(ConstantOp::KillPair {
+                        dest_reg1: dest,
+                        dest_reg2: rdx,
+                    });
                 }
                 return Some(ConstantOp::Kill { dest_reg: dest });
             }
             let rax = normalize_x86_reg(Register::RAX);
             let rdx = normalize_x86_reg(Register::RDX);
-            Some(ConstantOp::KillPair { dest_reg1: rax, dest_reg2: rdx })
+            Some(ConstantOp::KillPair {
+                dest_reg1: rax,
+                dest_reg2: rdx,
+            })
         }
         Mnemonic::Mul | Mnemonic::Div | Mnemonic::Idiv => {
             let rax = normalize_x86_reg(Register::RAX);
             let rdx = normalize_x86_reg(Register::RDX);
-            Some(ConstantOp::KillPair { dest_reg1: rax, dest_reg2: rdx })
+            Some(ConstantOp::KillPair {
+                dest_reg1: rax,
+                dest_reg2: rdx,
+            })
         }
         Mnemonic::Not | Mnemonic::Neg => {
             if instruction.op0_kind() == OpKind::Register {
@@ -462,20 +601,44 @@ fn extract_x86_constant_op(instruction: &Instruction) -> Option<ConstantOp> {
             }
             None
         }
-        Mnemonic::Setae | Mnemonic::Sete | Mnemonic::Setne | Mnemonic::Setb
-        | Mnemonic::Setbe | Mnemonic::Seta | Mnemonic::Setg | Mnemonic::Setge
-        | Mnemonic::Setl | Mnemonic::Setle | Mnemonic::Sets | Mnemonic::Setns
-        | Mnemonic::Seto | Mnemonic::Setno | Mnemonic::Setp | Mnemonic::Setnp => {
+        Mnemonic::Setae
+        | Mnemonic::Sete
+        | Mnemonic::Setne
+        | Mnemonic::Setb
+        | Mnemonic::Setbe
+        | Mnemonic::Seta
+        | Mnemonic::Setg
+        | Mnemonic::Setge
+        | Mnemonic::Setl
+        | Mnemonic::Setle
+        | Mnemonic::Sets
+        | Mnemonic::Setns
+        | Mnemonic::Seto
+        | Mnemonic::Setno
+        | Mnemonic::Setp
+        | Mnemonic::Setnp => {
             if instruction.op0_kind() == OpKind::Register {
                 let dest = normalize_x86_reg(instruction.op0_register());
                 return Some(ConstantOp::Kill { dest_reg: dest });
             }
             None
         }
-        Mnemonic::Cmove | Mnemonic::Cmovne | Mnemonic::Cmovg | Mnemonic::Cmovge
-        | Mnemonic::Cmovl | Mnemonic::Cmovle | Mnemonic::Cmova | Mnemonic::Cmovae
-        | Mnemonic::Cmovb | Mnemonic::Cmovbe | Mnemonic::Cmovs | Mnemonic::Cmovns
-        | Mnemonic::Cmovo | Mnemonic::Cmovno | Mnemonic::Cmovp | Mnemonic::Cmovnp => {
+        Mnemonic::Cmove
+        | Mnemonic::Cmovne
+        | Mnemonic::Cmovg
+        | Mnemonic::Cmovge
+        | Mnemonic::Cmovl
+        | Mnemonic::Cmovle
+        | Mnemonic::Cmova
+        | Mnemonic::Cmovae
+        | Mnemonic::Cmovb
+        | Mnemonic::Cmovbe
+        | Mnemonic::Cmovs
+        | Mnemonic::Cmovns
+        | Mnemonic::Cmovo
+        | Mnemonic::Cmovno
+        | Mnemonic::Cmovp
+        | Mnemonic::Cmovnp => {
             if instruction.op0_kind() == OpKind::Register {
                 let dest = normalize_x86_reg(instruction.op0_register());
                 return Some(ConstantOp::Kill { dest_reg: dest });
@@ -489,9 +652,17 @@ fn extract_x86_constant_op(instruction: &Instruction) -> Option<ConstantOp> {
             }
             None
         }
-        Mnemonic::Sarx | Mnemonic::Shlx | Mnemonic::Shrx | Mnemonic::Bzhi
-        | Mnemonic::Pext | Mnemonic::Pdep | Mnemonic::Bextr
-        | Mnemonic::Blsi | Mnemonic::Blsr | Mnemonic::Blsmsk | Mnemonic::Andn => {
+        Mnemonic::Sarx
+        | Mnemonic::Shlx
+        | Mnemonic::Shrx
+        | Mnemonic::Bzhi
+        | Mnemonic::Pext
+        | Mnemonic::Pdep
+        | Mnemonic::Bextr
+        | Mnemonic::Blsi
+        | Mnemonic::Blsr
+        | Mnemonic::Blsmsk
+        | Mnemonic::Andn => {
             if instruction.op0_kind() == OpKind::Register {
                 let dest = normalize_x86_reg(instruction.op0_register());
                 return Some(ConstantOp::Kill { dest_reg: dest });
@@ -504,7 +675,10 @@ fn extract_x86_constant_op(instruction: &Instruction) -> Option<ConstantOp> {
             {
                 let d1 = normalize_x86_reg(instruction.op0_register());
                 let d2 = normalize_x86_reg(instruction.op1_register());
-                return Some(ConstantOp::KillPair { dest_reg1: d1, dest_reg2: d2 });
+                return Some(ConstantOp::KillPair {
+                    dest_reg1: d1,
+                    dest_reg2: d2,
+                });
             }
             None
         }
@@ -522,21 +696,48 @@ fn extract_x86_constant_op(instruction: &Instruction) -> Option<ConstantOp> {
             }
             None
         }
-        Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Push | Mnemonic::Nop
-        | Mnemonic::Ret | Mnemonic::Retf
-        | Mnemonic::Call | Mnemonic::Jmp
-        | Mnemonic::Ja | Mnemonic::Jae | Mnemonic::Jb | Mnemonic::Jbe
-        | Mnemonic::Je | Mnemonic::Jne | Mnemonic::Jg | Mnemonic::Jge
-        | Mnemonic::Jl | Mnemonic::Jle | Mnemonic::Jo | Mnemonic::Jno
-        | Mnemonic::Jp | Mnemonic::Jnp | Mnemonic::Js | Mnemonic::Jns
-        | Mnemonic::Int | Mnemonic::Int1 | Mnemonic::Int3
-        | Mnemonic::Hlt | Mnemonic::Ud0 | Mnemonic::Ud1 | Mnemonic::Ud2
-        | Mnemonic::Str | Mnemonic::Std | Mnemonic::Sti | Mnemonic::Stc => None,
+        Mnemonic::Cmp
+        | Mnemonic::Test
+        | Mnemonic::Push
+        | Mnemonic::Nop
+        | Mnemonic::Ret
+        | Mnemonic::Retf
+        | Mnemonic::Call
+        | Mnemonic::Jmp
+        | Mnemonic::Ja
+        | Mnemonic::Jae
+        | Mnemonic::Jb
+        | Mnemonic::Jbe
+        | Mnemonic::Je
+        | Mnemonic::Jne
+        | Mnemonic::Jg
+        | Mnemonic::Jge
+        | Mnemonic::Jl
+        | Mnemonic::Jle
+        | Mnemonic::Jo
+        | Mnemonic::Jno
+        | Mnemonic::Jp
+        | Mnemonic::Jnp
+        | Mnemonic::Js
+        | Mnemonic::Jns
+        | Mnemonic::Int
+        | Mnemonic::Int1
+        | Mnemonic::Int3
+        | Mnemonic::Hlt
+        | Mnemonic::Ud0
+        | Mnemonic::Ud1
+        | Mnemonic::Ud2
+        | Mnemonic::Str
+        | Mnemonic::Std
+        | Mnemonic::Sti
+        | Mnemonic::Stc => None,
         _ => {
             if instruction.op_count() >= 1 && instruction.op0_kind() == OpKind::Register {
                 let reg = instruction.op0_register();
                 if is_x86_gp_register(reg) {
-                    return Some(ConstantOp::Kill { dest_reg: normalize_x86_reg(reg) });
+                    return Some(ConstantOp::Kill {
+                        dest_reg: normalize_x86_reg(reg),
+                    });
                 }
             }
             None

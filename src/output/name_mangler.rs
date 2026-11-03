@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use crate::il2cpp::metadata::Metadata;
+use crate::executor::Il2CppExecutor;
 use crate::il2cpp::base::Il2Cpp;
 use crate::il2cpp::enums::Il2CppTypeEnum;
+use crate::il2cpp::metadata::Metadata;
 use crate::il2cpp::structures::*;
-use crate::executor::Il2CppExecutor;
+use std::collections::HashMap;
 
 pub struct MangledNameBuilder {
     buf: String,
@@ -20,9 +20,15 @@ impl MangledNameBuilder {
         }
     }
 
-    fn begin_name(&mut self) { self.buf.push('N'); }
-    fn begin_generics(&mut self) { self.buf.push('I'); }
-    fn write_end(&mut self) { self.buf.push('E'); }
+    fn begin_name(&mut self) {
+        self.buf.push('N');
+    }
+    fn begin_generics(&mut self) {
+        self.buf.push('I');
+    }
+    fn write_end(&mut self) {
+        self.buf.push('E');
+    }
 
     fn write_identifier(&mut self, id: &str) {
         let sanitized = crate::utils::sanitize_mangled_identifier_chars(id);
@@ -49,7 +55,9 @@ impl MangledNameBuilder {
                         idx /= 36;
                     }
                     chars.reverse();
-                    for c in chars { self.buf.push(c); }
+                    for c in chars {
+                        self.buf.push(c);
+                    }
                 }
             }
             self.buf.push('_');
@@ -63,10 +71,16 @@ impl MangledNameBuilder {
         self.current_sub_index += 1;
     }
 
-    fn finish(self) -> String { self.buf }
+    fn finish(self) -> String {
+        self.buf
+    }
 
     fn base_clean(name: &str) -> &str {
-        if let Some(pos) = name.find('`') { &name[..pos] } else { name }
+        if let Some(pos) = name.find('`') {
+            &name[..pos]
+        } else {
+            name
+        }
     }
 
     fn type_def_key(td: &Il2CppTypeDefinition, td_index_guess: Option<usize>) -> String {
@@ -85,7 +99,9 @@ impl MangledNameBuilder {
         executor: &mut Il2CppExecutor,
         generic_inst: Option<&Il2CppGenericInst>,
     ) {
-        let ns = metadata.get_string_from_index(td.namespace_index).unwrap_or_default();
+        let ns = metadata
+            .get_string_from_index(td.namespace_index)
+            .unwrap_or_default();
         for part in ns.split('.') {
             if !part.is_empty() {
                 self.write_identifier(part);
@@ -94,7 +110,9 @@ impl MangledNameBuilder {
         }
 
         if td.declaring_type_index != -1 {
-            if let Some(declaring_type) = il2cpp.types.get(td.declaring_type_index as usize).cloned() {
+            if let Some(declaring_type) =
+                il2cpp.types.get(td.declaring_type_index as usize).cloned()
+            {
                 let decl_td_idx_opt = match Il2CppTypeEnum::from_u8(declaring_type.type_enum) {
                     Some(Il2CppTypeEnum::ValueType) | Some(Il2CppTypeEnum::Class) => {
                         Some(declaring_type.klass_index() as usize)
@@ -103,24 +121,30 @@ impl MangledNameBuilder {
                 };
                 if let Some(dt_idx) = decl_td_idx_opt {
                     if let Some(decl_td) = metadata.type_defs.get(dt_idx).cloned() {
-                        let decl_name_raw = metadata.get_string_from_index(decl_td.name_index).unwrap_or_default();
+                        let decl_name_raw = metadata
+                            .get_string_from_index(decl_td.name_index)
+                            .unwrap_or_default();
                         let decl_clean = Self::base_clean(&decl_name_raw);
                         self.write_identifier(decl_clean);
                         self.skip_sub_index();
                     } else {
-                        let decl_name = executor.get_type_name(&declaring_type, metadata, il2cpp, false, false);
+                        let decl_name =
+                            executor.get_type_name(&declaring_type, metadata, il2cpp, false, false);
                         self.write_identifier(&decl_name);
                         self.skip_sub_index();
                     }
                 } else {
-                    let decl_name = executor.get_type_name(&declaring_type, metadata, il2cpp, false, false);
+                    let decl_name =
+                        executor.get_type_name(&declaring_type, metadata, il2cpp, false, false);
                     self.write_identifier(&decl_name);
                     self.skip_sub_index();
                 }
             }
         }
 
-        let name_raw = metadata.get_string_from_index(td.name_index).unwrap_or_default();
+        let name_raw = metadata
+            .get_string_from_index(td.name_index)
+            .unwrap_or_default();
         let name_clean = Self::base_clean(&name_raw).to_string();
         self.write_identifier(&name_clean);
 
@@ -153,11 +177,7 @@ impl MangledNameBuilder {
         self.register_substitution(key);
     }
 
-    fn write_nested_system_type(
-        &mut self,
-        namespace: &str,
-        type_name: &str,
-    ) {
+    fn write_nested_system_type(&mut self, namespace: &str, type_name: &str) {
         let key = format!("sys::{namespace}::{type_name}");
         if self.try_write_substitution(&key) {
             return;
@@ -228,14 +248,17 @@ impl MangledNameBuilder {
                 } else {
                     self.buf.push('v');
                 }
-                if is_nested_type_element { self.skip_sub_index(); }
+                if is_nested_type_element {
+                    self.skip_sub_index();
+                }
                 return;
             }
             Some(Il2CppTypeEnum::SzArray) | Some(Il2CppTypeEnum::Array) => {
                 self.buf.push_str("A_");
                 is_nested_type_element = true;
                 if il2cpp_type.datapoint != 0 {
-                    if let Some(element) = il2cpp.types.get(il2cpp_type.datapoint as usize).cloned() {
+                    if let Some(element) = il2cpp.types.get(il2cpp_type.datapoint as usize).cloned()
+                    {
                         self.write_type(&element, metadata, il2cpp, executor);
                     } else {
                         self.buf.push('v');
@@ -243,7 +266,9 @@ impl MangledNameBuilder {
                 } else {
                     self.buf.push('v');
                 }
-                if is_nested_type_element { self.skip_sub_index(); }
+                if is_nested_type_element {
+                    self.skip_sub_index();
+                }
                 return;
             }
             _ => {}
@@ -277,7 +302,9 @@ impl MangledNameBuilder {
             Some(Il2CppTypeEnum::ValueType) | Some(Il2CppTypeEnum::Class) => {
                 let klass_idx = il2cpp_type.klass_index() as usize;
                 if let Some(td) = metadata.type_defs.get(klass_idx).cloned() {
-                    self.write_complex_type_from_td(&td, klass_idx, metadata, il2cpp, executor, None);
+                    self.write_complex_type_from_td(
+                        &td, klass_idx, metadata, il2cpp, executor, None,
+                    );
                 } else {
                     self.buf.push('v');
                 }
@@ -287,16 +314,29 @@ impl MangledNameBuilder {
                 let mut wrote = false;
                 if generic_class_ptr != 0 {
                     if let Ok(generic_class) = il2cpp.read_generic_class(generic_class_ptr) {
-                        if let Some((td, td_idx)) = executor.get_generic_class_type_definition(&generic_class, metadata, il2cpp) {
+                        if let Some((td, td_idx)) = executor.get_generic_class_type_definition(
+                            &generic_class,
+                            metadata,
+                            il2cpp,
+                        ) {
                             let key = format!(
                                 "td#{td_idx}::gi_ctx@0x{:x}",
                                 generic_class.context.class_inst
                             );
                             if self.try_write_substitution(&key) {
                                 wrote = true;
-                            } else if let Ok(inst) = il2cpp.read_generic_inst(generic_class.context.class_inst) {
+                            } else if let Ok(inst) =
+                                il2cpp.read_generic_inst(generic_class.context.class_inst)
+                            {
                                 self.begin_name();
-                                self.write_type_name_from_td(&td, td_idx, metadata, il2cpp, executor, Some(&inst));
+                                self.write_type_name_from_td(
+                                    &td,
+                                    td_idx,
+                                    metadata,
+                                    il2cpp,
+                                    executor,
+                                    Some(&inst),
+                                );
                                 self.write_end();
                                 self.register_substitution(key);
                                 wrote = true;
@@ -304,7 +344,9 @@ impl MangledNameBuilder {
                         }
                     }
                 }
-                if !wrote { self.buf.push('v'); }
+                if !wrote {
+                    self.buf.push('v');
+                }
             }
             Some(Il2CppTypeEnum::Var) | Some(Il2CppTypeEnum::MVar) => {
                 self.buf.push('v');
@@ -328,7 +370,14 @@ impl MangledNameBuilder {
         method_def: &Il2CppMethodDefinition,
     ) -> String {
         Self::mangle_method_inner(
-            executor, metadata, il2cpp, type_def, type_def_index, method_def, None, "",
+            executor,
+            metadata,
+            il2cpp,
+            type_def,
+            type_def_index,
+            method_def,
+            None,
+            "",
         )
     }
 
@@ -341,7 +390,14 @@ impl MangledNameBuilder {
         method_def: &Il2CppMethodDefinition,
     ) -> String {
         Self::mangle_method_inner(
-            executor, metadata, il2cpp, type_def, type_def_index, method_def, None, "MethodInfo",
+            executor,
+            metadata,
+            il2cpp,
+            type_def,
+            type_def_index,
+            method_def,
+            None,
+            "MethodInfo",
         )
     }
 
@@ -355,8 +411,14 @@ impl MangledNameBuilder {
         generic_context: &Il2CppGenericContext,
     ) -> String {
         Self::mangle_method_inner(
-            executor, metadata, il2cpp, type_def, type_def_index, method_def,
-            Some(generic_context), "",
+            executor,
+            metadata,
+            il2cpp,
+            type_def,
+            type_def_index,
+            method_def,
+            Some(generic_context),
+            "",
         )
     }
 
@@ -367,7 +429,14 @@ impl MangledNameBuilder {
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
     ) -> String {
-        Self::mangle_data(executor, metadata, il2cpp, type_def, type_def_index, "TypeInfo")
+        Self::mangle_data(
+            executor,
+            metadata,
+            il2cpp,
+            type_def,
+            type_def_index,
+            "TypeInfo",
+        )
     }
 
     pub fn mangle_type_ref(
@@ -377,7 +446,14 @@ impl MangledNameBuilder {
         type_def: &Il2CppTypeDefinition,
         type_def_index: usize,
     ) -> String {
-        Self::mangle_data(executor, metadata, il2cpp, type_def, type_def_index, "TypeRef")
+        Self::mangle_data(
+            executor,
+            metadata,
+            il2cpp,
+            type_def,
+            type_def_index,
+            "TypeRef",
+        )
     }
 
     fn mangle_data(
@@ -434,7 +510,14 @@ impl MangledNameBuilder {
             }
         });
 
-        b.write_type_name_from_td(type_def, type_def_index, metadata, il2cpp, executor, class_inst_opt.as_ref());
+        b.write_type_name_from_td(
+            type_def,
+            type_def_index,
+            metadata,
+            il2cpp,
+            executor,
+            class_inst_opt.as_ref(),
+        );
         let td_key_base = Self::type_def_key(type_def, Some(type_def_index));
         let td_key = match &class_inst_opt {
             Some(_) => match generic_context {
@@ -445,7 +528,9 @@ impl MangledNameBuilder {
         };
         b.register_substitution(td_key);
 
-        let method_name = metadata.get_string_from_index(method_def.name_index as i32).unwrap_or_default();
+        let method_name = metadata
+            .get_string_from_index(method_def.name_index as i32)
+            .unwrap_or_default();
         match method_name.as_str() {
             ".ctor" => b.buf.push_str("C1"),
             ".cctor" => b.write_identifier("cctor"),
@@ -460,7 +545,8 @@ impl MangledNameBuilder {
             }
         });
 
-        let is_generic_method = method_inst_opt.is_some() || Self::method_has_generic_params(method_def);
+        let is_generic_method =
+            method_inst_opt.is_some() || Self::method_has_generic_params(method_def);
 
         if let Some(inst) = &method_inst_opt {
             b.skip_sub_index();
@@ -488,7 +574,8 @@ impl MangledNameBuilder {
             }
         } else {
             for j in 0..method_def.parameter_count as usize {
-                let param_def = metadata.parameter_defs[method_def.parameter_start as usize + j].clone();
+                let param_def =
+                    metadata.parameter_defs[method_def.parameter_start as usize + j].clone();
                 let param_type = il2cpp.types[param_def.type_index as usize].clone();
                 b.write_type(&param_type, metadata, il2cpp, executor);
             }

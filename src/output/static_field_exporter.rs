@@ -12,7 +12,7 @@ use crate::executor::Il2CppExecutor;
 use crate::il2cpp::base::Il2Cpp;
 use crate::il2cpp::enums::field_attributes;
 use crate::il2cpp::field_layout::{
-    analyze_field_layout, decode_field_offset, FieldLayoutInfo, StaticFieldKind,
+    FieldLayoutInfo, StaticFieldKind, analyze_field_layout, decode_field_offset,
 };
 use crate::il2cpp::metadata::Metadata;
 use crate::il2cpp::structures::{Il2CppFieldDefinition, Il2CppType, Il2CppTypeDefinition};
@@ -53,8 +53,16 @@ pub fn bytes_to_base64(bytes: &[u8]) -> String {
         let triple = (b0 << 16) | (b1 << 8) | b2;
         out.push(TABLE[((triple >> 18) & 63) as usize] as char);
         out.push(TABLE[((triple >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { TABLE[((triple >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[(triple & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -129,9 +137,16 @@ pub struct StaticMetadataDocument {
 }
 
 fn ascii_preview(bytes: &[u8], max: usize) -> String {
-    bytes.iter()
+    bytes
+        .iter()
         .take(max)
-        .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { '.' })
+        .map(|&b| {
+            if (0x20..=0x7E).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }
 
@@ -177,7 +192,12 @@ impl StaticFieldCatalog {
             for type_def_index in image_def.type_start as usize..type_end {
                 let type_def = metadata.type_defs[type_def_index].clone();
                 let type_name = executor.get_type_def_name(
-                    &type_def, type_def_index, metadata, il2cpp, true, true,
+                    &type_def,
+                    type_def_index,
+                    metadata,
+                    il2cpp,
+                    true,
+                    true,
                 );
 
                 if type_name.contains("PrivateImplementationDetails")
@@ -199,7 +219,12 @@ impl StaticFieldCatalog {
                     let field_def = metadata.field_defs[field_index].clone();
                     let field_type = il2cpp.types[field_def.type_index as usize].clone();
                     let field_attrs = field_type.attrs;
-                    if (field_attrs & (field_attributes::STATIC | field_attributes::LITERAL | field_attributes::HAS_FIELD_RVA)) == 0 {
+                    if (field_attrs
+                        & (field_attributes::STATIC
+                            | field_attributes::LITERAL
+                            | field_attributes::HAS_FIELD_RVA))
+                        == 0
+                    {
                         continue;
                     }
 
@@ -269,7 +294,12 @@ impl StaticFieldCatalog {
                     };
 
                     let metadata_rva = layout.default_value_metadata_offset.map(|off| {
-                        off.saturating_sub(metadata.header.field_and_parameter_default_value_data_offset as u64)
+                        off.saturating_sub(
+                            metadata
+                                .header
+                                .field_and_parameter_default_value_data_offset
+                                as u64,
+                        )
                     });
 
                     entries.push(StaticFieldEntry {
@@ -330,10 +360,7 @@ impl StaticFieldCatalog {
                         entry.field_path, entry.effective_offset, entry.kind
                     )
                 } else {
-                    format!(
-                        "{} kind={} hex={}",
-                        entry.field_path, entry.kind, entry.hex
-                    )
+                    format!("{} kind={} hex={}", entry.field_path, entry.kind, entry.hex)
                 },
             });
         }
@@ -398,7 +425,10 @@ pub fn write_dump_cs_field_annotations(
     }
 
     let field_attrs = field_type.attrs;
-    if (field_attrs & (field_attributes::STATIC | field_attributes::LITERAL | field_attributes::HAS_FIELD_RVA)) == 0 {
+    if (field_attrs
+        & (field_attributes::STATIC | field_attributes::LITERAL | field_attributes::HAS_FIELD_RVA))
+        == 0
+    {
         return Ok(());
     }
 
@@ -414,9 +444,8 @@ pub fn write_dump_cs_field_annotations(
         config.max_field_rva_dump_bytes,
     );
 
-    let type_name = executor.get_type_def_name(
-        type_def, type_def_index, metadata, il2cpp, true, true,
-    );
+    let type_name =
+        executor.get_type_def_name(type_def, type_def_index, metadata, il2cpp, true, true);
     let field_name = metadata.get_string_from_index(field_def.name_index)?;
     let field_path = format!("{type_name}.{field_name}");
 
@@ -436,11 +465,19 @@ pub fn write_dump_cs_field_annotations(
         };
         if config.dump_field_rva_data {
             if let Some(bytes) = layout.metadata_bytes.as_ref().filter(|b| !b.is_empty()) {
-                writeln!(buf, "{indent}\t//   Hex: {}", bytes_to_hex_preview(bytes, 128)).ok();
+                writeln!(
+                    buf,
+                    "{indent}\t//   Hex: {}",
+                    bytes_to_hex_preview(bytes, 128)
+                )
+                .ok();
                 if bytes.len() <= 64 {
                     writeln!(buf, "{indent}\t//   ASCII: {}", ascii_preview(bytes, 64)).ok();
                 }
-                for line in format_hex_dump(bytes, 16).lines().take(FIELD_RVA_HEX_DUMP_LINES) {
+                for line in format_hex_dump(bytes, 16)
+                    .lines()
+                    .take(FIELD_RVA_HEX_DUMP_LINES)
+                {
                     writeln!(buf, "{indent}\t//   {line}").ok();
                 }
             }
@@ -452,9 +489,9 @@ pub fn write_dump_cs_field_annotations(
         writeln!(
             buf,
             "{indent}\t//   TLS offset in type block: 0x{:X} (raw IL2CPP offset 0x{:X})",
-            layout.effective_offset,
-            layout.raw_offset as u32
-        ).ok();
+            layout.effective_offset, layout.raw_offset as u32
+        )
+        .ok();
         writeln!(
             buf,
             "{indent}\t//   Not a binary RVA — per-thread storage; xref the field name in dump.cs / disasm"

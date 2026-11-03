@@ -5,14 +5,14 @@
 //! architectures. Flag-producing ops (CMP/TEST) fold with the next Jcc.
 
 use super::ir::{
-    ArithKind, CompareKind, Conversion, FloatArithKind, Insn, LanePick, Op, Operand, SimdOp,
-    SelectVariant, RET_REG,
+    ArithKind, CompareKind, Conversion, FloatArithKind, Insn, LanePick, Op, Operand, RET_REG,
+    SelectVariant, SimdOp,
+};
+use iced_x86::{
+    ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction as X86Insn, MemorySize,
+    Mnemonic, OpKind, Register,
 };
 use std::collections::BTreeSet;
-use iced_x86::{
-    ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction as X86Insn, Mnemonic,
-    MemorySize, OpKind, Register,
-};
 
 fn sse_op(insn: &X86Insn, n: usize, abi: X86Abi) -> Option<Operand> {
     if (n as u32) >= insn.op_count() {
@@ -24,7 +24,6 @@ fn sse_op(insn: &X86Insn, n: usize, abi: X86Abi) -> Option<Operand> {
         _ => None,
     }
 }
-
 
 pub struct LiftResult {
     pub insns: Vec<Insn>,
@@ -68,7 +67,7 @@ fn gpr_ordinal_of(reg: Register) -> Option<u32> {
 ///
 /// The ABI ordinals are deliberate, not a rename of the register file: argument
 /// register *i* takes the name `x{i}` whatever physical register the ABI puts it
-/// in, so every downstream pass (locals seeding, argument alignment, C# 
+/// in, so every downstream pass (locals seeding, argument alignment, C#
 /// rendering) speaks one positional vocabulary across ARM64, ARM32, x64 SysV and
 /// x64 MSVC.
 ///
@@ -219,14 +218,18 @@ fn memory_operand(insn: &X86Insn, abi: X86Abi) -> Operand {
         // no base, no index (`mov eax, [0x1234]`): the displacement IS the address
         (Operand::reg("abs"), insn.memory_displacement64() as i64)
     } else {
-        (Operand::reg(gpr(base, abi)), insn.memory_displacement64() as i64)
+        (
+            Operand::reg(gpr(base, abi)),
+            insn.memory_displacement64() as i64,
+        )
     };
     let index = if insn.memory_index() == Register::None {
         None
     } else {
         Some(Box::new(Operand::reg(gpr(insn.memory_index(), abi))))
     };
-    Operand::Memory { width: mem_access_width(insn),
+    Operand::Memory {
+        width: mem_access_width(insn),
         base: Box::new(b),
         index,
         scale: (insn.memory_index_scale() as u8).max(1),
@@ -528,7 +531,11 @@ fn materialize_pending(
         pin_deferred_read(insns, addresses, at, &mut rhs, &mut scratch.next);
     }
     let s = scratch.fresh();
-    insns.push(Insn::new(Op::Compare(kind), vec![s.clone(), lhs, rhs], addr));
+    insns.push(Insn::new(
+        Op::Compare(kind),
+        vec![s.clone(), lhs, rhs],
+        addr,
+    ));
     s
 }
 
@@ -2400,7 +2407,10 @@ pub fn lift_x86_64(
     if std::env::var("ILR_X86RAW").is_ok() {
         eprintln!("[x86raw] base={:#x} n={}", base_rva, insns.len());
         for (i, insn) in insns.iter().enumerate() {
-            eprintln!("[x86raw] i{} addr={:#x} op={:?} ops={:?}", i, insn.address, insn.op, insn.operands);
+            eprintln!(
+                "[x86raw] i{} addr={:#x} op={:?} ops={:?}",
+                i, insn.address, insn.op, insn.operands
+            );
         }
     }
 
@@ -2625,7 +2635,11 @@ fn lift_packed_simd(
             | Mnemonic::Vsqrtsd
     ) {
         if let Some((d, s)) = simd_unary_ops(insn, abi) {
-            insns.push(Insn::new(Op::FloatArith(FloatArithKind::Sqrt), vec![d, s], addr));
+            insns.push(Insn::new(
+                Op::FloatArith(FloatArithKind::Sqrt),
+                vec![d, s],
+                addr,
+            ));
             return true;
         }
         return false;
@@ -2839,7 +2853,13 @@ fn push_insert(
     let n: u8 = 16 / elem_bytes.max(1);
     let k = imm % n;
     let lanes: Vec<LanePick> = (0..n)
-        .map(|i| if i == k { LanePick::B(0) } else { LanePick::A(i) })
+        .map(|i| {
+            if i == k {
+                LanePick::B(0)
+            } else {
+                LanePick::A(i)
+            }
+        })
         .collect();
     push_arrange(insns, addr, d, a, Some(b), elem_bytes, lanes)
 }
@@ -2990,11 +3010,7 @@ fn lift_lane_simd(
         let lanes: Vec<LanePick> = (0..16u16)
             .map(|k| {
                 let src = k + imm as u16;
-                if src < 16 {
-                    A(src as u8)
-                } else {
-                    Zero
-                }
+                if src < 16 { A(src as u8) } else { Zero }
             })
             .collect();
         return push_arrange(insns, addr, d, s, None, 1, lanes);
@@ -3670,9 +3686,18 @@ mod tests {
         );
         assert_eq!(dst_reg(&v), Some("vf0"));
         // 0F 5C C1 subps / 0F 59 C1 mulps / 0F 5E C1 divps
-        assert!(matches!(&lift(&[0x0F, 0x5C, 0xC1])[0].op, Op::FloatArith(FloatArithKind::Sub)));
-        assert!(matches!(&lift(&[0x0F, 0x59, 0xC1])[0].op, Op::FloatArith(FloatArithKind::Mul)));
-        assert!(matches!(&lift(&[0x0F, 0x5E, 0xC1])[0].op, Op::FloatArith(FloatArithKind::Div)));
+        assert!(matches!(
+            &lift(&[0x0F, 0x5C, 0xC1])[0].op,
+            Op::FloatArith(FloatArithKind::Sub)
+        ));
+        assert!(matches!(
+            &lift(&[0x0F, 0x59, 0xC1])[0].op,
+            Op::FloatArith(FloatArithKind::Mul)
+        ));
+        assert!(matches!(
+            &lift(&[0x0F, 0x5E, 0xC1])[0].op,
+            Op::FloatArith(FloatArithKind::Div)
+        ));
         // 66 0F 58 C1  addpd xmm0, xmm1
         assert!(matches!(
             &lift(&[0x66, 0x0F, 0x58, 0xC1])[0].op,
@@ -3720,7 +3745,11 @@ mod tests {
     fn vector_moves_are_real_transfers() {
         // 0F 28 C1  movaps xmm0, xmm1
         let v = lift(&[0x0F, 0x28, 0xC1]);
-        assert!(matches!(&v[0].op, Op::Move), "movaps must be a Move, got {:?}", v[0]);
+        assert!(
+            matches!(&v[0].op, Op::Move),
+            "movaps must be a Move, got {:?}",
+            v[0]
+        );
         // 0F 10 C1  movups xmm0, xmm1
         assert!(matches!(&lift(&[0x0F, 0x10, 0xC1])[0].op, Op::Move));
     }
@@ -3730,13 +3759,17 @@ mod tests {
         // 0F 5D C1  minps xmm0, xmm1
         let v = lift(&[0x0F, 0x5D, 0xC1]);
         assert!(
-            v.iter().any(|i| matches!(&i.op, Op::Select(SelectVariant::Identity))),
+            v.iter()
+                .any(|i| matches!(&i.op, Op::Select(SelectVariant::Identity))),
             "minps must be compare+select, got {:?}",
             v
         );
         // 0F 5F C1  maxps xmm0, xmm1
         let v = lift(&[0x0F, 0x5F, 0xC1]);
-        assert!(v.iter().any(|i| matches!(&i.op, Op::Select(SelectVariant::Identity))));
+        assert!(
+            v.iter()
+                .any(|i| matches!(&i.op, Op::Select(SelectVariant::Identity)))
+        );
     }
 
     #[test]
@@ -3787,9 +3820,22 @@ mod tests {
         let v = lift(&[0x0F, 0xC6, 0xC1, 0x1B]);
         assert_eq!(
             arrange_of(&v),
-            (4, vec![LanePick::A(3), LanePick::A(2), LanePick::B(1), LanePick::B(0)])
+            (
+                4,
+                vec![
+                    LanePick::A(3),
+                    LanePick::A(2),
+                    LanePick::B(1),
+                    LanePick::B(0)
+                ]
+            )
         );
-        assert_eq!(v[0].operands.len(), 3, "dst, source A, source B: {:?}", v[0]);
+        assert_eq!(
+            v[0].operands.len(),
+            3,
+            "dst, source A, source B: {:?}",
+            v[0]
+        );
         assert_in_range(&v);
     }
 
@@ -3799,7 +3845,15 @@ mod tests {
         let v = lift(&[0x0F, 0xC6, 0xC1, 0x00]);
         assert_eq!(
             arrange_of(&v),
-            (4, vec![LanePick::A(0), LanePick::A(0), LanePick::B(0), LanePick::B(0)])
+            (
+                4,
+                vec![
+                    LanePick::A(0),
+                    LanePick::A(0),
+                    LanePick::B(0),
+                    LanePick::B(0)
+                ]
+            )
         );
     }
 
@@ -3811,7 +3865,15 @@ mod tests {
         let v = lift(&[0x0F, 0xC6, 0xC0, 0xE4]);
         assert_eq!(
             arrange_of(&v),
-            (4, vec![LanePick::A(0), LanePick::A(1), LanePick::B(2), LanePick::B(3)])
+            (
+                4,
+                vec![
+                    LanePick::A(0),
+                    LanePick::A(1),
+                    LanePick::B(2),
+                    LanePick::B(3)
+                ]
+            )
         );
     }
 
@@ -3832,7 +3894,15 @@ mod tests {
         let v = lift(&[0x66, 0x0F, 0x70, 0xC1, 0x1B]);
         assert_eq!(
             arrange_of(&v),
-            (4, vec![LanePick::A(3), LanePick::A(2), LanePick::A(1), LanePick::A(0)])
+            (
+                4,
+                vec![
+                    LanePick::A(3),
+                    LanePick::A(2),
+                    LanePick::A(1),
+                    LanePick::A(0)
+                ]
+            )
         );
         assert_eq!(v[0].operands.len(), 2, "one source only: {:?}", v[0]);
         assert_in_range(&v);
@@ -3898,7 +3968,10 @@ mod tests {
         for (i, l) in lanes.iter().take(12).enumerate() {
             assert_eq!(*l, LanePick::A((i + 4) as u8), "output byte {i}");
         }
-        assert!(lanes[12..].iter().all(|l| *l == LanePick::Zero), "top four zero-fill");
+        assert!(
+            lanes[12..].iter().all(|l| *l == LanePick::Zero),
+            "top four zero-fill"
+        );
         assert_in_range(&v);
     }
 
@@ -3917,7 +3990,10 @@ mod tests {
         // 66 0F 73 D8 10 — a shift by 16 discards every byte.
         let v = lift(&[0x66, 0x0F, 0x73, 0xD8, 0x10]);
         let (_, lanes) = arrange_of(&v);
-        assert!(lanes.iter().all(|l| *l == LanePick::Zero), "all zero-fill: {lanes:?}");
+        assert!(
+            lanes.iter().all(|l| *l == LanePick::Zero),
+            "all zero-fill: {lanes:?}"
+        );
         assert_in_range(&v);
     }
 
@@ -3965,12 +4041,28 @@ mod tests {
         // 0F 14 C1  unpcklps
         assert_eq!(
             arrange_of(&lift(&[0x0F, 0x14, 0xC1])),
-            (4, vec![LanePick::A(0), LanePick::B(0), LanePick::A(1), LanePick::B(1)])
+            (
+                4,
+                vec![
+                    LanePick::A(0),
+                    LanePick::B(0),
+                    LanePick::A(1),
+                    LanePick::B(1)
+                ]
+            )
         );
         // 0F 15 C1  unpckhps
         assert_eq!(
             arrange_of(&lift(&[0x0F, 0x15, 0xC1])),
-            (4, vec![LanePick::A(2), LanePick::B(2), LanePick::A(3), LanePick::B(3)])
+            (
+                4,
+                vec![
+                    LanePick::A(2),
+                    LanePick::B(2),
+                    LanePick::A(3),
+                    LanePick::B(3)
+                ]
+            )
         );
         // 66 0F 14 C1  unpcklpd
         assert_eq!(
@@ -4034,7 +4126,8 @@ mod tests {
         // 66 0F 76 C0  pcmpeqd xmm0, xmm0
         let v = lift(&[0x66, 0x0F, 0x76, 0xC0]);
         assert!(
-            matches!(&v[0].op, Op::Move) && matches!(v[0].operands.get(1), Some(Operand::Immediate(-1))),
+            matches!(&v[0].op, Op::Move)
+                && matches!(v[0].operands.get(1), Some(Operand::Immediate(-1))),
             "a self-compare is all-ones, got {:?}",
             v[0]
         );
@@ -4055,7 +4148,15 @@ mod tests {
         let v = lift(&[0xC5, 0xF0, 0xC6, 0xC2, 0x1B]);
         assert_eq!(
             arrange_of(&v),
-            (4, vec![LanePick::A(3), LanePick::A(2), LanePick::B(1), LanePick::B(0)])
+            (
+                4,
+                vec![
+                    LanePick::A(3),
+                    LanePick::A(2),
+                    LanePick::B(1),
+                    LanePick::B(0)
+                ]
+            )
         );
         assert_eq!(v[0].operands.len(), 3);
         assert_eq!(v[0].operands[0], Operand::Register("vf0".into()));
@@ -4092,7 +4193,8 @@ mod tests {
             "sal must shift, got {v:?}"
         );
         assert!(
-            !v.iter().any(|i| matches!(&i.op, Op::Simd(n) if n.contains("Sal"))),
+            !v.iter()
+                .any(|i| matches!(&i.op, Op::Simd(n) if n.contains("Sal"))),
             "sal must not reach the catch-all: {v:?}"
         );
     }
@@ -4146,7 +4248,10 @@ mod tests {
         // 0F 45 D6     cmovne edx, esi
         // 75 00        jne .+2
         let v = lift(&[0x39, 0xC8, 0x0F, 0x45, 0xD6, 0x75, 0x00]);
-        let compares: Vec<&Insn> = v.iter().filter(|i| matches!(i.op, Op::Compare(_))).collect();
+        let compares: Vec<&Insn> = v
+            .iter()
+            .filter(|i| matches!(i.op, Op::Compare(_)))
+            .collect();
         assert_eq!(
             compares.len(),
             2,
@@ -4176,8 +4281,15 @@ mod tests {
         // 75 00              jne .+2
         // C3                 ret
         let v = lift(&[0x39, 0xC8, 0xE8, 0xF9, 0x0F, 0x00, 0x00, 0x75, 0x00, 0xC3]);
-        let compares: Vec<&Insn> = v.iter().filter(|i| matches!(i.op, Op::Compare(_))).collect();
-        assert_eq!(compares.len(), 1, "the `cmp` alone materializes nothing: {v:?}");
+        let compares: Vec<&Insn> = v
+            .iter()
+            .filter(|i| matches!(i.op, Op::Compare(_)))
+            .collect();
+        assert_eq!(
+            compares.len(),
+            1,
+            "the `cmp` alone materializes nothing: {v:?}"
+        );
         assert!(
             matches!(compares[0].operands.get(1), Some(Operand::Unknown)),
             "the branch's compare must not be the one the call destroyed: {:?}",

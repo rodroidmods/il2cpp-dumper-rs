@@ -1,9 +1,9 @@
 //! Pipeline tests: synthetic compiler-shaped ARM64 → full recovery → CIL.
 
+use super::csharp::{BinOp, CmpKind, Expr, Stmt, cleanup};
 use super::*;
-use super::csharp::{cleanup, BinOp, CmpKind, Expr, Stmt};
-use std::collections::HashMap;
 use ir::{ArithKind, CompareKind, FloatArithKind, Op, Operand, SelectVariant};
+use std::collections::HashMap;
 
 fn le(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
@@ -20,6 +20,59 @@ fn le(words: &[u32]) -> Vec<u8> {
 ///     arrived, so `elements[index]` stayed an opaque indirect call;
 ///   * whenever it did fire, the receiver and every argument had just been
 ///     replaced with `Unknown`, so a resolved call rendered with no arguments.
+/// A def whose only consumer is an INSTANCE-FIELD BASE is live.
+///
+/// `passes::collect_locals` is the private operand walker behind
+/// `dead_code_elimination`'s use counts. It had arms for `Local`,
+/// `Memory`, `AddressOf`, `ArrayLength` and `ArrayAccess` but NONE for
+/// `Operand::InstanceField`, so the RECEIVER of a field access was invisible
+/// to the counts and the def that computed it was deleted as dead.
+///
+/// Shape (0x1489B84 `CircularScrollingList.Start`, ARM64):
+/// ```text
+///   ldr  x8,[x0,#0x30]     ; x8 = this._setting
+///   cbz  x8, …             ; copy propagation rewrites this read to the field
+///   ldrb w8,[x8,#0x26]     ; x8 = this._setting._initializeOnStart
+/// ```
+/// The `InstanceField` base was then the load's ONLY remaining use, so the load
+/// was Nop'd and the renderer — seeing a read with no definition — printed
+/// `in_x8._initializeOnStart`, an ABI name for a value the body does define.
+#[test]
+fn an_instance_field_base_keeps_its_definition_alive() {
+    let field = FieldRef {
+        type_def_index: 6,
+        field_index: 29,
+        name: "_initializeOnStart".into(),
+        declaring_type_name: "CircularScrollingListSetting".into(),
+        field_type: ManagedType::Primitive(PrimKind::Boolean),
+        is_static: false,
+    };
+    let mut insns = vec![
+        // x8 = <something the body computes>
+        Insn::new(Op::Move, vec![Operand::Local(1), Operand::Local(9)], 0x1000),
+        // w8 = x8._initializeOnStart   (the base is a NESTED operand)
+        Insn::new(
+            Op::Move,
+            vec![
+                Operand::Local(2),
+                Operand::InstanceField {
+                    base: Box::new(Operand::Local(1)),
+                    field,
+                },
+            ],
+            0x1004,
+        ),
+        // The loaded value is consumed, so nothing here is dead for the usual
+        // reason — the base is the ONLY thing keeping the load alive.
+        Insn::new(Op::Return, vec![Operand::Local(2)], 0x1008),
+    ];
+    passes::dead_code_elimination(&mut insns);
+    assert!(
+        matches!(insns[0].op, Op::Move),
+        "the base definition must survive: {insns:?}"
+    );
+}
+
 #[test]
 fn virtual_call_through_blr_shape_resolves_and_keeps_arguments() {
     let mut table = locals::LocalTable::default();
@@ -34,7 +87,8 @@ fn virtual_call_through_blr_shape_resolves_and_keeps_arguments() {
         is_this: false,
         is_param: Some(0),
         param_comp: None,
-            is_incoming_arg: false,
+        is_incoming_arg: false,
+        is_call_clobber: false,
         is_return_buffer: false,
     });
     table.index_of.insert(1u32, 0usize);
@@ -45,7 +99,8 @@ fn virtual_call_through_blr_shape_resolves_and_keeps_arguments() {
             Op::Move,
             vec![
                 Operand::Local(dst),
-                Operand::Memory { width: 0,
+                Operand::Memory {
+                    width: 0,
                     base: Box::new(Operand::Local(base)),
                     index: None,
                     scale: 8,
@@ -94,8 +149,16 @@ fn virtual_call_through_blr_shape_resolves_and_keeps_arguments() {
         "the operand list must survive the rewrite, got {:?}",
         insns[3].operands
     );
-    assert_eq!(insns[3].operands[2], Operand::Local(1), "receiver preserved");
-    assert_eq!(insns[3].operands[3], Operand::Local(9), "argument preserved");
+    assert_eq!(
+        insns[3].operands[2],
+        Operand::Local(1),
+        "receiver preserved"
+    );
+    assert_eq!(
+        insns[3].operands[3],
+        Operand::Local(9),
+        "argument preserved"
+    );
 }
 
 /// `Op::Call` always carries a destination slot at operand 1 — every
@@ -135,7 +198,11 @@ fn trim_call_arguments_keeps_the_destination_slot_for_void_calls() {
         "void call must keep 1 target + 1 dest slot + 1 receiver + 2 args, got {:?}",
         insns[0].operands
     );
-    assert_eq!(insns[0].operands[4], Operand::Local(13), "last argument dropped");
+    assert_eq!(
+        insns[0].operands[4],
+        Operand::Local(13),
+        "last argument dropped"
+    );
 }
 
 /// An indirect call the resolver could NOT name must still produce a VALUE.
@@ -220,7 +287,10 @@ fn arm64_full_pipeline() {
             _ => None,
         })
         .expect("the fixture has a conditional branch");
-    assert!(branch_before < insns.len(), "branch resolves to an instruction");
+    assert!(
+        branch_before < insns.len(),
+        "branch resolves to an instruction"
+    );
     let graph2 = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg again");
     let branch_after = insns
         .iter()
@@ -238,7 +308,7 @@ fn arm64_full_pipeline() {
     stack_analyzer::analyze(&mut insns, &graph);
 
     let dom = dominator::DominatorInfo::compute(&graph);
-    let mut ssa_out = ssa::build(&insns, &graph, &dom);
+    let mut ssa_out = ssa::build(&insns, &graph, &dom, &[]);
     ssa::materialize(&mut ssa_out, &mut graph);
 
     let seed = locals::SeedInfo {
@@ -262,7 +332,9 @@ fn arm64_full_pipeline() {
 
     let unused = passes::unused_locals(&ssa_out.insns, &table);
     let resolver = NullResolver;
-    let emitter = emit::Emitter { resolver: &resolver };
+    let emitter = emit::Emitter {
+        resolver: &resolver,
+    };
     let out = emitter.generate(&ssa_out.insns, &table, &unused, true);
 
     assert!(!out.instructions.is_empty());
@@ -300,11 +372,11 @@ fn loop_shape_produces_and_removes_phis() {
     // 0x200C b.lt -3 insns (to 0x2004): offset -12
     // 0x2010 ret
     let bytes = le(&[
-        0xD28F0000,             // movz x0, #0  (hw=0 imm=0 → 0xD2800000; use plain)
-        0x91000400,             // add x0, x0, #1
-        0xF1003DFF,             // subs xzr, x0, #15 (imm12=15<<10=0x3C00|0x1F)
-        0x54000F4B,             // placeholder b.lt — recomputed below
-        0xD65F03C0,             // ret
+        0xD28F0000, // movz x0, #0  (hw=0 imm=0 → 0xD2800000; use plain)
+        0x91000400, // add x0, x0, #1
+        0xF1003DFF, // subs xzr, x0, #15 (imm12=15<<10=0x3C00|0x1F)
+        0x54000F4B, // placeholder b.lt — recomputed below
+        0xD65F03C0, // ret
     ]);
     let _ = bytes;
     // encode precisely instead:
@@ -322,7 +394,7 @@ fn loop_shape_produces_and_removes_phis() {
     stack_analyzer::analyze(&mut insns, &graph);
 
     let dom = dominator::DominatorInfo::compute(&graph);
-    let mut ssa_out = ssa::build(&insns, &graph, &dom);
+    let mut ssa_out = ssa::build(&insns, &graph, &dom, &[]);
     ssa::materialize(&mut ssa_out, &mut graph);
 
     // the loop counter must have a phi (two defs joining at loop head)
@@ -367,7 +439,10 @@ fn string_literal_resolution() {
             Some(Operand::StringLiteral { index: 7, .. })
         )
     });
-    assert!(has_lit, "literal-slot immediate should become StringLiteral");
+    assert!(
+        has_lit,
+        "literal-slot immediate should become StringLiteral"
+    );
 }
 
 // tiny helper so the string test can build an empty table
@@ -394,8 +469,8 @@ fn receiver_from_previous_call_result() {
     // 0x4000 bl A        (+8 → 0x4008)
     // 0x4004 bl B        (+8 → 0x400C)
     // 0x4008 ret
-    let bl_a: u32 = 0x94000000 | ((2u32) & 0x3FF_FFFF);   // offset +2 insns
-    let bl_b: u32 = 0x94000000 | ((2u32) & 0x3FF_FFFF);   // offset +2 insns
+    let bl_a: u32 = 0x94000000 | ((2u32) & 0x3FF_FFFF); // offset +2 insns
+    let bl_b: u32 = 0x94000000 | ((2u32) & 0x3FF_FFFF); // offset +2 insns
     let bytes = le(&[bl_a, bl_b, 0xD65F03C0]);
 
     let lifted = lift::lift_arm64(&bytes, 0x4000, 32, None).expect("lift");
@@ -408,7 +483,7 @@ fn receiver_from_previous_call_result() {
     let mut graph = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
     stack_analyzer::analyze(&mut insns, &graph);
     let dom = dominator::DominatorInfo::compute(&graph);
-    let mut ssa_out = ssa::build(&insns, &graph, &dom);
+    let mut ssa_out = ssa::build(&insns, &graph, &dom, &[]);
     ssa::materialize(&mut ssa_out, &mut graph);
 
     let seed = locals::SeedInfo {
@@ -423,8 +498,10 @@ fn receiver_from_previous_call_result() {
     locals::propagate_types(&mut ssa_out.insns, &mut table, &locals::NullOracle);
 
     let mut maps = resolve::ResolveMaps::default();
-    maps.methods_by_rva.insert(0x5000, method_ref_for_test("PreciseLocale", "GetLanguage"));
-    maps.methods_by_rva.insert(0x6000, method_ref_for_instance("Sanitize", "HTTP"));
+    maps.methods_by_rva
+        .insert(0x5000, method_ref_for_test("PreciseLocale", "GetLanguage"));
+    maps.methods_by_rva
+        .insert(0x6000, method_ref_for_instance("Sanitize", "HTTP"));
     // patch call targets to the mapped RVAs
     for insn in insns.iter_mut() {
         if insn.op == Op::Call {
@@ -447,19 +524,35 @@ fn receiver_from_previous_call_result() {
     }
 
     let stats = resolve::run(&mut ssa_out.insns, &table, &maps);
-    println!("=== RESOLVED === resolved={} unresolved={}", stats.calls_resolved, stats.calls_unresolved);
+    println!(
+        "=== RESOLVED === resolved={} unresolved={}",
+        stats.calls_resolved, stats.calls_unresolved
+    );
     for (i, insn) in ssa_out.insns.iter().enumerate() {
         println!("  {i}: {insn:?} | {insn}");
     }
 
     ssa::eliminate(&mut ssa_out, &mut graph);
 
-    let ir = super::RecoveredIr { insns: ssa_out.insns, table, returns_value: true, base_rva: 0 };
+    let ir = super::RecoveredIr {
+        insns: ssa_out.insns,
+        table,
+        returns_value: true,
+        base_rva: 0,
+    };
     let text = crate::recovery::csharp::render_method_csharp(
-        &ir, "GetLanguage", false, &[], &ManagedType::String, -1,
+        &ir,
+        "GetLanguage",
+        false,
+        &[],
+        &ManagedType::String,
+        -1,
     );
     println!("=== C# ===\n{text}");
-    assert!(text.contains("PreciseLocale.GetLanguage"), "first call missing");
+    assert!(
+        text.contains("PreciseLocale.GetLanguage"),
+        "first call missing"
+    );
 }
 
 fn method_ref_for_test(ty: &str, name: &str) -> MethodRef {
@@ -490,7 +583,7 @@ fn method_ref_for_instance(ty: &str, name: &str) -> MethodRef {
 /// Typical Unity ctor: stp pair, class-init guard via ldrb+tbz, base call.
 #[test]
 fn diagnose_ctor_failure_shape() {
-    // Shape seen at 0x13a20 (84 bytes): 
+    // Shape seen at 0x13a20 (84 bytes):
     //   stp x22,x21; stp x20,x19; mov x19,x0
     //   adrp/add klass; ldrb w8,[x8,#0x135]; tbnz w8,#0 -> init
     //   ... base .ctor call ... init: bl class_init
@@ -512,7 +605,12 @@ fn diagnose_ctor_failure_shape() {
     let mut insns = lifted.insns;
     let Some(graph) = cfg::Cfg::build(&mut insns, &lifted.addresses) else {
         println!("!! CFG BUILD FAILED — this is the failure point");
-        for (i, insn) in lift::lift_arm64(&bytes, 0x13a20, 64, None).unwrap().insns.iter().enumerate() {
+        for (i, insn) in lift::lift_arm64(&bytes, 0x13a20, 64, None)
+            .unwrap()
+            .insns
+            .iter()
+            .enumerate()
+        {
             println!("  {i}: {insn}");
         }
         return;
@@ -529,7 +627,8 @@ fn switch_table_recovery() {
         Insn::move_(Operand::reg("x9"), Operand::imm(0x6000), 0x8000), // table base
         Insn::move_(
             Operand::reg("x8"),
-            Operand::Memory { width: 0,
+            Operand::Memory {
+                width: 0,
                 base: Box::new(Operand::reg("x9")),
                 index: Some(Box::new(Operand::Local(4))),
                 scale: 4,
@@ -595,7 +694,7 @@ fn loop_condition_polarity() {
 
     // back edge exists → structurer should produce a While/DoWhile statement
     let dom = dominator::DominatorInfo::compute(&graph);
-    let mut ssa_out = ssa::build(&insns, &graph, &dom);
+    let mut ssa_out = ssa::build(&insns, &graph, &dom, &[]);
     ssa::materialize(&mut ssa_out, &mut graph);
 
     let seed = locals::SeedInfo {
@@ -614,7 +713,9 @@ fn loop_condition_polarity() {
 
     let unused = passes::unused_locals(&ssa_out.insns, &table);
     let resolver = NullResolver;
-    let emitter = emit::Emitter { resolver: &resolver };
+    let emitter = emit::Emitter {
+        resolver: &resolver,
+    };
     let out = emitter.generate(&ssa_out.insns, &table, &unused, true);
     assert!(matches!(
         out.instructions.last(),
@@ -684,9 +785,7 @@ fn x64_argument_register_names_follow_the_calling_convention() {
     // …and the ROLES must swap in the ABI-predicted direction: `rcx` is the
     // first argument under MSVC and the fourth under SysV, so the `x`-ordinal
     // for `rcx` differs by exactly 3 between the two.
-    let ordinal = |v: &str| -> Option<u32> {
-        v.strip_prefix('x')?.parse::<u32>().ok()
-    };
+    let ordinal = |v: &str| -> Option<u32> { v.strip_prefix('x')?.parse::<u32>().ok() };
     let (Some(m0), Some(s0)) = (ordinal(&msvc[0]), ordinal(&sysv[0])) else {
         panic!("expected positional register names, got msvc={msvc:?} sysv={sysv:?}");
     };
@@ -1047,7 +1146,9 @@ fn x86_avx_and_sse_name_one_physical_register() {
         "both the SSE and the AVX form must name vf3; got {names:?}"
     );
     assert!(
-        !names.iter().any(|n| n.starts_with('r') && n[1..].parse::<u32>().is_ok()),
+        !names
+            .iter()
+            .any(|n| n.starts_with('r') && n[1..].parse::<u32>().is_ok()),
         "no vector register may fall back to a phantom `r<ordinal>` name; got {names:?}"
     );
 }
@@ -1082,9 +1183,11 @@ fn x86_sub_register_widths_share_one_identity() {
         ir::RET_REG
     );
     assert!(
-        insns.iter().any(|i| matches!(i.op, Op::Arith(ArithKind::Shl))
-            && i.operands.get(1) == Some(&Operand::Register(ir::RET_REG.into()))
-            && i.operands.get(2) == Some(&Operand::Register("x3".into()))),
+        insns
+            .iter()
+            .any(|i| matches!(i.op, Op::Arith(ArithKind::Shl))
+                && i.operands.get(1) == Some(&Operand::Register(ir::RET_REG.into()))
+                && i.operands.get(2) == Some(&Operand::Register("x3".into()))),
         "`shl eax, cl` must shift {} by x3 (cl IS ecx): {insns:?}",
         ir::RET_REG
     );
@@ -1101,12 +1204,18 @@ fn x86_rep_movs_copies_and_leaves_the_exact_end_state() {
     let insns = lift_sysv(&[0xF3, 0xA4, 0xC3]);
     let copy = insns
         .iter()
-        .find(|i| matches!(i.op, Op::Move) && matches!(i.operands.get(1), Some(Operand::Memory { .. })))
+        .find(|i| {
+            matches!(i.op, Op::Move) && matches!(i.operands.get(1), Some(Operand::Memory { .. }))
+        })
         .expect("the byte copy must not be dropped");
     match (&copy.operands[0], &copy.operands[1]) {
         (
-            Operand::Memory { width: 1, base: d, .. },
-            Operand::Memory { width: 1, base: s, .. },
+            Operand::Memory {
+                width: 1, base: d, ..
+            },
+            Operand::Memory {
+                width: 1, base: s, ..
+            },
         ) => {
             assert!(
                 matches!(**d, Operand::Register(ref r) if r == "x0"),
@@ -1142,11 +1251,21 @@ fn x86_rep_stos_advances_only_the_destination() {
     let insns = lift_sysv(&[0xF3, 0x48, 0xAB, 0xC3]);
     let fill = insns
         .iter()
-        .find(|i| matches!(i.op, Op::Move) && matches!(i.operands.get(1), Some(Operand::Register(_))))
+        .find(|i| {
+            matches!(i.op, Op::Move) && matches!(i.operands.get(1), Some(Operand::Register(_)))
+        })
         .expect("the store must not be dropped");
     match (&fill.operands[0], &fill.operands[1]) {
-        (Operand::Memory { width: 8, base: d, .. }, Operand::Register(r)) => {
-            assert!(matches!(**d, Operand::Register(ref b) if b == "x0"), "stos writes [rdi] (x0): {fill:?}");
+        (
+            Operand::Memory {
+                width: 8, base: d, ..
+            },
+            Operand::Register(r),
+        ) => {
+            assert!(
+                matches!(**d, Operand::Register(ref b) if b == "x0"),
+                "stos writes [rdi] (x0): {fill:?}"
+            );
             assert_eq!(
                 r,
                 ir::RET_REG,
@@ -1160,11 +1279,7 @@ fn x86_rep_stos_advances_only_the_destination() {
         .iter()
         .filter(|i| matches!(i.op, Op::Arith(ArithKind::Add)))
         .collect();
-    assert_eq!(
-        adds.len(),
-        1,
-        "only rdi advances for `stos`: {insns:?}"
-    );
+    assert_eq!(adds.len(), 1, "only rdi advances for `stos`: {insns:?}");
     assert!(
         matches!(adds[0].operands.first(), Some(Operand::Register(r)) if r == "x0"),
         "the advancing pointer must be rdi: {:?}",
@@ -1226,13 +1341,17 @@ fn x86_loop_and_jrcxz_test_the_count_register_not_eflags() {
     // `loop +0` = E2 00 ; `ret`
     let looped = lift_sysv(&[0xE2, 0x00, 0xC3]);
     assert!(
-        looped.iter().any(|i| matches!(i.op, Op::Arith(ArithKind::Sub))
-            && matches!(i.operands.first(), Some(Operand::Register(r)) if r == "x3")
-            && i.operands.get(2) == Some(&Operand::Immediate(1))),
+        looped
+            .iter()
+            .any(|i| matches!(i.op, Op::Arith(ArithKind::Sub))
+                && matches!(i.operands.first(), Some(Operand::Register(r)) if r == "x3")
+                && i.operands.get(2) == Some(&Operand::Immediate(1))),
         "`loop` must decrement rcx: {looped:?}"
     );
     assert!(
-        looped.iter().any(|i| matches!(i.op, Op::Compare(CompareKind::NotEqual))),
+        looped
+            .iter()
+            .any(|i| matches!(i.op, Op::Compare(CompareKind::NotEqual))),
         "`loop` branches while rcx != 0: {looped:?}"
     );
 }
@@ -1244,16 +1363,20 @@ fn x86_bmi_ops_are_modelled_not_stubbed() {
     // `andn eax, ecx, edx` = C4 E2 70 F2 C2 ; `ret`
     let andn = lift_sysv(&[0xC4, 0xE2, 0x70, 0xF2, 0xC2, 0xC3]);
     assert!(
-        !andn.iter().any(|i| matches!(&i.op, Op::Simd(n) if n.contains("Andn"))),
+        !andn
+            .iter()
+            .any(|i| matches!(&i.op, Op::Simd(n) if n.contains("Andn"))),
         "`andn` must be modelled, not an `__Andn` stub: {andn:?}"
     );
     assert!(
-        andn.iter().any(|i| matches!(i.op, Op::Arith(ArithKind::Xor))
-            && i.operands.get(2) == Some(&Operand::Immediate(-1))),
+        andn.iter()
+            .any(|i| matches!(i.op, Op::Arith(ArithKind::Xor))
+                && i.operands.get(2) == Some(&Operand::Immediate(-1))),
         "`andn` complements its first source: {andn:?}"
     );
     assert!(
-        andn.iter().any(|i| matches!(i.op, Op::Arith(ArithKind::And)) && i.operands.len() == 3),
+        andn.iter()
+            .any(|i| matches!(i.op, Op::Arith(ArithKind::And)) && i.operands.len() == 3),
         "`andn` ANDs the complement with the second source: {andn:?}"
     );
 
@@ -1268,8 +1391,9 @@ fn x86_bmi_ops_are_modelled_not_stubbed() {
     // `blsr eax, ecx` = C4 E2 78 F3 C9 — src & (src - 1), NOT `src & -src`
     let blsr = lift_sysv(&[0xC4, 0xE2, 0x78, 0xF3, 0xC9, 0xC3]);
     assert!(
-        blsr.iter().any(|i| matches!(i.op, Op::Arith(ArithKind::Sub))
-            && i.operands.get(2) == Some(&Operand::Immediate(1)))
+        blsr.iter()
+            .any(|i| matches!(i.op, Op::Arith(ArithKind::Sub))
+                && i.operands.get(2) == Some(&Operand::Immediate(1)))
             && !blsr.iter().any(|i| matches!(i.op, Op::Negate)),
         "`blsr` clears the lowest set bit with `src - 1`, not a negate: {blsr:?}"
     );
@@ -1296,7 +1420,9 @@ fn x86_bmi_ops_are_modelled_not_stubbed() {
     // `bzhi eax, ecx, edx` = C4 E2 68 F5 C1 — a mask of `index` bits
     let bzhi = lift_sysv(&[0xC4, 0xE2, 0x68, 0xF5, 0xC1, 0xC3]);
     assert!(
-        !bzhi.iter().any(|i| matches!(&i.op, Op::Simd(n) if n.contains("Bzhi"))),
+        !bzhi
+            .iter()
+            .any(|i| matches!(&i.op, Op::Simd(n) if n.contains("Bzhi"))),
         "`bzhi` must be modelled, not a stub: {bzhi:?}"
     );
     assert_arith_is_three_operand(&bzhi, "bzhi");
@@ -1305,7 +1431,8 @@ fn x86_bmi_ops_are_modelled_not_stubbed() {
     // high half is published as an explicit unknown rather than left stale.
     let mulx = lift_sysv(&[0xC4, 0xE2, 0x73, 0xF6, 0xC2, 0xC3]);
     assert!(
-        mulx.iter().any(|i| matches!(&i.op, Op::Simd(n) if n.contains("mulx_hi"))),
+        mulx.iter()
+            .any(|i| matches!(&i.op, Op::Simd(n) if n.contains("mulx_hi"))),
         "`mulx`'s high half must be an explicit unknown, not a stale value: {mulx:?}"
     );
     assert_arith_is_three_operand(&mulx, "mulx");
@@ -1484,9 +1611,7 @@ fn x86_bit_test_drives_a_single_bit_condition() {
         _ => false,
     });
     let causal = insns.iter().any(|i| match &i.op {
-        Op::Compare(CompareKind::NotEqual) => {
-            !matches!(i.operands.get(1), Some(Operand::Unknown))
-        }
+        Op::Compare(CompareKind::NotEqual) => !matches!(i.operands.get(1), Some(Operand::Unknown)),
         _ => false,
     });
     assert!(
@@ -1520,9 +1645,7 @@ fn x86_register_bit_index_is_a_variable_shift() {
         _ => false,
     });
     let causal = insns.iter().any(|i| match &i.op {
-        Op::Compare(CompareKind::NotEqual) => {
-            !matches!(i.operands.get(1), Some(Operand::Unknown))
-        }
+        Op::Compare(CompareKind::NotEqual) => !matches!(i.operands.get(1), Some(Operand::Unknown)),
         _ => false,
     });
     assert!(
@@ -1541,8 +1664,7 @@ fn x86_cmpxchg_lifts_to_a_real_compare_exchange() {
         .filter(|i| matches!(&i.op, Op::Select(_)))
         .count();
     let stores = insns.iter().any(|i| {
-        matches!(&i.op, Op::Move)
-            && matches!(i.operands.first(), Some(Operand::Memory { .. }))
+        matches!(&i.op, Op::Move) && matches!(i.operands.first(), Some(Operand::Memory { .. }))
     });
     assert!(
         selects >= 2 && stores,
@@ -1567,7 +1689,11 @@ fn x86_shld_is_a_shift_pair_plus_or() {
     let or = insns
         .iter()
         .any(|i| matches!(&i.op, Op::Arith(ArithKind::Or)));
-    assert!(shl4 && shr28 && or, "shld eax,ecx,4 lowered wrong: {:?}", insns);
+    assert!(
+        shl4 && shr28 && or,
+        "shld eax,ecx,4 lowered wrong: {:?}",
+        insns
+    );
 }
 
 #[test]
@@ -1658,11 +1784,12 @@ fn x86_sbb_is_borrow_not_not_borrow() {
 fn x86_xchg_swaps_both_ways() {
     // `xchg eax, ecx` = 91 ; `ret` = C3
     let insns = lift_sysv(&[0x91, 0xC3]);
-    let moves = insns
-        .iter()
-        .filter(|i| matches!(&i.op, Op::Move))
-        .count();
-    assert!(moves >= 3, "xchg must be a three-step swap, got {:?}", insns);
+    let moves = insns.iter().filter(|i| matches!(&i.op, Op::Move)).count();
+    assert!(
+        moves >= 3,
+        "xchg must be a three-step swap, got {:?}",
+        insns
+    );
 }
 
 #[test]
@@ -1706,19 +1833,23 @@ fn lift_a32(words: &[u32]) -> Vec<Insn> {
     for w in words {
         bytes.extend_from_slice(&w.to_le_bytes());
     }
-    lift_arm32::lift_arm32(&bytes, 0x1000, 64).expect("lift").insns
+    lift_arm32::lift_arm32(&bytes, 0x1000, 64)
+        .expect("lift")
+        .insns
 }
 
 #[test]
 fn arm32_exclusive_load_is_a_real_load() {
     // `ldrex r0, [r1]` = E1910F9F ; `bx lr` = E12FFF1E
     let insns = lift_a32(&[0xE1910F9F, 0xE12FFF1E]);
-    let loaded = insns.iter().any(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
-        (Op::Move, Some(Operand::Register(r)), Some(Operand::Memory { base, .. })) => {
-            r == "x0" && matches!(**base, Operand::Register(ref b) if b == "x1")
-        }
-        _ => false,
-    });
+    let loaded = insns
+        .iter()
+        .any(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
+            (Op::Move, Some(Operand::Register(r)), Some(Operand::Memory { base, .. })) => {
+                r == "x0" && matches!(**base, Operand::Register(ref b) if b == "x1")
+            }
+            _ => false,
+        });
     assert!(
         loaded,
         "ldrex must lift to a load from its real address (the Interlocked path); got {:?}",
@@ -1738,12 +1869,16 @@ fn arm32_post_indexed_load_updates_its_base() {
             && matches!(i.operands.first(), Some(Operand::Register(r)) if r == "x0")
             && matches!(i.operands.get(1), Some(Operand::Memory { .. }))
     });
-    let advanced = insns.iter().any(|i| match (&i.op, i.operands.first(), i.operands.get(2)) {
-        (Op::Arith(ArithKind::Add), Some(Operand::Register(r)), Some(Operand::Immediate(4))) => {
-            r == "x1"
-        }
-        _ => false,
-    });
+    let advanced = insns
+        .iter()
+        .any(|i| match (&i.op, i.operands.first(), i.operands.get(2)) {
+            (
+                Op::Arith(ArithKind::Add),
+                Some(Operand::Register(r)),
+                Some(Operand::Immediate(4)),
+            ) => r == "x1",
+            _ => false,
+        });
     assert!(
         loaded && advanced,
         "post-indexed ldr must load AND advance r1 by 4; got {:?}",
@@ -1756,12 +1891,14 @@ fn arm32_adr_materializes_a_real_address() {
     // `adr r0, pc, 0x8` = E28F0008 ; `bx lr`, lifted at 0x1000
     // A32 `pc` reads as `addr + 8`, so the value is 0x1000 + 8 + 8 = 0x1010.
     let insns = lift_a32(&[0xE28F0008, 0xE12FFF1E]);
-    let value = insns.iter().find_map(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
-        (Op::Move, Some(Operand::Register(r)), Some(Operand::Immediate(v))) if r == "x0" => {
-            Some(*v)
-        }
-        _ => None,
-    });
+    let value = insns
+        .iter()
+        .find_map(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
+            (Op::Move, Some(Operand::Register(r)), Some(Operand::Immediate(v))) if r == "x0" => {
+                Some(*v)
+            }
+            _ => None,
+        });
     assert_eq!(
         value,
         Some(0x1010),
@@ -1775,9 +1912,15 @@ fn arm32_mls_is_a_negated_multiply_add() {
     // `mls r0, r1, r2, r3` = E0603291  == r0 = r3 - r1*r2 ; `bx lr`
     let insns = lift_a32(&[0xE0603291, 0xE12FFF1E]);
     let neg = insns.iter().any(|i| matches!(&i.op, Op::Negate));
-    let acc = insns
-        .iter()
-        .any(|i| matches!(&i.op, Op::MulAcc { negate_addend: false, .. }));
+    let acc = insns.iter().any(|i| {
+        matches!(
+            &i.op,
+            Op::MulAcc {
+                negate_addend: false,
+                ..
+            }
+        )
+    });
     assert!(neg && acc, "mls lowered wrong: {:?}", insns);
 }
 
@@ -1786,9 +1929,13 @@ fn arm32_smlal_accumulates_the_low_word() {
     // `smlal r0, r1, r2, r3` = E0E10392 ; `bx lr`
     let insns = lift_a32(&[0xE0E10392, 0xE12FFF1E]);
     assert!(
-        insns
-            .iter()
-            .any(|i| matches!(&i.op, Op::MulAcc { is_float: false, .. })),
+        insns.iter().any(|i| matches!(
+            &i.op,
+            Op::MulAcc {
+                is_float: false,
+                ..
+            }
+        )),
         "smlal must accumulate into its low word; got {:?}",
         insns
     );
@@ -1796,20 +1943,21 @@ fn arm32_smlal_accumulates_the_low_word() {
 
 #[test]
 fn arm32_dsp_mul_decodes_the_variant_from_the_word() {
-    use crate::recovery::lift_arm32::{dsp_mul, DspMul};
+    use crate::recovery::lift_arm32::{DspMul, dsp_mul};
     // Every encoding below was assembled with `llvm-mc --show-encoding` and
     // round-tripped back through `llvm-mc --disassemble`, because yaxpeax's
     // rendering of this family is wrong in two independent ways (see
     // `dsp_mul`): it swaps the halfword selectors on `smlal` and calls
     // `smulw*` `smlaw*`. The table pins the *bits*, so a future decoder bump
     // cannot drag the lifter back to the wrong product.
-    let dsp = |long: bool, word_form: bool, accumulate: bool, rn_high: bool, rm_high: bool| DspMul {
-        long,
-        word_form,
-        accumulate,
-        rn_high,
-        rm_high,
-    };
+    let dsp =
+        |long: bool, word_form: bool, accumulate: bool, rn_high: bool, rm_high: bool| DspMul {
+            long,
+            word_form,
+            accumulate,
+            rn_high,
+            rm_high,
+        };
     let table: &[(u32, &str, DspMul)] = &[
         (0xE1600281, "smulbb", dsp(false, false, false, false, false)),
         (0xE16002C1, "smulbt", dsp(false, false, false, false, true)),
@@ -1907,12 +2055,14 @@ fn arm32_smulwb_is_not_the_accumulate_yaxpeax_calls_it() {
     // it computes `r0 = ((r0 * r1[15:0]) >> 16) + r0`, reading and re-adding
     // the destination. Bit5 says `smulw`, so no addend may be consumed.
     let insns = lift_a32(&[0xE12002A1, 0xE12FFF1E]);
-    let accumulates = insns.iter().any(|i| match (&i.op, i.operands.first(), i.operands.get(2)) {
-        (Op::Arith(ArithKind::Add), Some(Operand::Register(r)), Some(Operand::Register(_))) => {
-            r == "x0"
-        }
-        _ => false,
-    });
+    let accumulates = insns
+        .iter()
+        .any(|i| match (&i.op, i.operands.first(), i.operands.get(2)) {
+            (Op::Arith(ArithKind::Add), Some(Operand::Register(r)), Some(Operand::Register(_))) => {
+                r == "x0"
+            }
+            _ => false,
+        });
     assert!(
         !accumulates,
         "smulwb must not accumulate an addend; got {:?}",
@@ -1948,9 +2098,13 @@ fn arm32_bare_umlal_still_reaches_its_own_arm() {
     // unsigned accumulate.
     let insns = lift_a32(&[0xE0A10392, 0xE12FFF1E]);
     assert!(
-        insns
-            .iter()
-            .any(|i| matches!(&i.op, Op::MulAcc { is_float: false, .. })),
+        insns.iter().any(|i| matches!(
+            &i.op,
+            Op::MulAcc {
+                is_float: false,
+                ..
+            }
+        )),
         "umlal must still accumulate; got {:?}",
         insns
     );
@@ -1958,12 +2112,16 @@ fn arm32_bare_umlal_still_reaches_its_own_arm() {
 
 /// Does some instruction shift register `reg` right by 16 into a temp?
 fn shifts_reg_right_16(insns: &[Insn], reg: &str) -> bool {
-    insns.iter().any(|i| match (&i.op, i.operands.get(1), i.operands.get(2)) {
-        (Op::Arith(ArithKind::Shr), Some(Operand::Register(r)), Some(Operand::Immediate(16))) => {
-            r == reg
-        }
-        _ => false,
-    })
+    insns
+        .iter()
+        .any(|i| match (&i.op, i.operands.get(1), i.operands.get(2)) {
+            (
+                Op::Arith(ArithKind::Shr),
+                Some(Operand::Register(r)),
+                Some(Operand::Immediate(16)),
+            ) => r == reg,
+            _ => false,
+        })
 }
 
 #[test]
@@ -2006,12 +2164,17 @@ fn arm32_smulwb_takes_the_high_half_of_the_product() {
         insns
     );
     // The result is written to x0 by a >>16 of the product temp.
-    let result_shifted = insns.iter().any(|i| match (&i.op, i.operands.first(), i.operands.get(2)) {
-        (Op::Arith(ArithKind::Shr), Some(Operand::Register(r)), Some(Operand::Immediate(16))) => {
-            r == "x0"
-        }
-        _ => false,
-    });
+    let result_shifted =
+        insns
+            .iter()
+            .any(|i| match (&i.op, i.operands.first(), i.operands.get(2)) {
+                (
+                    Op::Arith(ArithKind::Shr),
+                    Some(Operand::Register(r)),
+                    Some(Operand::Immediate(16)),
+                ) => r == "x0",
+                _ => false,
+            });
     assert!(
         result_shifted,
         "smulwb must shift the 48-bit product right by 16 into Rd; got {:?}",
@@ -2033,12 +2196,14 @@ fn arm32_smlawb_shifts_then_accumulates() {
         matches!(&i.op, Op::Arith(ArithKind::Shr))
             && i.operands.get(2) == Some(&Operand::Immediate(16))
     });
-    let accumulated = insns.iter().any(|i| match (&i.op, i.operands.first(), i.operands.get(2)) {
-        (Op::Arith(ArithKind::Add), Some(Operand::Register(r)), Some(Operand::Register(a))) => {
-            r == "x0" && a == "x3"
-        }
-        _ => false,
-    });
+    let accumulated = insns
+        .iter()
+        .any(|i| match (&i.op, i.operands.first(), i.operands.get(2)) {
+            (Op::Arith(ArithKind::Add), Some(Operand::Register(r)), Some(Operand::Register(a))) => {
+                r == "x0" && a == "x3"
+            }
+            _ => false,
+        });
     assert!(
         shifted && accumulated,
         "smlawb must shift the product right by 16 and add Ra (x3) into Rd; got {:?}",
@@ -2058,7 +2223,13 @@ fn arm32_smlaltt_sign_extends_both_top_halves() {
         insns
     );
     assert!(
-        insns.iter().any(|i| matches!(&i.op, Op::MulAcc { is_float: false, .. })),
+        insns.iter().any(|i| matches!(
+            &i.op,
+            Op::MulAcc {
+                is_float: false,
+                ..
+            }
+        )),
         "smlaltt must accumulate a product into its low word: {:?}",
         insns
     );
@@ -2087,16 +2258,22 @@ fn arm32_adc_consumes_the_carry_of_the_adds_before_it() {
     );
     // ADD carry = (sum < lhs), turned into an integer 0/1 by the Select.
     assert!(
-        insns.iter().any(|i| matches!(&i.op, Op::Compare(CompareKind::LessThan))),
+        insns
+            .iter()
+            .any(|i| matches!(&i.op, Op::Compare(CompareKind::LessThan))),
         "the adds must publish `(sum < lhs)` as its carry: {:?}",
         insns
     );
-    let carry = insns.iter().find_map(|i| match (&i.op, i.operands.get(2), i.operands.get(3)) {
-        (Op::Select(super::ir::SelectVariant::Identity), Some(Operand::Immediate(1)), Some(Operand::Immediate(0))) => {
-            Some(i)
-        }
-        _ => None,
-    });
+    let carry = insns
+        .iter()
+        .find_map(|i| match (&i.op, i.operands.get(2), i.operands.get(3)) {
+            (
+                Op::Select(super::ir::SelectVariant::Identity),
+                Some(Operand::Immediate(1)),
+                Some(Operand::Immediate(0)),
+            ) => Some(i),
+            _ => None,
+        });
     assert!(
         carry.is_some(),
         "the carry must be materialized as an integer 0/1 value: {:?}",
@@ -2136,7 +2313,11 @@ fn arm32_sbc_subtracts_the_borrow() {
     });
     assert!(borrow, "sbc needs `1 - C`, i.e. a 0/1 select: {:?}", insns);
     assert!(
-        insns.iter().filter(|i| matches!(&i.op, Op::Arith(ArithKind::Sub))).count() >= 3,
+        insns
+            .iter()
+            .filter(|i| matches!(&i.op, Op::Arith(ArithKind::Sub)))
+            .count()
+            >= 3,
         "subs + sbc must both subtract: {:?}",
         insns
     );
@@ -2157,16 +2338,17 @@ fn arm32_flag_setting_mvn_and_adr_keep_their_suffix() {
     );
     // `mvn` is lowered as `x1 ^ -1` (the honest two-step), not a `Not` op.
     assert!(
-        insns.iter().any(|i| matches!(&i.op, Op::Arith(ArithKind::Xor))
-            && matches!(i.operands.get(2), Some(Operand::Immediate(-1)))),
+        insns
+            .iter()
+            .any(|i| matches!(&i.op, Op::Arith(ArithKind::Xor))
+                && matches!(i.operands.get(2), Some(Operand::Immediate(-1)))),
         "mvns must still invert: {:?}",
         insns
     );
     // `adrs r1, #0x10` at 0x1004 reads pc as its own address + 8
     // (0x1004 + 8 + 0x10 = 0x101C).
     let adr = insns.iter().any(|i| {
-        matches!(&i.op, Op::Move)
-            && matches!(i.operands.get(1), Some(Operand::Immediate(0x101C)))
+        matches!(&i.op, Op::Move) && matches!(i.operands.get(1), Some(Operand::Immediate(0x101C)))
     });
     assert!(adr, "adrs must materialize 0x1004 + 8 + 0x10: {:?}", insns);
 }
@@ -2276,7 +2458,6 @@ fn arm32_seeds_incoming_arg_registers_despite_g14() {
     );
 }
 
-
 #[test]
 fn arm32_unprivileged_load_lifts_like_the_ordinary_one() {
     // `ldrbt r0, [r1], #4` = E4D10004 ; `bx lr`.
@@ -2296,7 +2477,11 @@ fn arm32_unprivileged_load_lifts_like_the_ordinary_one() {
         matches!(&i.op, Op::Arith(ArithKind::Add))
             && matches!(i.operands.get(2), Some(Operand::Immediate(4)))
     });
-    assert!(loaded && advanced, "ldrbt must load AND advance r1: {:?}", insns);
+    assert!(
+        loaded && advanced,
+        "ldrbt must load AND advance r1: {:?}",
+        insns
+    );
 }
 
 #[test]
@@ -2385,10 +2570,7 @@ fn arm32_predicated_move_is_a_select_not_an_unconditional_move() {
     );
     // The predicate is materialized as a real compare against zero.
     assert!(
-        lifted
-            .insns
-            .iter()
-            .any(|i| matches!(i.op, Op::Compare(_))),
+        lifted.insns.iter().any(|i| matches!(i.op, Op::Compare(_))),
         "the pending compare must be materialized: {:?}",
         lifted.insns
     );
@@ -2426,7 +2608,11 @@ fn arm32_conditional_return_keeps_its_condition() {
             panic!(
                 "a conditional return must be guarded by a branch to the next \
                  instruction, got {:?}",
-                lifted.insns.iter().map(|i| i.op.clone()).collect::<Vec<_>>()
+                lifted
+                    .insns
+                    .iter()
+                    .map(|i| i.op.clone())
+                    .collect::<Vec<_>>()
             )
         });
     // The guard branches on the NEGATION: `popeq` returns when equal, so it
@@ -2476,7 +2662,11 @@ fn arm32_register_shifted_source_keeps_the_shift_register() {
         .iter()
         .filter(|i| matches!(i.op, Op::Arith(ArithKind::Shl)))
         .collect();
-    assert!(!shl.is_empty(), "register shift must emit a Shl: {:?}", lifted.insns);
+    assert!(
+        !shl.is_empty(),
+        "register shift must emit a Shl: {:?}",
+        lifted.insns
+    );
     for s in &shl {
         assert!(
             matches!(s.operands.get(2), Some(Operand::Register(n)) if n == "x1"),
@@ -2580,8 +2770,14 @@ fn arm32_vfp_double_and_unary() {
         .collect();
     assert_eq!(kinds.len(), 3);
     assert_eq!(kinds[0], (FloatArithKind::Add, "vd0".into(), "vd1".into()));
-    assert_eq!(kinds[1], (FloatArithKind::Abs, "vs18".into(), "vs19".into()));
-    assert_eq!(kinds[2], (FloatArithKind::Sqrt, "vs22".into(), "vs23".into()));
+    assert_eq!(
+        kinds[1],
+        (FloatArithKind::Abs, "vs18".into(), "vs19".into())
+    );
+    assert_eq!(
+        kinds[2],
+        (FloatArithKind::Sqrt, "vs22".into(), "vs23".into())
+    );
 }
 
 /// `vmov` between a core register and a single-precision FP register used to be
@@ -2622,7 +2818,11 @@ fn arm32_vfp_core_transfer_covers_every_single_register() {
             .iter()
             .any(|i| matches!(i.op, Op::MulAcc { .. })),
         "a core transfer must never lift as VMLA: {:?}",
-        lifted.insns.iter().map(|i| (i.address, i.op.clone())).collect::<Vec<_>>()
+        lifted
+            .insns
+            .iter()
+            .map(|i| (i.address, i.op.clone()))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2659,14 +2859,19 @@ fn arm32_vfp_vmla_vldr_and_compare() {
     // vmla.f32 s12,s13,s14 = EE066A87 ; vldr.f32 s30,[r2,#4] = ED92FA01
     // vcmp.f32 s22,s23 = EEB4BA6B ; vmrs APSR_nzcv,FPSCR = EEF1FA10
     // bne $+0x0 = 1AFFFFFE ; bx lr
-    let bytes = le(&[0xEE066A87, 0xED92FA01, 0xEEB4BA6B, 0xEEF1FA10, 0x1AFFFFFE, 0xE12FFF1E]);
+    let bytes = le(&[
+        0xEE066A87, 0xED92FA01, 0xEEB4BA6B, 0xEEF1FA10, 0x1AFFFFFE, 0xE12FFF1E,
+    ]);
     let lifted = lift_arm32::lift_arm32(&bytes, 0x2000, 32).expect("lift");
     let mut ops: Vec<Op> = lifted.insns.iter().map(|i| i.op.clone()).collect();
     ops.retain(|o| !matches!(o, Op::Return));
     assert!(matches!(ops[0], Op::MulAcc { is_float: true, .. }));
     assert_eq!(ops[1], Op::Move); // vldr → move from memory
     // vmrs must NOT clear the pending vcmp — the following bne consumes it
-    assert!(matches!(ops[2], Op::Compare(_)), "vcmp→vmrs→bne should lift to a compare");
+    assert!(
+        matches!(ops[2], Op::Compare(_)),
+        "vcmp→vmrs→bne should lift to a compare"
+    );
     assert!(matches!(ops[3], Op::CondJump(_)));
 }
 
@@ -2698,13 +2903,22 @@ fn arm32_vldr_off_callee_saved_base_is_lifted() {
                     if matches!(base.as_ref(), Operand::Register(n) if n == "x4"))
         })
         .collect();
-    assert_eq!(loads.len(), 2, "both vldr off r4 must be lifted: {:?}", lifted.insns);
+    assert_eq!(
+        loads.len(),
+        2,
+        "both vldr off r4 must be lifted: {:?}",
+        lifted.insns
+    );
     assert!(
-        loads.iter().any(|i| matches!(i.operands.first(), Some(Operand::Register(n)) if n == "vs0")),
+        loads
+            .iter()
+            .any(|i| matches!(i.operands.first(), Some(Operand::Register(n)) if n == "vs0")),
         "the vs0 load must survive"
     );
     assert!(
-        loads.iter().any(|i| matches!(i.operands.first(), Some(Operand::Register(n)) if n == "vs16")),
+        loads
+            .iter()
+            .any(|i| matches!(i.operands.first(), Some(Operand::Register(n)) if n == "vs16")),
         "the vs16 load must survive"
     );
     // And the compare that consumes vs0 keeps a real register operand.
@@ -2761,7 +2975,10 @@ fn arm32_vcmpe_and_register_vcmp_keep_their_operands() {
         .iter()
         .find(|i| matches!(i.op, Op::Compare(_)))
         .expect("vcmpe #0 must produce a Compare");
-    assert!(matches!(cmp.operands.get(2), Some(Operand::FloatLiteral(_))));
+    assert!(matches!(
+        cmp.operands.get(2),
+        Some(Operand::FloatLiteral(_))
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -2774,9 +2991,14 @@ fn arm32_movw_movt_pair() {
     let bytes = le(&[0xE3010234, 0xE34A0BCD, 0xE12FFF1E]);
     let lifted = lift_arm32::lift_arm32(&bytes, 0x3000, 16).expect("lift");
     assert_eq!(lifted.insns.len(), 3); // mov imm, mov imm, return
-    assert!(matches!(lifted.insns[0].operands.get(1), Some(Operand::Immediate(0x1234))));
+    assert!(matches!(
+        lifted.insns[0].operands.get(1),
+        Some(Operand::Immediate(0x1234))
+    ));
     // movt folds the low half into the high-combined constant
-    assert!(matches!(lifted.insns[1].operands.get(1), Some(Operand::Immediate(v)) if *v == 0xABCD1234));
+    assert!(
+        matches!(lifted.insns[1].operands.get(1), Some(Operand::Immediate(v)) if *v == 0xABCD1234)
+    );
 }
 
 #[test]
@@ -2854,11 +3076,20 @@ fn arm32_unconditional_branch_keeps_the_pending_compare() {
     let insns = lift_a32(&[0xE1500001, 0x9A000000, 0xEA000000, 0x8AFFFFFF, 0xE12FFF1E]);
     assert!(
         !insns.iter().any(|i| matches!(i.op, Op::Compare(_))
-            && i.operands.iter().skip(1).any(|o| matches!(o, Operand::Unknown))),
+            && i.operands
+                .iter()
+                .skip(1)
+                .any(|o| matches!(o, Operand::Unknown))),
         "the `bhi` after the unconditional `b` must keep the cmp's operands: {insns:?}"
     );
-    let real = insns.iter().filter(|i| matches!(i.op, Op::Compare(_))).count();
-    assert!(real >= 2, "both branches need a compare, not one: {insns:?}");
+    let real = insns
+        .iter()
+        .filter(|i| matches!(i.op, Op::Compare(_)))
+        .count();
+    assert!(
+        real >= 2,
+        "both branches need a compare, not one: {insns:?}"
+    );
 }
 
 #[test]
@@ -2869,11 +3100,20 @@ fn x64_direct_jump_keeps_the_pending_compare() {
     let insns = lift_sysv(&bytes);
     assert!(
         !insns.iter().any(|i| matches!(i.op, Op::Compare(_))
-            && i.operands.iter().skip(1).any(|o| matches!(o, Operand::Unknown))),
+            && i.operands
+                .iter()
+                .skip(1)
+                .any(|o| matches!(o, Operand::Unknown))),
         "the `ja` after the direct `jmp` must keep the cmp's operands: {insns:?}"
     );
-    let real = insns.iter().filter(|i| matches!(i.op, Op::Compare(_))).count();
-    assert!(real >= 2, "both conditional branches need a compare: {insns:?}");
+    let real = insns
+        .iter()
+        .filter(|i| matches!(i.op, Op::Compare(_)))
+        .count();
+    assert!(
+        real >= 2,
+        "both conditional branches need a compare: {insns:?}"
+    );
 }
 
 #[test]
@@ -2916,7 +3156,10 @@ fn arm32_cross_block_condition_is_recovered_from_a_reaching_compare() {
          compare: {insns:?}"
     );
     let n = passes::resolve_cross_block_conditions(&mut insns, &graph);
-    assert_eq!(n, 1, "exactly the cross-block branch is recovered: {insns:?}");
+    assert_eq!(
+        n, 1,
+        "exactly the cross-block branch is recovered: {insns:?}"
+    );
     assert!(
         !insns.iter().any(|i| matches!(i.op, Op::Compare(_))
             && matches!(i.operands.get(1), Some(Operand::Unknown))),
@@ -2948,7 +3191,10 @@ fn arm32_cross_block_pass_will_not_cross_a_call_on_the_path() {
     let mut insns = lifted.insns;
     let graph = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
     let n = passes::resolve_cross_block_conditions(&mut insns, &graph);
-    assert_eq!(n, 0, "a call on the path must block the recovery: {insns:?}");
+    assert_eq!(
+        n, 0,
+        "a call on the path must block the recovery: {insns:?}"
+    );
 }
 
 #[test]
@@ -3051,11 +3297,15 @@ fn arm32_vfp_sqrt_neg_and_convert_register_forms_are_lifted() {
     // (the ones that actually occur) fell through to `NotVfp`.
     let insns = lift_a32(&[0xeeb19ac9, 0xeeb10a49, 0xeeb80ac9, 0xe12fff1e]);
     assert!(
-        insns.iter().any(|i| matches!(i.op, Op::FloatArith(FloatArithKind::Sqrt))),
+        insns
+            .iter()
+            .any(|i| matches!(i.op, Op::FloatArith(FloatArithKind::Sqrt))),
         "vsqrt must lift: {insns:?}"
     );
     assert!(
-        insns.iter().any(|i| matches!(i.op, Op::FloatArith(FloatArithKind::Neg))),
+        insns
+            .iter()
+            .any(|i| matches!(i.op, Op::FloatArith(FloatArithKind::Neg))),
         "vneg must lift: {insns:?}"
     );
     assert!(
@@ -3063,7 +3313,6 @@ fn arm32_vfp_sqrt_neg_and_convert_register_forms_are_lifted() {
         "vcvt must lift: {insns:?}"
     );
 }
-
 
 #[test]
 fn arm32_signed_narrow_loads_are_lifted_from_the_raw_word() {
@@ -3074,15 +3323,20 @@ fn arm32_signed_narrow_loads_are_lifted_from_the_raw_word() {
     let widths: Vec<u8> = insns
         .iter()
         .filter_map(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
-            (Op::Move, Some(Operand::Register(r)), Some(Operand::Memory { width, base, addend, .. }))
-                if r == "x0" =>
-            {
-                match (&**base, *addend) {
-                    (Operand::Register(b), 8) if b == "x4" => Some(*width),
-                    (Operand::Register(b), 2) if b == "sp" => Some(*width),
-                    _ => None,
-                }
-            }
+            (
+                Op::Move,
+                Some(Operand::Register(r)),
+                Some(Operand::Memory {
+                    width,
+                    base,
+                    addend,
+                    ..
+                }),
+            ) if r == "x0" => match (&**base, *addend) {
+                (Operand::Register(b), 8) if b == "x4" => Some(*width),
+                (Operand::Register(b), 2) if b == "sp" => Some(*width),
+                _ => None,
+            },
             _ => None,
         })
         .collect();
@@ -3134,12 +3388,14 @@ fn arm32_vldr_literal_pool_resolves_the_program_counter() {
     // `vldr s0, [pc, #100]` = 0xED9F0A19, lifted at 0x1000. A32 `pc` reads as
     // `addr + 8`, so the literal lives at 0x106c — not at a raw `g15` base.
     let insns = lift_a32(&[0xed9f0a19, 0xe12fff1e]);
-    let ok = insns.iter().any(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
-        (Op::Move, Some(Operand::Register(r)), Some(Operand::Memory { base, .. })) => {
-            r == "vs0" && matches!(&**base, Operand::Immediate(a) if *a == 0x106c)
-        }
-        _ => false,
-    });
+    let ok = insns
+        .iter()
+        .any(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
+            (Op::Move, Some(Operand::Register(r)), Some(Operand::Memory { base, .. })) => {
+                r == "vs0" && matches!(&**base, Operand::Immediate(a) if *a == 0x106c)
+            }
+            _ => false,
+        });
     assert!(
         ok,
         "the vldr literal address must be the resolved PC + 8 + offset: {insns:?}"
@@ -3174,14 +3430,14 @@ fn arm32_vstmia_register_list_emits_ir_at_its_own_address() {
     // the LAST genuine branch-target mismatch: the word produced NO IR, so a
     // `bhi` that targets it had its IR target shifted to the next instruction.
     let insns = lift_a32(&[0xecaa8a01, 0xe12fff1e]);
-    let stored = insns.iter().any(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
-        (Op::Move, Some(Operand::Memory { base, addend, .. }), Some(Operand::Register(r))) => {
-            r == "vs16"
-                && *addend == 0
-                && matches!(&**base, Operand::Register(b) if b == "x10")
-        }
-        _ => false,
-    });
+    let stored = insns
+        .iter()
+        .any(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
+            (Op::Move, Some(Operand::Memory { base, addend, .. }), Some(Operand::Register(r))) => {
+                r == "vs16" && *addend == 0 && matches!(&**base, Operand::Register(b) if b == "x10")
+            }
+            _ => false,
+        });
     assert!(
         stored,
         "vstmia must store its register list to the base address: {insns:?}"
@@ -3201,14 +3457,20 @@ fn arm32_vldmia_register_list_loads_into_the_vfp_file() {
     let insns = lift_a32(&[0xecb00a02, 0xe12fff1e]);
     for (reg, off) in [("vs0", 0i64), ("vs1", 4)] {
         assert!(
-            insns.iter().any(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
-                (Op::Move, Some(Operand::Register(r)), Some(Operand::Memory { base, addend, .. })) => {
-                    r == reg
-                        && *addend == off
-                        && matches!(&**base, Operand::Register(b) if b == "x0")
-                }
-                _ => false,
-            }),
+            insns
+                .iter()
+                .any(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
+                    (
+                        Op::Move,
+                        Some(Operand::Register(r)),
+                        Some(Operand::Memory { base, addend, .. }),
+                    ) => {
+                        r == reg
+                            && *addend == off
+                            && matches!(&**base, Operand::Register(b) if b == "x0")
+                    }
+                    _ => false,
+                }),
             "vldmia must load {reg} from [x0, #{off}]: {insns:?}"
         );
     }
@@ -3281,12 +3543,142 @@ fn key_function_object_new_becomes_typed_newobj() {
     }
 }
 
-/// box(klass, &value) call sites become Box ops carrying the value operand.
+/// Runtime metadata initialization — a VOID call whose first argument is the
+/// ADDRESS of a metadata usage slot — is bookkeeping the source never had, and
+/// is dropped (never a managed observable effect).
 #[test]
-fn key_function_box_becomes_box() {
+fn key_function_drops_metadata_usage_init() {
+    let slot = 0x7000i64;
+    let mut insns = vec![Insn::new(
+        Op::CallVoid,
+        vec![
+            Operand::imm(0x9300),
+            Operand::imm(slot),
+            Operand::reg("x1"),
+        ],
+        0x1000,
+    )];
+    let mut maps = resolve::ResolveMaps::default();
+    maps.klass_to_tdi.insert(slot as u64, 5);
+    maps.tdi_names.insert(5, ("Test".into(), "Thing".into()));
+
+    let table = locals::create(&HashMap::new(), &helper_seed());
+    resolve::run(&mut insns, &table, &maps);
+
+    assert!(matches!(insns[0].op, Op::Nop), "got {:?}", insns[0].op);
+    assert_eq!(
+        crate::recovery::runtime_helpers::role_of(0x9300),
+        Some(crate::recovery::runtime_helpers::RuntimeHelper::MetadataInit)
+    );
+    assert_eq!(
+        crate::recovery::runtime_helpers::arg_arity(0x9300),
+        Some(1)
+    );
+}
+
+/// A klass loaded through a GOT slot (`[[got]]`) is still proven metadata:
+/// got_addend → usage slot → TypeDef. This is the shape of the large
+/// allocation temps (`v480 = object_new(*(*(GOT)))`).
+#[test]
+fn key_function_object_new_resolves_klass_through_the_got() {
+    let got = 0x5000u64;
+    let slot = 0x6100u64;
+    let inner = Operand::Memory {
+        base: Box::new(Operand::Immediate(got as i64)),
+        index: None,
+        scale: 1,
+        addend: 0,
+        width: 0,
+    };
+    let outer = Operand::Memory {
+        base: Box::new(inner),
+        index: None,
+        scale: 1,
+        addend: 0,
+        width: 0,
+    };
+    let mut insns = vec![
+        Insn::move_(Operand::reg("x0"), outer, 0x1000),
+        Insn::new(
+            Op::Call,
+            vec![
+                Operand::imm(0x9400),
+                Operand::reg("x0"),
+                Operand::reg("x0"),
+                Operand::reg("x1"),
+            ],
+            0x1004,
+        ),
+    ];
+    let mut maps = resolve::ResolveMaps::default();
+    maps.object_new = vec![0x9400];
+    maps.got_addend_by_addr.insert(got, slot);
+    maps.klass_to_tdi.insert(slot, 11);
+    maps.tdi_names
+        .insert(11, ("System.Collections.Generic".into(), "List`1".into()));
+
+    let table = locals::create(&HashMap::new(), &helper_seed());
+    resolve::run(&mut insns, &table, &maps);
+
+    match &insns[1].op {
+        Op::NewObj(Some(t)) => assert_eq!(t.ty.name, "List`1"),
+        other => panic!("expected typed NewObj through GOT, got {other:?}"),
+    }
+}
+
+/// `v = helper(object, klass)` is an instance-of test even when a broad alias
+/// chain also put the target in the object_new family: the allocator's class
+/// is x0, not x1.
+#[test]
+fn key_function_isinst_overrides_a_wide_object_new_alias() {
+    let mut insns = vec![
+        Insn::move_(Operand::reg("x1"), Operand::imm(0x6200), 0x1000),
+        Insn::new(
+            Op::Call,
+            vec![
+                Operand::imm(0x9500),
+                Operand::reg("x0"),
+                Operand::reg("x0"),
+                Operand::reg("x1"),
+            ],
+            0x1004,
+        ),
+    ];
+    let mut maps = resolve::ResolveMaps::default();
+    maps.object_new = vec![0x9500];
+    maps.klass_to_tdi.insert(0x6200, 12);
+    maps.tdi_names.insert(12, ("Test".into(), "Other".into()));
+
+    let table = locals::create(&HashMap::new(), &helper_seed());
+    resolve::run(&mut insns, &table, &maps);
+
+    assert!(
+        matches!(insns[1].op, Op::Call),
+        "the isinst call must stay a call, got {:?}",
+        insns[1].op
+    );
+    assert_eq!(
+        crate::recovery::runtime_helpers::role_of(0x9500),
+        Some(crate::recovery::runtime_helpers::RuntimeHelper::IsInst)
+    );
+    assert_eq!(
+        crate::recovery::runtime_helpers::arg_arity(0x9500),
+        Some(2)
+    );
+}
+
+/// box(klass, &value) call sites keep their call form so the statement-stage
+/// fold can recover the VALUE expression (Op::Box cannot carry it), and the
+/// role table records the proven Box role for argument slicing.
+#[test]
+fn key_function_box_keeps_the_call_and_records_the_role() {
     let mut insns = vec![
         Insn::move_(Operand::reg("x0"), Operand::imm(0x6000), 0x1000),
-        Insn::move_(Operand::reg("x1"), Operand::AddressOf(Box::new(Operand::Local(2))), 0x1004),
+        Insn::move_(
+            Operand::reg("x1"),
+            Operand::AddressOf(Box::new(Operand::Local(2))),
+            0x1004,
+        ),
         Insn::new(
             Op::Call,
             vec![
@@ -3305,15 +3697,19 @@ fn key_function_box_becomes_box() {
     let table = locals::create(&HashMap::new(), &helper_seed());
     resolve::run(&mut insns, &table, &maps);
 
-    match &insns[2].op {
-        Op::Box(_) => {
-            assert_eq!(
-                insns[2].operands.get(1),
-                Some(&Operand::AddressOf(Box::new(Operand::Local(2))))
-            );
-        }
-        other => panic!("expected Box, got {other:?}"),
-    }
+    assert!(
+        matches!(insns[2].op, Op::Call),
+        "box call must stay a call, got {:?}",
+        insns[2].op
+    );
+    assert_eq!(
+        crate::recovery::runtime_helpers::role_of(0x9100),
+        Some(crate::recovery::runtime_helpers::RuntimeHelper::Box)
+    );
+    assert_eq!(
+        crate::recovery::runtime_helpers::arg_arity(0x9100),
+        Some(2)
+    );
 }
 
 /// raise_exception call sites become Throw for both raw call layouts
@@ -3365,6 +3761,7 @@ fn vtable_dispatch_resolves_through_seeded_receiver() {
             is_param: None,
             param_comp: None,
             is_incoming_arg: false,
+            is_call_clobber: false,
             is_return_buffer: false,
         }],
         index_of: [(0u32, 0usize)].into_iter().collect(),
@@ -3378,7 +3775,8 @@ fn vtable_dispatch_resolves_through_seeded_receiver() {
             Op::Move,
             vec![
                 Operand::Local(1),
-                Operand::Memory { width: 0,
+                Operand::Memory {
+                    width: 0,
                     base: Box::new(Operand::Local(0)),
                     index: None,
                     scale: 8,
@@ -3402,7 +3800,8 @@ fn vtable_dispatch_resolves_through_seeded_receiver() {
             Op::Move,
             vec![
                 Operand::Local(2),
-                Operand::Memory { width: 0,
+                Operand::Memory {
+                    width: 0,
                     base: Box::new(Operand::Local(1)),
                     index: None,
                     scale: 8,
@@ -3420,7 +3819,11 @@ fn vtable_dispatch_resolves_through_seeded_receiver() {
     let stats = resolve::run(&mut insns, &table, &maps);
 
     assert_eq!(stats.virtuals_resolved, 1, "virtual call should resolve");
-    assert!(matches!(insns[2].op, Op::Call), "expected Call, got {:?}", insns[2].op);
+    assert!(
+        matches!(insns[2].op, Op::Call),
+        "expected Call, got {:?}",
+        insns[2].op
+    );
     match insns[2].operands.first() {
         Some(Operand::Method(m)) => assert_eq!(m.name, "DoThing"),
         other => panic!("expected Method operand, got {other:?}"),
@@ -3451,6 +3854,7 @@ fn vtable_dispatch_resolves_on_a_32_bit_target() {
             is_param: None,
             param_comp: None,
             is_incoming_arg: false,
+            is_call_clobber: false,
             is_return_buffer: false,
         }],
         index_of: [(0u32, 0usize)].into_iter().collect(),
@@ -3464,7 +3868,8 @@ fn vtable_dispatch_resolves_on_a_32_bit_target() {
             Op::Move,
             vec![
                 Operand::Local(1),
-                Operand::Memory { width: 0,
+                Operand::Memory {
+                    width: 0,
                     base: Box::new(Operand::Local(0)),
                     index: None,
                     scale: 4,
@@ -3478,7 +3883,8 @@ fn vtable_dispatch_resolves_on_a_32_bit_target() {
             Op::Move,
             vec![
                 Operand::Local(2),
-                Operand::Memory { width: 0,
+                Operand::Memory {
+                    width: 0,
                     base: Box::new(Operand::Local(1)),
                     index: None,
                     scale: 4,
@@ -3506,8 +3912,15 @@ fn vtable_dispatch_resolves_on_a_32_bit_target() {
         &no_parents,
     );
 
-    assert_eq!(stats.virtuals_resolved, 1, "32-bit virtual call should resolve");
-    assert!(matches!(insns[2].op, Op::Call), "expected Call, got {:?}", insns[2].op);
+    assert_eq!(
+        stats.virtuals_resolved, 1,
+        "32-bit virtual call should resolve"
+    );
+    assert!(
+        matches!(insns[2].op, Op::Call),
+        "expected Call, got {:?}",
+        insns[2].op
+    );
     match insns[2].operands.first() {
         Some(Operand::Method(m)) => assert_eq!(m.name, "DoThing"),
         other => panic!("expected Method operand, got {other:?}"),
@@ -3541,7 +3954,8 @@ fn resolved_call_keeps_a_phi_defined_receiver() {
         ),
     ];
     let mut maps = resolve::ResolveMaps::default();
-    maps.methods_by_rva.insert(0x9100, mref("get_Value", 7, false));
+    maps.methods_by_rva
+        .insert(0x9100, mref("get_Value", 7, false));
 
     let table = locals::create(&HashMap::new(), &helper_seed());
     resolve::run(insns, &table, &maps);
@@ -3566,11 +3980,35 @@ fn helper_selectors_prefer_thunks_and_ratios() {
     use super::HelperCounts;
     let mut counts = HashMap::new();
     // thunk-bodied klass-arg helper (the codegen_object_new shape)
-    counts.insert(0xA000u64, HelperCounts { total: 20, string_arg: 0, klass_arg: 20, x1_arg: 0 });
+    counts.insert(
+        0xA000u64,
+        HelperCounts {
+            total: 20,
+            string_arg: 0,
+            klass_arg: 20,
+            x1_arg: 0,
+        },
+    );
     // real-bodied two-arg klass target (box-ish), higher volume
-    counts.insert(0xB000u64, HelperCounts { total: 30, string_arg: 0, klass_arg: 25, x1_arg: 28 });
+    counts.insert(
+        0xB000u64,
+        HelperCounts {
+            total: 30,
+            string_arg: 0,
+            klass_arg: 25,
+            x1_arg: 28,
+        },
+    );
     // literal-index target (string_new shape)
-    counts.insert(0xC000u64, HelperCounts { total: 10, string_arg: 8, klass_arg: 0, x1_arg: 0 });
+    counts.insert(
+        0xC000u64,
+        HelperCounts {
+            total: 10,
+            string_arg: 8,
+            klass_arg: 0,
+            x1_arg: 0,
+        },
+    );
 
     assert_eq!(select_string_new(&counts), vec![0xC000]);
 
@@ -3591,19 +4029,23 @@ fn helper_selectors_prefer_thunks_and_ratios() {
 
     // box requires ≥0.8 klass ratio AND a defined value arg in x1
     let excluded2 = [0xC000u64, 0xA000u64].into_iter().collect();
-    assert_eq!(select_box_fallback(&counts, &excluded2, &thunk_a), vec![0xB000]);
+    assert_eq!(
+        select_box_fallback(&counts, &excluded2, &thunk_a),
+        vec![0xB000]
+    );
 }
 
 #[test]
 fn eval_arg_classifies_data_refs() {
-    use super::{eval_arg, ArgVal};
+    use super::{ArgVal, eval_arg};
     let consts: HashMap<String, ArgVal> = [("x8".to_string(), ArgVal::Const(0x123_000))]
         .into_iter()
         .collect();
     let ranges = [(0x100_000u64, 0x200_000u64)];
 
     // [x8 + 0x40] with x8 = 0x123000 → data reference
-    let mem = Operand::Memory { width: 0,
+    let mem = Operand::Memory {
+        width: 0,
         base: Box::new(Operand::reg("x8")),
         index: None,
         scale: 8,
@@ -3612,9 +4054,15 @@ fn eval_arg_classifies_data_refs() {
     assert_eq!(eval_arg(&mem, &consts, &ranges), ArgVal::DataRef(0x123_040));
 
     // plain small constants stay Const (string-literal-index shape)
-    assert_eq!(eval_arg(&Operand::imm(42), &consts, &ranges), ArgVal::Const(42));
+    assert_eq!(
+        eval_arg(&Operand::imm(42), &consts, &ranges),
+        ArgVal::Const(42)
+    );
     // out-of-range data addresses are not DataRef
-    assert_eq!(eval_arg(&Operand::imm(0x999_999), &consts, &ranges), ArgVal::Const(0x999_999));
+    assert_eq!(
+        eval_arg(&Operand::imm(0x999_999), &consts, &ranges),
+        ArgVal::Const(0x999_999)
+    );
 }
 
 /// ABI argument classification: `this` in x0, GPR params in x1..x7, scalar
@@ -3665,7 +4113,7 @@ fn abi_param_registers_classified_by_type() {
         slots.insert(i as u32, s.to_string());
     }
     let n = slots.len() as u32;
-    for (i, s) in ["vs0", "vs1", "vs2", "vs3", "vd4"].iter().enumerate() {
+    for (i, s) in ["vs0", "vs4", "vs8", "vs12", "vd4"].iter().enumerate() {
         slots.insert(n + i as u32, s.to_string());
     }
     let table = super::locals::create(&slots, &seed);
@@ -3689,8 +4137,8 @@ fn abi_param_registers_classified_by_type() {
     let s = find("vs0");
     assert_eq!(s.is_param, Some(1));
     assert_eq!(s.param_comp, None);
-    // pos → s1..s3 with components 0..2
-    for (k, origin) in ["vs1", "vs2", "vs3"].iter().enumerate() {
+    // pos → s1..s3 with components 0..2 (flattened lane-0 names)
+    for (k, origin) in ["vs4", "vs8", "vs12"].iter().enumerate() {
         let p = find(origin);
         assert_eq!(p.is_param, Some(2));
         assert_eq!(p.param_comp, Some(k));
@@ -3776,7 +4224,7 @@ fn abi_float_params_do_not_consume_gpr_slots() {
         ret_hidden_buffer: false,
     };
     let mut slots: HashMap<u32, String> = HashMap::new();
-    for (i, s) in ["vs0", "vs1", "x2"].iter().enumerate() {
+    for (i, s) in ["vs0", "vs4", "x2"].iter().enumerate() {
         slots.insert(i as u32, s.to_string());
     }
     let table = super::locals::create(&slots, &seed);
@@ -3789,7 +4237,7 @@ fn abi_float_params_do_not_consume_gpr_slots() {
         &table.infos[table.index_of[&v]]
     };
     assert_eq!(get("vs0").is_param, Some(0));
-    assert_eq!(get("vs1").is_param, Some(1));
+    assert_eq!(get("vs4").is_param, Some(1));
     // x2 is scratch (static method has no `this`), never a parameter
     assert_eq!(get("x2").is_param, None);
 }
@@ -3813,18 +4261,36 @@ fn vector_fp_lane_decomposition() {
     let fmt = |i: &super::ir::Insn| format!("{:?} {:?}", i.op, i.operands);
     let all: Vec<String> = lifted.insns.iter().map(fmt).collect();
     // 2 lanes of fmul, scalar math on vs8/vs9 ← vs20/vs21
-    let mul: Vec<&String> = all.iter().filter(|s| s.contains("FloatArith(Mul)")).collect();
+    let mul: Vec<&String> = all
+        .iter()
+        .filter(|s| s.contains("FloatArith(Mul)"))
+        .collect();
     assert_eq!(mul.len(), 2, "lanes: {all:?}");
-    assert!(all.iter().any(|s| s.contains("vs8") && s.contains("vs20")), "{all:?}");
-    assert!(all.iter().any(|s| s.contains("vs9") && s.contains("vs21")), "{all:?}");
+    assert!(
+        all.iter().any(|s| s.contains("vs8") && s.contains("vs20")),
+        "{all:?}"
+    );
+    assert!(
+        all.iter().any(|s| s.contains("vs9") && s.contains("vs21")),
+        "{all:?}"
+    );
     // dup splats s(16*4+0)=vs64 into both lanes vs64..65? (dup source lane 0)
     // ld1 {v3.s}[1] loads 4 bytes at [x9] into s(3*4+1)=vs13
-    let loads: Vec<&String> = all.iter().filter(|s| s.contains("vs13") && s.contains("Move")).collect();
+    let loads: Vec<&String> = all
+        .iter()
+        .filter(|s| s.contains("vs13") && s.contains("Move"))
+        .collect();
     assert_eq!(loads.len(), 1, "{all:?}");
     // ld1r broadcasts one load to vs4..vs5 (v1 lanes)
-    assert!(all.iter().any(|s| s.contains("vs4") && s.contains("vs5")), "{all:?}");
+    assert!(
+        all.iter().any(|s| s.contains("vs4") && s.contains("vs5")),
+        "{all:?}"
+    );
     // st1 {v1.s}[1] stores vs5 to [x3]
-    assert!(all.iter().any(|s| s.contains("vs5") && s.contains("Move")), "{all:?}");
+    assert!(
+        all.iter().any(|s| s.contains("vs5") && s.contains("Move")),
+        "{all:?}"
+    );
     assert_eq!(
         lifted.insns.len(),
         lifted.addresses.len(),
@@ -3837,8 +4303,8 @@ fn vector_fp_lane_decomposition() {
 /// counter) survives the use-count DCE but must be removed by liveness DCE.
 #[test]
 fn liveness_dce_breaks_dead_counter_cycles() {
-    use super::passes;
     use super::ir::{ArithKind, Insn, Op, Operand};
+    use super::passes;
     let l = |v: u32| Operand::Local(v);
     let mut insns = vec![
         // v2 = 10            (seed — the loop counter init)
@@ -3874,8 +4340,8 @@ fn liveness_dce_breaks_dead_counter_cycles() {
 /// store operand): only genuinely dead writes are dropped.
 #[test]
 fn liveness_dce_keeps_live_values() {
-    use super::passes;
     use super::ir::{ArithKind, Insn, Op, Operand};
+    use super::passes;
     let l = |v: u32| Operand::Local(v);
     let mut insns = vec![
         // v1 = 7
@@ -3909,10 +4375,11 @@ fn liveness_dce_keeps_live_values() {
 /// corruption: v31 was a phi of [this, call-result]).
 #[test]
 fn pin_copy_survives_identity_clobber() {
-    use super::locals;
     use super::ir::{Insn, Op, Operand};
+    use super::locals;
     let r = |s: &str| Operand::Register(s.to_string());
-    let mem = |base: &str| Operand::Memory { width: 0,
+    let mem = |base: &str| Operand::Memory {
+        width: 0,
         base: Box::new(r(base)),
         index: None,
         scale: 8,
@@ -3961,10 +4428,11 @@ fn pin_copy_survives_identity_clobber() {
 /// (the fast path — no restored copies left behind).
 #[test]
 fn pin_copy_canonicalizes_when_identity_survives() {
-    use super::locals;
     use super::ir::{Insn, Op, Operand};
+    use super::locals;
     let r = |s: &str| Operand::Register(s.to_string());
-    let mem = |base: &str| Operand::Memory { width: 0,
+    let mem = |base: &str| Operand::Memory {
+        width: 0,
         base: Box::new(r(base)),
         index: None,
         scale: 8,
@@ -4058,9 +4526,17 @@ fn tbz_tests_get_unique_scratch_ids() {
 #[ignore]
 fn dbg_arm32_prints() {
     for (name, b, base) in [
-        ("movwt", le(&[0xE3010234, 0xE34A0BCD, 0xE12FFF1E]), 0x3000u64),
+        (
+            "movwt",
+            le(&[0xE3010234, 0xE34A0BCD, 0xE12FFF1E]),
+            0x3000u64,
+        ),
         ("cmps", le(&[0xE1550002, 0x1AFFFFFE, 0xE12FFF1E]), 0x3000u64),
-        ("vmla", le(&[0xEE066A87, 0xED92FA01, 0xEEB4BA6B, 0xE12FFF1E]), 0x2000u64),
+        (
+            "vmla",
+            le(&[0xEE066A87, 0xED92FA01, 0xEEB4BA6B, 0xE12FFF1E]),
+            0x2000u64,
+        ),
     ] {
         eprintln!("==== {name}");
         let l = lift_arm32::lift_arm32(&b, base, 32).expect("lift");
@@ -4338,7 +4814,11 @@ fn ccmp_compound_condition_is_recovered() {
         .iter()
         .filter(|i| matches!(i.op, Op::Compare(_)))
         .collect();
-    assert_eq!(cmps.len(), 2, "compound condition needs two compares: {ops:?}");
+    assert_eq!(
+        cmps.len(),
+        2,
+        "compound condition needs two compares: {ops:?}"
+    );
     for c in &cmps {
         assert!(
             !matches!(c.operands.get(1), Some(Operand::Unknown)),
@@ -4383,7 +4863,7 @@ fn exit_sentinel_survives_index_shifting_passes() {
     let mut graph = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
     stack_analyzer::analyze(&mut insns, &graph);
     let dom = dominator::DominatorInfo::compute(&graph);
-    let mut ssa_out = ssa::build(&insns, &graph, &dom);
+    let mut ssa_out = ssa::build(&insns, &graph, &dom, &[]);
     let _ = ssa::materialize(&mut ssa_out, &mut graph);
     ssa::eliminate(&mut ssa_out, &mut graph);
 
@@ -4417,7 +4897,7 @@ fn fp_return_binds_to_d_register() {
     let mut graph = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
     stack_analyzer::analyze(&mut insns, &graph);
     let dom = dominator::DominatorInfo::compute(&graph);
-    let mut ssa_out = ssa::build(&insns, &graph, &dom);
+    let mut ssa_out = ssa::build(&insns, &graph, &dom, &[]);
     let _ = ssa::materialize(&mut ssa_out, &mut graph);
 
     passes::bind_fp_returns(
@@ -4504,12 +4984,149 @@ fn fp_call_return_binds_s0_reads_to_the_call_result() {
     ];
     insns[0].dest_type = Some(ManagedType::Primitive(PrimKind::R4));
 
-    let n = passes::bind_fp_call_returns(&mut insns, &version_slot, |_| 0);
+    let n = passes::bind_fp_call_returns(&mut insns, &version_slot, 1, |_| Vec::new());
     assert_eq!(n, 1, "the stale s0 read must be rebound to the call result");
     assert_eq!(
         insns[1].operands[1],
         Operand::Local(2),
         "`str s0` must read the call's result version, not the pre-call stale one"
+    );
+}
+
+/// An HFA return (`Vector3`) occupies one v-register per field. Every
+/// component must become a DISTINCT `call.field`, never the same local:
+/// binding all of them to the call result made `zA - zB` render `(z - z)`.
+#[test]
+fn fp_hfa_call_components_are_distinct_result_fields() {
+    use crate::recovery::types::{FieldRef, NamedType};
+    use std::sync::Arc;
+    let mut version_slot = std::collections::HashMap::new();
+    version_slot.insert(1u32, "vs0".to_string());
+    version_slot.insert(2u32, "vs4".to_string());
+    version_slot.insert(3u32, "vs8".to_string());
+    version_slot.insert(4u32, "x0".to_string());
+    version_slot.insert(5u32, "x0".to_string());
+    let mut insns = vec![
+        Insn::new(Op::Call, vec![Operand::Local(5), Operand::Local(4)], 0x1000),
+        Insn::new(
+            Op::Move,
+            vec![
+                Operand::Memory {
+                    base: Box::new(Operand::reg("x19")),
+                    index: None,
+                    scale: 8,
+                    addend: 0xc8,
+                    width: 0,
+                },
+                Operand::Local(1),
+            ],
+            0x1004,
+        ),
+        Insn::new(Op::Move, vec![Operand::Local(10), Operand::Local(2)], 0x1008),
+        Insn::new(Op::Move, vec![Operand::Local(11), Operand::Local(3)], 0x100c),
+    ];
+    insns[0].dest_type = Some(ManagedType::Class(Arc::new(NamedType {
+        namespace: "UnityEngine".into(),
+        name: "Vector3".into(),
+        assembly: None,
+        type_def_index: 7651,
+    })));
+    let field = |name: &str, idx: u32| FieldRef {
+        type_def_index: 7651,
+        field_index: idx,
+        name: name.into(),
+        declaring_type_name: "UnityEngine.Vector3".into(),
+        field_type: ManagedType::Primitive(PrimKind::R4),
+        is_static: false,
+    };
+    let n = passes::bind_fp_call_returns(&mut insns, &version_slot, 4, |_| {
+        vec![field("x", 1), field("y", 2), field("z", 3)]
+    });
+    assert_eq!(n, 3, "all three component reads must be rebound: {insns:?}");
+    for (idx, expected) in [(1usize, "x"), (2, "y"), (3, "z")] {
+        match &insns[idx].operands[1] {
+            Operand::InstanceField { base, field } => {
+                assert_eq!(**base, Operand::Local(4), "{insns:?}");
+                assert_eq!(field.name, expected, "{insns:?}");
+            }
+            other => panic!("component {expected} not bound: {other:?}"),
+        }
+    }
+}
+
+/// A shared `List<T>.get_Item` returns `Opaque("T")`; the call site's
+/// declaring type (`List<Vector3>`) proves the concrete return. Without the
+/// specialization the call is not even known to return a struct, so its HFA
+/// components are never bound.
+#[test]
+fn a_generic_list_get_item_returns_the_instantiated_element_type() {
+    let mut maps = resolve::ResolveMaps::default();
+    maps.tdi_names
+        .insert(7651, ("UnityEngine".into(), "Vector3".into()));
+    maps.tdi_names_reverse
+        .insert("UnityEngine.Vector3".into(), 7651);
+    maps.tdi_names_reverse.insert("Vector3".into(), 7651);
+    let m = crate::recovery::types::MethodRef {
+        image_index: 0,
+        type_def_index: 4328,
+        method_index: 34254,
+        name: "get_Item".into(),
+        declaring_namespace: "System.Collections.Generic".into(),
+        declaring_type_name: "List<Vector3>".into(),
+        assembly: String::new(),
+        sig: crate::recovery::types::MethodSigInfo {
+            ret: ManagedType::Opaque("T".into()),
+            params: vec![ManagedType::Primitive(PrimKind::I4)],
+            is_static: false,
+        },
+    };
+    let mut insns = vec![
+        Insn::new(Op::Call, vec![Operand::Method(m), Operand::Local(1), Operand::Local(2)], 0x4000),
+    ];
+    let n = resolve::specialize_generic_return_sigs(&mut insns, &maps);
+    assert_eq!(n, 1);
+    match &insns[0].operands[0] {
+        Operand::Method(m) => match &m.sig.ret {
+            ManagedType::Class(nt) => {
+                assert_eq!(nt.name, "Vector3");
+                assert_eq!(nt.type_def_index, 7651);
+            }
+            other => panic!("expected Vector3 return, got {other:?}"),
+        },
+        other => panic!("expected method operand, got {other:?}"),
+    }
+    assert!(matches!(insns[0].dest_type, Some(ManagedType::Class(_))));
+}
+
+/// A CALL is an ABI definition of the caller-saved FP return registers. The
+/// post-call read must name a FRESH version; reading the pre-call version is
+/// what let two different returned components collapse to one value.
+#[test]
+fn a_call_clobbers_the_fp_return_slot_in_ssa() {
+    let mut insns = vec![
+        Insn::new(Op::Move, vec![Operand::reg("vs0"), Operand::imm(0)], 0x2000),
+        Insn::new(Op::Call, vec![Operand::imm(0x3000), Operand::reg("x0")], 0x2004),
+        Insn::new(Op::Move, vec![Operand::reg("x1"), Operand::reg("vs0")], 0x2008),
+        Insn::new(Op::Return, vec![], 0x200c),
+    ];
+    let addresses: Vec<u64> = insns.iter().map(|i| i.address).collect();
+    let graph = cfg::Cfg::build(&mut insns, &addresses).expect("cfg");
+    let dom = dominator::DominatorInfo::compute(&graph);
+    let out = ssa::build(&insns, &graph, &dom, &["vs0".to_string()]);
+    let read = out
+        .insns
+        .iter()
+        .find_map(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
+            (Op::Move, Some(Operand::Local(_)), Some(Operand::Local(v))) => {
+                (out.version_slot.get(v).map(|s| s.as_str()) == Some("vs0")).then_some(*v)
+            }
+            _ => None,
+        })
+        .expect("post-call vs0 read");
+    assert!(
+        out.call_defined.contains(&read),
+        "the post-call read must be the call-clobber version, got v{read} ({:?})",
+        out.version_slot.get(&read)
     );
 }
 
@@ -4555,8 +5172,11 @@ fn fp_call_return_bind_leaves_phi_operands_alone() {
         ),
     ];
 
-    let n = passes::bind_fp_call_returns(&mut insns, &version_slot, |_| 0);
-    assert_eq!(n, 0, "a phi operand is not a linear read and must not be rebound");
+    let n = passes::bind_fp_call_returns(&mut insns, &version_slot, 1, |_| Vec::new());
+    assert_eq!(
+        n, 0,
+        "a phi operand is not a linear read and must not be rebound"
+    );
     assert_eq!(
         insns[2].operands[1],
         Operand::Local(51),
@@ -4634,7 +5254,7 @@ fn fp_call_return_bind_does_not_cross_a_block_that_cannot_reach_the_read() {
     ];
     insns[3].dest_type = Some(ManagedType::Primitive(PrimKind::R4));
 
-    let n = passes::bind_fp_call_returns(&mut insns, &version_slot, |_| 0);
+    let n = passes::bind_fp_call_returns(&mut insns, &version_slot, 1, |_| Vec::new());
 
     assert_eq!(
         insns[4].operands[0],
@@ -4671,6 +5291,48 @@ fn fp_call_return_bind_does_not_cross_a_block_that_cannot_reach_the_read() {
 /// there before this pass ran). The point of the guard is that the pass fails
 /// CLOSED on it: a bare undefined local stays visible, while an invented
 /// constant is indistinguishable from a real one.
+#[test]
+fn copy_prop_never_forwards_an_address_taken_cell() {
+    //   i0 @0x5000  v1 = 0                 ; out-cell initialiser
+    //   i1 @0x5004  v2 = &v1               ; pass by reference
+    //   i2 @0x5008  Call TryGetValue(…, v2) ; callee WRITES v1
+    //   i3 @0x500c  v3 = (v1 == 0)         ; must read the cell, not the 0
+    let mut insns = vec![
+        Insn::move_(Operand::Local(1), Operand::imm(0), 0x5000),
+        Insn::move_(
+            Operand::Local(2),
+            Operand::AddressOf(Box::new(Operand::Local(1))),
+            0x5004,
+        ),
+        Insn::new(
+            Op::Call,
+            vec![Operand::imm(0x1234), Operand::Local(2)],
+            0x5008,
+        ),
+        Insn::new(
+            Op::Compare(CompareKind::Equal),
+            vec![Operand::Local(3), Operand::Local(1), Operand::imm(0)],
+            0x500c,
+        ),
+        Insn::new(Op::Return, vec![Operand::Local(3)], 0x5010),
+    ];
+
+    passes::copy_and_constant_propagation(&mut insns);
+    passes::constant_folding(&mut insns);
+
+    assert_eq!(
+        insns[3].operands[1],
+        Operand::Local(1),
+        "an address-taken cell is mutated by the callee; forwarding its \
+         initialiser would invent a stale null/zero:\n{insns:#?}"
+    );
+    assert_eq!(
+        insns[3].operands[0],
+        Operand::Local(3),
+        "the comparison result must stay a real value:\n{insns:#?}"
+    );
+}
+
 #[test]
 fn copy_prop_chain_hop_needs_a_definition_that_reaches_the_use() {
     let cond = Operand::Local(u32::MAX - 2);
@@ -4854,7 +5516,7 @@ fn store_base_register_is_ssa_renamed() {
     let mut insns = lifted.insns;
     let graph = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
     let dom = dominator::DominatorInfo::compute(&graph);
-    let out = ssa::build(&insns, &graph, &dom);
+    let out = ssa::build(&insns, &graph, &dom, &[]);
 
     let mut raw = Vec::new();
     for insn in &out.insns {
@@ -4872,7 +5534,11 @@ fn store_base_register_is_ssa_renamed() {
             && matches!(i.operands.first(), Some(Operand::Memory { base, .. })
                 if matches!(**base, Operand::Local(_)))
     });
-    assert!(store.is_some(), "store base was not versioned: {:?}", out.insns);
+    assert!(
+        store.is_some(),
+        "store base was not versioned: {:?}",
+        out.insns
+    );
 }
 
 /// `cmp x9, x8` is encoded `subs xzr, x9, x8`, and yaxpeax reports x8 as a
@@ -4909,9 +5575,11 @@ fn cmp_register_rhs_survives_regshift_operand() {
 fn tree_contains_goto(stmts: &[csharp::Stmt], label: &str) -> bool {
     stmts.iter().any(|s| match s {
         csharp::Stmt::Goto(l) => l == label,
-        csharp::Stmt::If { then_body, else_body, .. } => {
-            tree_contains_goto(then_body, label) || tree_contains_goto(else_body, label)
-        }
+        csharp::Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => tree_contains_goto(then_body, label) || tree_contains_goto(else_body, label),
         csharp::Stmt::While { body, .. } | csharp::Stmt::DoWhile { body, .. } => {
             tree_contains_goto(body, label)
         }
@@ -4922,9 +5590,11 @@ fn tree_contains_goto(stmts: &[csharp::Stmt], label: &str) -> bool {
 fn tree_contains_label(stmts: &[csharp::Stmt], label: &str) -> bool {
     stmts.iter().any(|s| match s {
         csharp::Stmt::Label(l) => l == label,
-        csharp::Stmt::If { then_body, else_body, .. } => {
-            tree_contains_label(then_body, label) || tree_contains_label(else_body, label)
-        }
+        csharp::Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => tree_contains_label(then_body, label) || tree_contains_label(else_body, label),
         csharp::Stmt::While { body, .. } | csharp::Stmt::DoWhile { body, .. } => {
             tree_contains_label(body, label)
         }
@@ -4994,7 +5664,10 @@ fn a_guard_goto_folds_into_an_inverted_if_over_the_region() {
     ];
     csharp::branch_repair(&mut stmts);
 
-    let csharp::Stmt::If { cond, then_body, .. } = &stmts[0] else {
+    let csharp::Stmt::If {
+        cond, then_body, ..
+    } = &stmts[0]
+    else {
         panic!("the guard was not folded into an if head: {stmts:?}");
     };
     assert!(
@@ -5072,7 +5745,9 @@ fn a_payload_else_arm_blocks_the_fold() {
         panic!("the two-armed branch vanished: {stmts:?}");
     };
     assert!(
-        then_body.iter().any(|s| matches!(s, csharp::Stmt::Return(None))),
+        then_body
+            .iter()
+            .any(|s| matches!(s, csharp::Stmt::Return(None))),
         "the two-armed branch must preserve its return edge: {stmts:?}"
     );
 }
@@ -5081,20 +5756,18 @@ fn a_payload_else_arm_blocks_the_fold() {
 fn real_method_pin_copy_keeps_param_identity() {
     use super::{cfg, csharp, dominator, lift, locals, passes, ssa, stack_analyzer};
     let words: [u32; 79] = [
-        0xA9BD57F6, 0xA9014FF4, 0xA9027BFD, 0x910083FD, 0xAA0203F5, 0xAA0103F3,
-        0xAA0003F4, 0xB00222F6, 0x397446C8, 0x37000128, 0xF0020820, 0x911DE000,
-        0x94AC2865, 0xF0020820, 0x91276000, 0x94AC2862, 0x52800028, 0x393446C8,
-        0x36000075, 0xB50000B3, 0x1400003A, 0xB4000733, 0xF9406660, 0xB50005A0,
-        0xF9405E60, 0xB5000560, 0xF9405A75, 0xF0020836, 0x911DE2D6, 0xF94002C0,
-        0xB940E008, 0x35000068, 0x94AC2896, 0xF94002C0, 0xF9405C08, 0xF9400501,
-        0xAA1503E0, 0xD2800002, 0x94048D1D, 0xAA0003E8, 0xD2800000, 0x34000368,
-        0xF9400E80, 0xB4000460, 0xD2800001, 0x940194B8, 0xB4000400, 0xF9405A61,
-        0xD2800002, 0x94018C36, 0xB40001C0, 0xF0020828, 0x91276108, 0xF9400108,
-        0xF9400009, 0x3944C12B, 0x3944C10A, 0x6B0A017F, 0x540000C3, 0xF9406529,
-        0x8B0A0D29, 0xF85F8129, 0xEB08013F, 0x540000A0, 0xF9405A60, 0xD2800001,
-        0x9401BA67, 0xB40000A0, 0xA9427BFD, 0xA9414FF4, 0xA8C357F6, 0xD65F03C0,
-        0xF9405A60, 0xD2800001, 0xA9427BFD, 0xA9414FF4, 0xA8C357F6, 0x1401BAC5,
-        0x94AC28B6,
+        0xA9BD57F6, 0xA9014FF4, 0xA9027BFD, 0x910083FD, 0xAA0203F5, 0xAA0103F3, 0xAA0003F4,
+        0xB00222F6, 0x397446C8, 0x37000128, 0xF0020820, 0x911DE000, 0x94AC2865, 0xF0020820,
+        0x91276000, 0x94AC2862, 0x52800028, 0x393446C8, 0x36000075, 0xB50000B3, 0x1400003A,
+        0xB4000733, 0xF9406660, 0xB50005A0, 0xF9405E60, 0xB5000560, 0xF9405A75, 0xF0020836,
+        0x911DE2D6, 0xF94002C0, 0xB940E008, 0x35000068, 0x94AC2896, 0xF94002C0, 0xF9405C08,
+        0xF9400501, 0xAA1503E0, 0xD2800002, 0x94048D1D, 0xAA0003E8, 0xD2800000, 0x34000368,
+        0xF9400E80, 0xB4000460, 0xD2800001, 0x940194B8, 0xB4000400, 0xF9405A61, 0xD2800002,
+        0x94018C36, 0xB40001C0, 0xF0020828, 0x91276108, 0xF9400108, 0xF9400009, 0x3944C12B,
+        0x3944C10A, 0x6B0A017F, 0x540000C3, 0xF9406529, 0x8B0A0D29, 0xF85F8129, 0xEB08013F,
+        0x540000A0, 0xF9405A60, 0xD2800001, 0x9401BA67, 0xB40000A0, 0xA9427BFD, 0xA9414FF4,
+        0xA8C357F6, 0xD65F03C0, 0xF9405A60, 0xD2800001, 0xA9427BFD, 0xA9414FF4, 0xA8C357F6,
+        0x1401BAC5, 0x94AC28B6,
     ];
     let bytes = le(&words);
     let seed = locals::SeedInfo {
@@ -5120,16 +5793,25 @@ fn real_method_pin_copy_keeps_param_identity() {
             let preds: Vec<usize> = (0..graph.blocks.len())
                 .filter(|&p| succ[p].contains(&bi))
                 .collect();
-            eprintln!("[cfg] B{bi} {:#x}..={} insns={} preds={:?} succs={:?}",
-                insns[b.start].address, b.end, b.end - b.start, preds, succ[bi]);
+            eprintln!(
+                "[cfg] B{bi} {:#x}..={} insns={} preds={:?} succs={:?}",
+                insns[b.start].address,
+                b.end,
+                b.end - b.start,
+                preds,
+                succ[bi]
+            );
             for i in b.start..b.end {
-                eprintln!("      i{i} @{:#x}: {:?} {:?}", insns[i].address, insns[i].op, insns[i].operands);
+                eprintln!(
+                    "      i{i} @{:#x}: {:?} {:?}",
+                    insns[i].address, insns[i].op, insns[i].operands
+                );
             }
         }
     }
     stack_analyzer::analyze(&mut insns, &graph);
     let dom = dominator::DominatorInfo::compute(&graph);
-    let mut ssa_out = ssa::build(&insns, &graph, &dom);
+    let mut ssa_out = ssa::build(&insns, &graph, &dom, &[]);
     ssa::materialize(&mut ssa_out, &mut graph);
     // stage probe: count surviving raw Register operands (should be zero:
     // SSA must rename EVERY register use into a versioned Local).
@@ -5139,11 +5821,15 @@ fn real_method_pin_copy_keeps_param_identity() {
             return;
         }
         for (i, insn) in insns.iter().enumerate() {
-            let has_reg = insn.operands.iter().any(|o| {
-                matches!(o, super::ir::Operand::Register(_))
-            });
+            let has_reg = insn
+                .operands
+                .iter()
+                .any(|o| matches!(o, super::ir::Operand::Register(_)));
             if has_reg {
-                eprintln!("[reg] {tag} i{i} @{:#x}: op={:?} operands={:?}", insn.address, insn.op, insn.operands);
+                eprintln!(
+                    "[reg] {tag} i{i} @{:#x}: op={:?} operands={:?}",
+                    insn.address, insn.op, insn.operands
+                );
             }
         }
     };
@@ -5177,7 +5863,10 @@ fn real_method_pin_copy_keeps_param_identity() {
 
     if std::env::var("ILR_HARNESS_IR").is_ok() {
         for (i, insn) in ssa_out.insns.iter().enumerate() {
-            eprintln!("  h{i} @{:#x}: op={:?} operands={:?}", insn.address, insn.op, insn.operands);
+            eprintln!(
+                "  h{i} @{:#x}: op={:?} operands={:?}",
+                insn.address, insn.op, insn.operands
+            );
         }
     }
     let ir = super::RecoveredIr {
@@ -5197,8 +5886,10 @@ fn real_method_pin_copy_keeps_param_identity() {
         &ManagedType::Unknown,
         -1,
     );
-    eprintln!("--- rendered ---
-{out}----------------");
+    eprintln!(
+        "--- rendered ---
+{out}----------------"
+    );
     assert!(
         !out.contains("__unknown != 0"),
         "pin copy lost the parameter identity (renders __unknown):
@@ -5299,7 +5990,8 @@ fn pin_restore_picks_the_live_site_deterministically() {
         ),
         Insn::move_(
             Operand::reg("x1"),
-            Operand::Memory { width: 0,
+            Operand::Memory {
+                width: 0,
                 base: Box::new(Operand::reg("x19")),
                 index: None,
                 scale: 8,
@@ -5316,7 +6008,8 @@ fn pin_restore_picks_the_live_site_deterministically() {
         ),
         Insn::move_(
             Operand::reg("x1"),
-            Operand::Memory { width: 0,
+            Operand::Memory {
+                width: 0,
                 base: Box::new(Operand::reg("x19")),
                 index: None,
                 scale: 8,
@@ -5343,12 +6036,7 @@ fn pin_restore_picks_the_live_site_deterministically() {
         (0usize, "clobber at i=2 must restore the prologue pin site"),
         (3usize, "clobber at i=5 must restore the re-pin site"),
     ] {
-        assert_eq!(
-            insns[idx].op,
-            Op::Move,
-            "{why} (got {:?})",
-            insns[idx].op
-        );
+        assert_eq!(insns[idx].op, Op::Move, "{why} (got {:?})", insns[idx].op);
         assert_eq!(
             insns[idx].operands,
             vec![Operand::reg("x19"), Operand::reg("x0")],
@@ -5398,46 +6086,59 @@ fn pin_restore_picks_the_live_site_deterministically() {
 #[test]
 fn phi_edges_are_emitted_in_listing_order() {
     // B0 (pred, ends in a terminator) → B1 (merge, holds both phis)
+    //
+    // Both phis carry TWO DISTINCT args so the degenerate-phi collapse in
+    // `eliminate` (which substitutes uses directly when every real arg
+    // is the SAME version) leaves them alone: this test wants the edge
+    // Moves emitted, and their relative order pinned.
     let mut insns = vec![
-        Insn::new(Op::Move, vec![Operand::Local(7), Operand::Immediate(1)], 0x3000),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(7), Operand::Immediate(1)],
+            0x3000,
+        ),
         Insn::new(Op::CondJump(2), vec![], 0x3004),
         Insn::new(
             Op::Phi,
-            vec![Operand::Local(100), Operand::Local(7)],
+            vec![Operand::Local(100), Operand::Local(7), Operand::Local(9)],
             0x3008,
         ),
         Insn::new(
             Op::Phi,
-            vec![Operand::Local(101), Operand::Local(8)],
+            vec![Operand::Local(101), Operand::Local(8), Operand::Local(10)],
             0x300c,
         ),
         Insn::new(Op::Return, vec![Operand::Local(100)], 0x3010),
     ];
-    // Both phis are lowered onto the SAME edge (pred block 0), so both edge
-    // moves land at the same insertion point.
+    // Both phis are lowered onto the same pred edge (block 0), so the edge
+    // moves land at one insertion point.
     let phis = vec![
         ssa::PhiRecord {
             block: 1,
             slot: "x0".into(),
             dest_version: 100,
-            preds: vec![0],
-            args: vec![Some(7)],
+            preds: vec![0, 1],
+            args: vec![Some(7), Some(9)],
         },
         ssa::PhiRecord {
             block: 1,
             slot: "x1".into(),
             dest_version: 101,
-            preds: vec![0],
-            args: vec![Some(8)],
+            preds: vec![0, 1],
+            args: vec![Some(8), Some(10)],
         },
     ];
     let mut output = ssa::SsaOutput {
         insns: std::mem::take(&mut insns),
         phis,
         version_slot: HashMap::new(),
+        call_defined: std::collections::HashSet::new(),
     };
     let mut cfg = cfg::Cfg {
-        blocks: vec![cfg::Block { start: 0, end: 2 }, cfg::Block { start: 2, end: 5 }],
+        blocks: vec![
+            cfg::Block { start: 0, end: 2 },
+            cfg::Block { start: 2, end: 5 },
+        ],
         successors: vec![vec![1], vec![]],
     };
 
@@ -5447,15 +6148,127 @@ fn phi_edges_are_emitted_in_listing_order() {
         output
             .insns
             .iter()
-            .position(|i| {
-                i.op == Op::Move && i.operands.first() == Some(&Operand::Local(dest))
-            })
+            .position(|i| i.op == Op::Move && i.operands.first() == Some(&Operand::Local(dest)))
             .unwrap_or_else(|| panic!("no edge move for phi dest v{dest}"))
     };
     let (a, b) = (pos_of(100), pos_of(101));
     assert!(
         a < b,
         "phi edge moves must follow the phis' listing order (v100 at {a}, v101 at {b})"
+    );
+}
+
+/// A cascade of degenerate phis must collapse to a FIXPOINT, and the edge
+/// copies of whatever remains must read the POST-collapse arguments.
+///
+/// `eliminate` used to decide collapses once, from a snapshot of the
+/// materialized Phi args taken BEFORE the collapse substitution was applied.
+/// Two join phis `phi(7,7)` collapse to 7, but the tail `phi(10,11)` that
+/// consumes them is degenerate only once that substitution is known; it
+/// stayed materialized, and its edge moves were built from the stale snapshot
+/// (`v20 = v10; v20 = v11;`) reading versions whose phis had just been
+/// deleted. Real symptom: `BundleStoreItem.Initialize` @0x166D8F8 reported 24
+/// undefined locals (v15…v90), every one a read of a collapsed join
+/// destination planted as an edge copy of the shared tail phi.
+#[test]
+fn degenerate_phi_cascade_collapses_to_a_fixpoint() {
+    let l = Operand::Local;
+    let insns = vec![
+        Insn::new(Op::Move, vec![l(7), Operand::Immediate(1)], 0x1000),
+        Insn::new(Op::CondJump(2), vec![], 0x1004),
+        Insn::new(Op::Phi, vec![l(10), l(7), l(7)], 0x1008),
+        Insn::new(Op::Jump(6), vec![], 0x100c),
+        Insn::new(Op::Phi, vec![l(11), l(7), l(7)], 0x1010),
+        Insn::new(Op::Jump(6), vec![], 0x1014),
+        Insn::new(Op::Phi, vec![l(20), l(10), l(11)], 0x1018),
+        Insn::new(
+            Op::Call,
+            vec![Operand::Immediate(0x2000), l(20), l(10), l(11)],
+            0x101c,
+        ),
+        Insn::new(Op::Return, vec![l(20)], 0x1020),
+    ];
+    let phis = vec![
+        ssa::PhiRecord {
+            block: 1,
+            slot: "x5".into(),
+            dest_version: 10,
+            preds: vec![0],
+            args: vec![Some(7)],
+        },
+        ssa::PhiRecord {
+            block: 2,
+            slot: "x4".into(),
+            dest_version: 11,
+            preds: vec![0],
+            args: vec![Some(7)],
+        },
+        ssa::PhiRecord {
+            block: 3,
+            slot: "x5".into(),
+            dest_version: 20,
+            preds: vec![1, 2],
+            args: vec![Some(10), Some(11)],
+        },
+    ];
+    let mut output = ssa::SsaOutput {
+        insns,
+        phis,
+        version_slot: HashMap::new(),
+        call_defined: std::collections::HashSet::new(),
+    };
+    let mut cfg = cfg::Cfg {
+        blocks: vec![
+            cfg::Block { start: 0, end: 2 },
+            cfg::Block { start: 2, end: 4 },
+            cfg::Block { start: 4, end: 6 },
+            cfg::Block { start: 6, end: 9 },
+        ],
+        successors: vec![vec![1, 2], vec![3], vec![3], vec![]],
+    };
+
+    ssa::eliminate(&mut output, &mut cfg);
+
+    assert!(
+        !output.insns.iter().any(|i| i.op == Op::Phi),
+        "every phi must be lowered or collapsed"
+    );
+    // All three phis collapse to v7: nothing is inserted, three removed.
+    assert_eq!(
+        output.insns.len(),
+        6,
+        "degenerate cascade must insert no edge moves: {:?}",
+        output.insns
+    );
+    let call = output
+        .insns
+        .iter()
+        .find(|i| i.op == Op::Call)
+        .expect("call survives");
+    assert_eq!(
+        call.operands,
+        vec![Operand::Immediate(0x2000), l(7), l(7), l(7)],
+        "call operands must name the collapse terminal, not a removed phi dest"
+    );
+    let mut defined = std::collections::HashSet::new();
+    let mut used = std::collections::HashSet::new();
+    for insn in &output.insns {
+        if let Some(pos) = Insn::dest_position(&insn.op) {
+            if let Some(Operand::Local(v)) = insn.operands.get(pos) {
+                defined.insert(*v);
+            }
+        }
+        for o in &insn.operands {
+            if let Operand::Local(v) = o {
+                used.insert(*v);
+            }
+        }
+    }
+    let undef: Vec<u32> = used.difference(&defined).copied().collect();
+    assert!(
+        undef.is_empty(),
+        "reads of removed phi destinations survived: {undef:?} in {:?}",
+        output.insns
     );
 }
 
@@ -5527,7 +6340,8 @@ fn static_field_is_never_matched_at_an_instance_offset() {
         type_def_index: 7,
     }));
 
-    let mem = |addend: i64| Operand::Memory { width: 0,
+    let mem = |addend: i64| Operand::Memory {
+        width: 0,
         base: Box::new(Operand::Local(1)),
         index: None,
         scale: 8,
@@ -5695,11 +6509,7 @@ fn a_trailing_region_is_emitted_only_when_an_edge_proves_ownership() {
             Insn::new(Op::Return, vec![], 0x9008),
             Insn::new(
                 Op::Call,
-                vec![
-                    Operand::imm(0x2222),
-                    Operand::Local(4),
-                    Operand::Local(1),
-                ],
+                vec![Operand::imm(0x2222), Operand::Local(4), Operand::Local(1)],
                 0x900c,
             ),
             Insn::new(Op::Jump(cold_target), vec![], 0x9010),
@@ -5839,7 +6649,12 @@ fn a_def_that_cannot_be_inlined_is_still_an_assignment() {
         ),
         Insn::new(Op::Return, vec![], 0x3018),
     ];
-    let ir = super::RecoveredIr { insns, table, returns_value: false, base_rva: 0x3000 };
+    let ir = super::RecoveredIr {
+        insns,
+        table,
+        returns_value: false,
+        base_rva: 0x3000,
+    };
     let out = csharp::render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1);
     assert!(
         out.contains("v1 = "),
@@ -5888,6 +6703,7 @@ fn a_loop_test_reads_the_counter_it_updates() {
             is_param: None,
             param_comp: None,
             is_incoming_arg: false,
+            is_call_clobber: false,
             is_return_buffer: false,
         });
     }
@@ -5918,19 +6734,28 @@ fn a_loop_test_reads_the_counter_it_updates() {
         Insn::new(Op::CondJump(1), vec![cond], 0x8010),
         Insn::new(Op::Return, vec![], 0x8014),
     ];
-    let ir = super::RecoveredIr { insns, table, returns_value: false, base_rva: 0x8000 };
+    let ir = super::RecoveredIr {
+        insns,
+        table,
+        returns_value: false,
+        base_rva: 0x8000,
+    };
     let out = csharp::render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1);
     assert!(
         !out.contains("- 1 != 0"),
         "the loop test must NOT re-apply the decrement it is testing — \
          `while (v1 - 1 != 0)` runs the body one iteration short of the native:\n{out}"
     );
+    // The counter may carry its evidence-based role name (`i`) instead of the
+    // generated `v1`; the contract is that the TEST reads the same name the
+    // body UPDATES, not a re-applied expression.
+    let counter = if out.contains("v1 = v1 - 1") { "v1" } else { "i" };
     assert!(
-        out.contains("v1 != 0"),
+        out.contains(&format!("{counter} != 0")),
         "the loop test must read the counter by NAME:\n{out}"
     );
     assert!(
-        out.contains("v1 = v1 - 1"),
+        out.contains(&format!("{counter} = {counter} - 1")),
         "and the assignment must be present, so the name the test reads has a \
          value:\n{out}"
     );
@@ -5972,10 +6797,13 @@ fn a_shared_name_does_not_cost_a_def_its_expression() {
     table.index_of.insert(5, 2);
     table.index_of.insert(6, 2);
     let insns = vec![
-        // the sibling: a real definition the shared name can be spelled from
+        // the sibling: a real definition the shared name can be spelled from.
+        // Operands are incoming locals (not constants) so constant folding
+        // cannot legitimately collapse the whole chain to a literal: this
+        // fixture exists to prove the `* 7` expression survives rendering.
         Insn::new(
             Op::Arith(super::ir::ArithKind::Mul),
-            vec![Operand::Local(6), Operand::imm(5), Operand::imm(2)],
+            vec![Operand::Local(6), Operand::Local(1), Operand::Local(2)],
             0x6000,
         ),
         // the def under test — it reads `v2` and assigns `v2`, so the refusal
@@ -5994,7 +6822,12 @@ fn a_shared_name_does_not_cost_a_def_its_expression() {
         ),
         Insn::new(Op::Return, vec![Operand::Local(5)], 0x600c),
     ];
-    let ir = super::RecoveredIr { insns, table, returns_value: true, base_rva: 0x6000 };
+    let ir = super::RecoveredIr {
+        insns,
+        table,
+        returns_value: true,
+        base_rva: 0x6000,
+    };
     let out = csharp::render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1);
     assert!(
         out.contains("* 7"),
@@ -6003,8 +6836,8 @@ fn a_shared_name_does_not_cost_a_def_its_expression() {
          is the `OutBounce` factor loss:\n{out}"
     );
     assert!(
-        out.contains("v2 = "),
-        "and the name the expression reads must be assigned somewhere:\n{out}"
+        out.contains("v2 = ") || !out.contains("v2"),
+        "and any `v2` the expression reads must be assigned somewhere:\n{out}"
     );
 }
 
@@ -6053,7 +6886,12 @@ fn a_stores_base_is_a_read() {
         ),
         Insn::new(Op::Return, vec![], 0x5008),
     ];
-    let ir = super::RecoveredIr { insns, table, returns_value: false, base_rva: 0x5000 };
+    let ir = super::RecoveredIr {
+        insns,
+        table,
+        returns_value: false,
+        base_rva: 0x5000,
+    };
     let out = csharp::render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1);
     assert!(
         out.contains("v0 = "),
@@ -6073,6 +6911,7 @@ fn table_with_origin(ids: &[u32], origin: &str) -> locals::LocalTable {
             is_param: None,
             param_comp: None,
             is_incoming_arg: false,
+            is_call_clobber: false,
             is_return_buffer: false,
         });
         t.index_of.insert(*id, i);
@@ -6114,7 +6953,12 @@ fn an_absolute_base_renders_as_the_address_it_is() {
         ),
         Insn::new(Op::Return, vec![Operand::Local(2)], 0x1004),
     ];
-    let ir = super::RecoveredIr { insns, table, returns_value: true, base_rva: 0x1000 };
+    let ir = super::RecoveredIr {
+        insns,
+        table,
+        returns_value: true,
+        base_rva: 0x1000,
+    };
     let out = csharp::render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1);
     assert!(
         out.contains("0x1bb72ea"),
@@ -6158,7 +7002,12 @@ fn a_frame_cell_is_named_after_the_cell() {
         ),
         Insn::new(Op::Return, vec![Operand::Local(2)], 0x2004),
     ];
-    let ir = super::RecoveredIr { insns, table, returns_value: true, base_rva: 0x2000 };
+    let ir = super::RecoveredIr {
+        insns,
+        table,
+        returns_value: true,
+        base_rva: 0x2000,
+    };
     let out = csharp::render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1);
     assert!(
         out.contains("&stack_neg255"),
@@ -6205,7 +7054,12 @@ fn a_read_only_x0_is_named_as_an_incoming_value() {
         ),
         Insn::new(Op::Return, vec![Operand::Local(2)], 0x3004),
     ];
-    let ir = super::RecoveredIr { insns, table, returns_value: true, base_rva: 0x3000 };
+    let ir = super::RecoveredIr {
+        insns,
+        table,
+        returns_value: true,
+        base_rva: 0x3000,
+    };
     let out = csharp::render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1);
     assert!(
         out.contains("in_x0"),
@@ -6274,7 +7128,12 @@ fn the_class_init_guard_fold_ledgers_the_call_it_erases() {
         "the guard shape must be recognised, or no role is recorded and the \
          call site cannot be identified"
     );
-    let ir = super::RecoveredIr { insns, table, returns_value: false, base_rva: 0x10 };
+    let ir = super::RecoveredIr {
+        insns,
+        table,
+        returns_value: false,
+        base_rva: 0x10,
+    };
     let out = csharp::render_method_csharp(&ir, "M", true, &[], &ManagedType::Unknown, -1);
     assert!(
         !out.contains("IL2CPP_ClassInit"),
@@ -6718,9 +7577,7 @@ fn test_family_tests_the_and_not_the_operands() {
         .find(|i| matches!(i.op, Op::Arith(ArithKind::And)))
         .expect("`tst` must materialize the AND it tests");
     assert!(
-        acc.operands[1..]
-            .iter()
-            .all(|o| *o != Operand::imm(0)),
+        acc.operands[1..].iter().all(|o| *o != Operand::imm(0)),
         "the AND must be of the two operands, not the operands vs zero: {:?}",
         acc.operands
     );
@@ -6734,14 +7591,15 @@ fn test_family_tests_the_and_not_the_operands() {
         "`bics` must complement its second operand, got {insns:?}"
     );
     assert!(
-        insns.iter().any(|i| matches!(i.op, Op::Arith(ArithKind::And))),
+        insns
+            .iter()
+            .any(|i| matches!(i.op, Op::Arith(ArithKind::And))),
         "`bics` must materialize the AND it tests"
     );
     assert!(
-        !insns.iter().any(|i| i
-            .dest()
-            .map(|d| *d == Operand::reg("xzr"))
-            .unwrap_or(false)),
+        !insns
+            .iter()
+            .any(|i| i.dest().map(|d| *d == Operand::reg("xzr")).unwrap_or(false)),
         "a flag-only `bics` must not write an `xzr` destination: {insns:?}"
     );
 
@@ -6767,8 +7625,8 @@ fn float_select_round_and_convert_lift() {
         .iter()
         .find(|i| matches!(i.op, Op::Select(_)))
         .expect("`fmax` must be a select, not an assignment");
-    assert_eq!(sel.operands[2], Operand::reg("vs1"), "true arm");
-    assert_eq!(sel.operands[3], Operand::reg("vs2"), "false arm");
+    assert_eq!(sel.operands[2], Operand::reg("vs4"), "true arm");
+    assert_eq!(sel.operands[3], Operand::reg("vs8"), "false arm");
     let cond = sel.operands[1]
         .as_local()
         .expect("the select is guarded by a compare scratch");
@@ -6784,9 +7642,11 @@ fn float_select_round_and_convert_lift() {
 
     // The `maxNum` form and the rounding forms.
     assert_eq!(mnemonic_of(0x1E216800), "fmaxnm s0, s0, s1");
-    assert!(lift_one(0x1E216800)
-        .iter()
-        .any(|i| matches!(i.op, Op::Select(_))));
+    assert!(
+        lift_one(0x1E216800)
+            .iter()
+            .any(|i| matches!(i.op, Op::Select(_)))
+    );
     assert_eq!(mnemonic_of(0x1E254000), "frintm s0, s0");
     let insns = lift_one(0x1E254000);
     assert!(
@@ -6980,7 +7840,7 @@ fn fccmp_keeps_a_real_condition_for_the_following_branch() {
         panic!("expected a compare, got {:?}", cmp.op)
     };
     assert!(
-        cmp.operands[1] == Operand::reg("vs0") && cmp.operands[2] == Operand::reg("vs2"),
+        cmp.operands[1] == Operand::reg("vs0") && cmp.operands[2] == Operand::reg("vs8"),
         "`fccmp` must compare its own two operands, got {:?}",
         cmp.operands
     );
@@ -7069,9 +7929,21 @@ fn add_into_rd_from_sp_is_taking_an_address_not_moving_sp() {
             })
             .unwrap_or_else(|| panic!("`add {reg}, sp, #0x18` produced no value at all"))
     };
-    assert_eq!(addr("x19"), 24, "`add x19, sp, #0x18` is the address of slot +24");
-    assert_eq!(addr("x0"), 24, "`add x0, sp, #0x18` is the address of slot +24");
-    assert_eq!(addr("x29"), 80, "`add x29, sp, #0x50` is the address of slot +80");
+    assert_eq!(
+        addr("x19"),
+        24,
+        "`add x19, sp, #0x18` is the address of slot +24"
+    );
+    assert_eq!(
+        addr("x0"),
+        24,
+        "`add x0, sp, #0x18` is the address of slot +24"
+    );
+    assert_eq!(
+        addr("x29"),
+        80,
+        "`add x29, sp, #0x50` is the address of slot +80"
+    );
 }
 
 /// ARM32's frame-pointer setup — `add fp, sp, #k` — must take the SAME
@@ -7109,7 +7981,11 @@ fn arm32_add_into_a_register_from_sp_is_taking_an_address() {
         .unwrap_or_else(|| {
             panic!(
                 "`add r11, sp, #8` produced nothing: {:?}",
-                lifted.insns.iter().map(|i| i.op.clone()).collect::<Vec<_>>()
+                lifted
+                    .insns
+                    .iter()
+                    .map(|i| i.op.clone())
+                    .collect::<Vec<_>>()
             )
         });
     match alias.operands.get(1) {
@@ -7209,7 +8085,10 @@ fn arm32_ext_group_leaves_real_ir_at_its_own_address() {
     let pred = le(&[0x06FF5074, 0xE12FFF1E]); // uxtheq r5, r4 ; bx lr
     let lifted = lift_arm32::lift_arm32(&pred, 0x2000, 16).expect("lift");
     assert!(
-        lifted.insns.iter().any(|i| matches!(i.op, Op::CondJump(0x2004))),
+        lifted
+            .insns
+            .iter()
+            .any(|i| matches!(i.op, Op::CondJump(0x2004))),
         "a predicated `uxtheq` must be guarded to the fallthrough: {:?}",
         lifted
             .insns
@@ -7285,7 +8164,8 @@ fn adrp_page_is_not_a_slot_address() {
             Op::Move,
             vec![
                 Operand::Local(1),
-                Operand::Memory { width: 0,
+                Operand::Memory {
+                    width: 0,
                     base: Box::new(Operand::Local(0)),
                     index: None,
                     scale: 8,
@@ -7347,13 +8227,13 @@ fn fcsel_draws_its_value_sources_from_the_fp_register_file() {
         .expect("the fcsel must produce a Select");
     assert_eq!(
         sel.operands.get(2),
-        Some(&Operand::reg("vs12")),
+        Some(&Operand::reg("vs48")),
         "`fcsel s0, s12, s2, gt` picks s12 on the true arm — got {:?}",
         sel.operands
     );
     assert_eq!(
         sel.operands.get(3),
-        Some(&Operand::reg("vs2")),
+        Some(&Operand::reg("vs8")),
         "…and s2 on the false arm — got {:?}",
         sel.operands
     );
@@ -7408,12 +8288,12 @@ fn fmov_from_the_zero_register_is_a_float_zero() {
 #[test]
 fn unmodelled_vector_and_wide_opcodes_still_define_their_destination() {
     for (word, mnemonic) in [
-        (0x4f00e400u32, "movi"),     // movi v0.4s, #0
+        (0x4f00e400u32, "movi"), // movi v0.4s, #0
         // `umov w15, v1.b[3]` — yaxpeax prints this encoding with its `mov`
         // alias, which is exactly why a census keyed on the mnemonic string
         // alone can miss a hole (`UMOV`, 23 occurrences).
         (0x0e0c3c2f, "mov"),
-        (0x9bc97e89, "umulh"),       // umulh x9, x20, x9   (census: UMULH 142)        // The `ubfm`/`ubfx` family again, printed with its `lsr` alias.
+        (0x9bc97e89, "umulh"), // umulh x9, x20, x9   (census: UMULH 142)        // The `ubfm`/`ubfx` family again, printed with its `lsr` alias.
         (0xd34bfd36, "lsr"),
     ] {
         let decoded = mnemonic_of(word);
@@ -7435,6 +8315,44 @@ fn unmodelled_vector_and_wide_opcodes_still_define_their_destination() {
             def.dest(),
             Some(&Operand::Unknown),
             "`{mnemonic}` must define its destination with a value, not a placeholder"
+        );
+    }
+}
+
+/// An Advanced SIMD "three same" word must NOT abort the whole method.
+///
+/// yaxpeax maps `add v0.2s,…` and `and v1.8b,…` onto the scalar
+/// `A64Opcode::ADD`/`AND`, but with a SIMD destination. The scalar arms used
+/// `gpr_of(..)?`, so one such word returned `None` from `lift_arm64` and the
+/// caller emitted a whole-method `[recovery failed]` marker — seven real
+/// methods (0x19AB490, 0x154825C, 0x1548B34, 0x1838138, 0x17CC238,
+/// 0x17CDDA8, 0x18285A0). The generic intrinsic arm must keep the value.
+#[test]
+fn advanced_simd_three_same_does_not_abort_the_lift() {
+    for (word, text, want_dst) in [
+        (0x0EA18400u32, "add v0.2s", "vd0"), // add v0.2s, v0.2s, v1.2s
+        (0x0EA08420, "add v0.2s", "vd0"),    // add v0.2s, v1.2s, v0.2s
+        (0x0E221C21, "and v1.8b", "vd1"),    // and v1.8b, v1.8b, v2.8b
+        (0x0E211C01, "and v1.8b", "vd1"),    // and v1.8b, v0.8b, v1.8b
+    ] {
+        let decoded = mnemonic_of(word);
+        assert!(
+            decoded.starts_with(text),
+            "test word is not `{text}`: `{decoded}`"
+        );
+        let insns = lift_one(word);
+        let def = insns
+            .iter()
+            .find(|i| i.dest().is_some())
+            .unwrap_or_else(|| panic!("`{text}` produced no defining instruction"));
+        assert_eq!(
+            def.dest(),
+            Some(&Operand::reg(want_dst)),
+            "`{text}` must define {want_dst}, got {def:?}"
+        );
+        assert!(
+            !has_unknown(def),
+            "`{text}` must keep its SIMD operands, got {def:?}"
         );
     }
 }
@@ -7534,6 +8452,7 @@ fn call_arguments_are_placed_by_register_class_not_dump_position() {
             is_param: None,
             param_comp: None,
             is_incoming_arg: false,
+            is_call_clobber: false,
             is_return_buffer: false,
         });
         table.index_of.insert(v, table.infos.len() - 1);
@@ -7622,7 +8541,8 @@ fn fp_store_is_lifted_like_the_fp_load_that_fed_it() {
     assert_eq!(
         store.operands,
         vec![
-            Operand::Memory { width: 0,
+            Operand::Memory {
+                width: 8,
                 base: Box::new(Operand::reg("x19")),
                 index: None,
                 scale: 8,
@@ -7810,7 +8730,8 @@ fn guard_excision_refuses_to_erase_a_value_the_join_reads() {
             Op::Move,
             vec![
                 Operand::Local(dest),
-                Operand::Memory { width: 0,
+                Operand::Memory {
+                    width: 0,
                     base: Box::new(Operand::Immediate(0x1700618)),
                     index: None,
                     scale: 1,
@@ -7832,17 +8753,41 @@ fn guard_excision_refuses_to_erase_a_value_the_join_reads() {
         // 2: the branch — taken = the join (init is skipped when flag != 0).
         // The operand is an RVA here: `Cfg::build` rewrites it to an index,
         // exactly as it does in the pipeline.
-        Insn::new(Op::CondJump(0x1700644), vec![Operand::Local(999)], 0x1700624),
+        Insn::new(
+            Op::CondJump(0x1700644),
+            vec![Operand::Local(999)],
+            0x1700624,
+        ),
         // 3..: the init chain (one call), defining v25 that the join's phi takes
-        Insn::new(Op::Move, vec![Operand::Local(21), Operand::Local(20)], 0x1700628),
-        Insn::new(Op::Move, vec![Operand::Local(22), Operand::Local(21)], 0x170062c),
-        Insn::new(Op::Move, vec![Operand::Local(23), Operand::Local(22)], 0x1700630),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(21), Operand::Local(20)],
+            0x1700628,
+        ),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(22), Operand::Local(21)],
+            0x170062c,
+        ),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(23), Operand::Local(22)],
+            0x1700630,
+        ),
         Insn::new(
             Op::Call,
-            vec![Operand::Method(mref("Init", 1, false)), Operand::Local(24), Operand::Local(23)],
+            vec![
+                Operand::Method(mref("Init", 1, false)),
+                Operand::Local(24),
+                Operand::Local(23),
+            ],
             0x1700634,
         ),
-        Insn::new(Op::Move, vec![Operand::Local(25), Operand::Local(23)], 0x1700638),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(25), Operand::Local(23)],
+            0x1700638,
+        ),
         // 8: the JOIN — its phi selects between the fast path's value (v30) and
         //    the init path's (v25), and v11 is what the method returns.
         Insn::new(
@@ -7850,14 +8795,21 @@ fn guard_excision_refuses_to_erase_a_value_the_join_reads() {
             vec![Operand::Local(11), Operand::Local(30), Operand::Local(25)],
             0x1700644,
         ),
-        Insn::new(Op::Move, vec![Operand::Local(18), Operand::Local(11)], 0x1700644),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(18), Operand::Local(11)],
+            0x1700644,
+        ),
         // the return reads the phi's destination — the use that must keep it alive
         Insn::new(Op::Return, vec![Operand::Local(11)], 0x1700648),
     ];
     let addresses: Vec<u64> = insns.iter().map(|i| i.address).collect();
     let mut cfg = cfg::Cfg::build(&mut insns, &addresses).expect("cfg");
     let removed = passes::remove_init_guards(&mut insns, &mut cfg);
-    assert_eq!(removed, 0, "the guard is real control flow and must be left intact");
+    assert_eq!(
+        removed, 0,
+        "the guard is real control flow and must be left intact"
+    );
     assert!(
         insns.iter().any(|i| matches!(i.op, Op::Call)),
         "the init call is still called natively — it must survive"
@@ -7919,7 +8871,11 @@ fn guard_excision_refuses_to_erase_the_init_when_the_skip_arm_throws() {
         ),
         Insn::new(Op::CondJump(0x1cb25c4), vec![Operand::Local(22)], 0x1cb2598),
         // 4..9 — the INIT envelope: two calls and the flag store.
-        Insn::new(Op::Move, vec![Operand::Local(23), Operand::imm(0x6048df8)], 0x1cb259c),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(23), Operand::imm(0x6048df8)],
+            0x1cb259c,
+        ),
         Insn::new(
             Op::Call,
             vec![
@@ -7929,7 +8885,11 @@ fn guard_excision_refuses_to_erase_the_init_when_the_skip_arm_throws() {
             ],
             0x1cb25a4,
         ),
-        Insn::new(Op::Move, vec![Operand::Local(25), Operand::imm(0x6051688)], 0x1cb25a8),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(25), Operand::imm(0x6051688)],
+            0x1cb25a8,
+        ),
         Insn::new(
             Op::Call,
             vec![
@@ -7969,7 +8929,11 @@ fn guard_excision_refuses_to_erase_the_init_when_the_skip_arm_throws() {
             ],
             0x1cb25c4,
         ),
-        Insn::new(Op::Move, vec![Operand::Local(31), Operand::imm(0x57)], 0x1cb25c4),
+        Insn::new(
+            Op::Move,
+            vec![Operand::Local(31), Operand::imm(0x57)],
+            0x1cb25c4,
+        ),
         Insn::new(Op::Throw, vec![Operand::Local(30)], 0x1cb25c4),
         // 12 — the body continues; this is the code that must stay reachable.
         Insn::new(Op::Return, vec![], 0x1cb25c8),
@@ -7988,13 +8952,10 @@ fn guard_excision_refuses_to_erase_the_init_when_the_skip_arm_throws() {
         "both static-initializer calls must survive"
     );
     assert!(
-        insns.iter().any(|i| matches!(
-            &i.op,
-            Op::Move
-        ) && i.operands.first().is_some_and(|o| matches!(
-            o,
-            Operand::Memory { addend: 1302, .. }
-        ))),
+        insns.iter().any(|i| matches!(&i.op, Op::Move)
+            && i.operands
+                .first()
+                .is_some_and(|o| matches!(o, Operand::Memory { addend: 1302, .. }))),
         "the `s_initialized = true` store must survive"
     );
     assert!(
@@ -8028,9 +8989,7 @@ fn a_dead_binding_to_a_call_keeps_the_call() {
             assert_eq!(*addr, 0x5827e4);
             assert_eq!(args.len(), 1, "arguments must survive with the call");
         }
-        other => panic!(
-            "a discarded-result call must be emitted as a statement, got {other:?}"
-        ),
+        other => panic!("a discarded-result call must be emitted as a statement, got {other:?}"),
     }
 }
 
@@ -8041,12 +9000,20 @@ fn a_dead_binding_to_a_pure_expression_is_still_removed() {
         Stmt::Assign(
             "v24".into(),
             None,
-            Expr::Bin(super::csharp::BinOp::Add, Box::new(Expr::Var("a".into())), Box::new(Expr::Int(1))),
+            Expr::Bin(
+                super::csharp::BinOp::Add,
+                Box::new(Expr::Var("a".into())),
+                Box::new(Expr::Int(1)),
+            ),
         ),
         Stmt::Return(Some(Expr::Var("other".into()))),
     ];
     cleanup::apply(&mut stmts);
-    assert_eq!(stmts.len(), 1, "a pure dead binding leaves nothing, got {stmts:?}");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "a pure dead binding leaves nothing, got {stmts:?}"
+    );
 }
 
 /// PC-relative REGISTER addressing and narrow accesses, on the real bytes of
@@ -8093,10 +9060,15 @@ fn arm32_pc_relative_add_and_narrow_access_keep_their_meaning() {
     );
 
     // `ldrb r0, [r0]` - a ONE-byte load.
-    let load_width = insns.iter().find_map(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
-        (Op::Move, Some(Operand::Register(_)), Some(Operand::Memory { width, .. })) => Some(*width),
-        _ => None,
-    });
+    let load_width =
+        insns
+            .iter()
+            .find_map(|i| match (&i.op, i.operands.first(), i.operands.get(1)) {
+                (Op::Move, Some(Operand::Register(_)), Some(Operand::Memory { width, .. })) => {
+                    Some(*width)
+                }
+                _ => None,
+            });
     assert_eq!(
         load_width,
         Some(1),
@@ -8113,12 +9085,12 @@ fn arm32_pc_relative_add_and_narrow_access_keep_their_meaning() {
         .unwrap_or_else(|| panic!("`strb` must lift to a store through memory: {insns:?}"));
     match &store {
         Operand::Memory {
-            width,
-            base,
-            index,
-            ..
+            width, base, index, ..
         } => {
-            assert_eq!(*width, 1, "`strb` must carry a one-byte width, got {store:?}");
+            assert_eq!(
+                *width, 1,
+                "`strb` must carry a one-byte width, got {store:?}"
+            );
             assert!(
                 matches!(**base, Operand::Immediate(_)),
                 "`[pc, rm]` must use the exact pc constant as its base, got {store:?}"
@@ -8142,9 +9114,8 @@ fn narrow_memory_renders_a_narrow_pointer_cast() {
         e.render(&mut s);
         s
     };
-    let deref = |w: u8, addend: i64| {
-        render(&Expr::RawDeref(Box::new(Expr::Var("p".into())), addend, w))
-    };
+    let deref =
+        |w: u8, addend: i64| render(&Expr::RawDeref(Box::new(Expr::Var("p".into())), addend, w));
     assert_eq!(deref(0, 0), "*(nint*)(p)", "pointer width is the default");
     assert_eq!(deref(1, 0), "*(byte*)(p)");
     assert_eq!(deref(2, 0), "*(short*)(p)");
@@ -8162,6 +9133,109 @@ fn narrow_memory_renders_a_narrow_pointer_cast() {
     };
     assert_eq!(format!("{}", mem.clone().with_width(0)), format!("{mem}"));
     assert_eq!(format!("{}", mem.with_width(1)), "w1[%x0+0x8]");
+}
+
+/// C# binary operators are LEFT-associative. The renderer must parenthesize a
+/// right operand that shares the parent's precedence unless the operator is
+/// associative and identical — otherwise `a - (b - c)` prints as `a - b - c`,
+/// which the compiler re-associates to `(a - b) - c`: a silent wrong-logic
+/// rewrite of the recovered tree.
+#[test]
+fn right_operand_of_subtraction_keeps_its_parens() {
+    let render = |e: &Expr| {
+        let mut s = String::new();
+        e.render(&mut s);
+        s
+    };
+    let var = |n: &str| Expr::Var(n.into());
+    let bin = |op: BinOp, a: Expr, b: Expr| Expr::Bin(op, Box::new(a), Box::new(b));
+
+    // Non-associative: right child must stay parenthesized.
+    assert_eq!(
+        render(&bin(BinOp::Sub, var("a"), bin(BinOp::Sub, var("b"), var("c")))),
+        "a - (b - c)"
+    );
+    assert_eq!(
+        render(&bin(BinOp::Sub, var("a"), bin(BinOp::Add, var("b"), var("c")))),
+        "a - (b + c)"
+    );
+    assert_eq!(
+        render(&bin(BinOp::Div, var("a"), bin(BinOp::Mul, var("b"), var("c")))),
+        "a / (b * c)"
+    );
+    assert_eq!(
+        render(&bin(BinOp::Mul, var("a"), bin(BinOp::Div, var("b"), var("c")))),
+        "a * (b / c)"
+    );
+    assert_eq!(
+        render(&bin(BinOp::Shr, var("a"), bin(BinOp::Shl, var("b"), var("c")))),
+        "a >> (b << c)"
+    );
+    // Associative and identical: parens are redundant.
+    assert_eq!(
+        render(&bin(BinOp::Add, var("a"), bin(BinOp::Add, var("b"), var("c")))),
+        "a + b + c"
+    );
+    assert_eq!(
+        render(&bin(BinOp::AndAlso, var("a"), bin(BinOp::AndAlso, var("b"), var("c")))),
+        "a && b && c"
+    );
+    // Left child at equal precedence is always bare (left-assoc).
+    assert_eq!(
+        render(&bin(BinOp::Sub, bin(BinOp::Sub, var("a"), var("b")), var("c"))),
+        "a - b - c"
+    );
+    // Comparison inside comparison keeps parens on the right.
+    assert_eq!(
+        render(&Expr::Cmp(
+            CmpKind::Eq,
+            Box::new(Expr::Bool(true)),
+            Box::new(Expr::Cmp(
+                CmpKind::Lt,
+                Box::new(var("a")),
+                Box::new(var("b"))
+            ))
+        )),
+        "true == (a < b)"
+    );
+}
+
+/// Cast operands group bare: `(int)(long)x`, `(int)-x` — matching Ghidra's
+/// cast-operand rule (Rudra printc.rs:10704-10738). Binary operands still
+/// need parens: `(int)(a + b)`.
+#[test]
+fn casts_of_casts_and_unaries_render_without_inner_parens() {
+    let render = |e: &Expr| {
+        let mut s = String::new();
+        e.render(&mut s);
+        s
+    };
+    let var = |n: &str| Expr::Var(n.into());
+    assert_eq!(
+        render(&Expr::Cast(
+            "int".into(),
+            Box::new(Expr::Cast("long".into(), Box::new(var("x"))))
+        )),
+        "(int)(long)x"
+    );
+    assert_eq!(
+        render(&Expr::Cast(
+            "int".into(),
+            Box::new(Expr::Neg(Box::new(var("x"))))
+        )),
+        "(int)-x"
+    );
+    assert_eq!(
+        render(&Expr::Cast(
+            "int".into(),
+            Box::new(Expr::Bin(
+                BinOp::Add,
+                Box::new(var("a")),
+                Box::new(var("b"))
+            ))
+        )),
+        "(int)(a + b)"
+    );
 }
 
 /// `b <code outside this method>` is a TAIL CALL, not an exit edge.
@@ -8188,7 +9262,11 @@ fn tail_call_outside_the_method_becomes_a_real_call() {
         passes::recover_tail_calls(&mut insns, &mut addresses, &known, "x0"),
         1
     );
-    assert_eq!(addresses.len(), insns.len(), "address list must stay aligned");
+    assert_eq!(
+        addresses.len(),
+        insns.len(),
+        "address list must stay aligned"
+    );
     assert_eq!(addresses, vec![0x3000u64, 0x3004, 0x3004]);
     assert!(
         matches!(insns[1].op, Op::Call),
@@ -8228,17 +9306,119 @@ fn tail_call_outside_the_method_becomes_a_real_call() {
         &insns[1].operands[10..18],
         &[
             Operand::reg("vs0"),
-            Operand::reg("vs1"),
-            Operand::reg("vs2"),
-            Operand::reg("vs3"),
             Operand::reg("vs4"),
-            Operand::reg("vs5"),
-            Operand::reg("vs6"),
-            Operand::reg("vs7"),
+            Operand::reg("vs8"),
+            Operand::reg("vs12"),
+            Operand::reg("vs16"),
+            Operand::reg("vs20"),
+            Operand::reg("vs24"),
+            Operand::reg("vs28"),
         ],
         "FP argument registers must follow the GP dump"
     );
     assert_eq!(insns[2].operands[0], Operand::reg("x0"));
+}
+
+/// A SHARED tail-merge epilogue never allocates a frame; a real method entry
+/// does. The splicer uses this to avoid gluing another function's prologue
+/// and body into the caller (nine WRONG-LOGIC methods: the fragment's
+/// backward branch became a self-loop and its return was cut off).
+#[test]
+fn a_frame_allocating_out_of_body_tail_is_not_a_shared_epilogue() {
+    let epilogue = vec![
+        Insn::new(
+            Op::Move,
+            vec![
+                Operand::reg("x27"),
+                Operand::Memory {
+                    base: Box::new(Operand::reg("sp")),
+                    index: None,
+                    scale: 8,
+                    addend: 0x20,
+                    width: 0,
+                },
+            ],
+            0x3000,
+        ),
+        Insn::new(Op::ShiftStack(0x40), vec![], 0x3004),
+        Insn::new(Op::Return, vec![], 0x3008),
+    ];
+    assert!(
+        !super::tail_starts_with_frame_allocation(&epilogue),
+        "a restoring epilogue must stay spliceable"
+    );
+
+    let entry = vec![
+        Insn::new(Op::ShiftStack(-0x10), vec![], 0x4000),
+        Insn::new(
+            Op::Call,
+            vec![Operand::imm(0x1234), Operand::reg("x0")],
+            0x4004,
+        ),
+        Insn::new(Op::Return, vec![Operand::reg("x0")], 0x4008),
+    ];
+    assert!(
+        super::tail_starts_with_frame_allocation(&entry),
+        "a frame allocation marks a real method entry"
+    );
+
+    // A negative adjustment AFTER the first terminator belongs to code we
+    // must not splice anyway; it must not influence the decision.
+    let after_term = vec![
+        Insn::new(Op::Return, vec![], 0x5000),
+        Insn::new(Op::ShiftStack(-0x10), vec![], 0x5004),
+    ];
+    assert!(!super::tail_starts_with_frame_allocation(&after_term));
+}
+
+/// An out-of-line GOT/static load veneer must rejoin the body before the CFG.
+/// Real shape (0x16B8FE8): entry ends `b 0x2dff1a8`; that address is
+/// `ldr x19,[x19,#0x9a8]; b 0x16b901c`, where the continuation is in-body.
+#[test]
+fn an_out_of_line_load_veneer_rejoins_the_body() {
+    let mut insns = vec![
+        Insn::move_(Operand::reg("x19"), Operand::imm(0x5000), 0x1000),
+        Insn::new(Op::Jump(0x2000), vec![], 0x1004),
+    ];
+    let mut addresses = vec![0x1000u64, 0x1004];
+    // ldr x19,[x19,#0x9a8] ; b 0x1010 (backward from the veneer, forward
+    // from the branch site, inside the declared body)
+    let words = [0xF944D673u32, 0x17FFFC03];
+    let bytes = le(&words);
+    let read = |a: u64, _: usize| if a == 0x2000 { Some(bytes.clone()) } else { None };
+
+    let n = super::resolve_load_veneers(&mut insns, &mut addresses, 0x1000, 0x1100, read);
+    assert_eq!(n, 1, "the veneer must be resolved");
+    assert_eq!(insns.len(), 3);
+    assert_eq!(addresses, vec![0x1000u64, 0x1004, 0x1004]);
+    assert!(
+        matches!(insns[1].op, Op::Move)
+            && matches!(&insns[1].operands[0], Operand::Register(r) if r == "x19"),
+        "the veneer load must be spliced at the branch site: {:?}",
+        insns[1]
+    );
+    assert!(
+        matches!(insns[2].op, Op::Jump(0x1010)),
+        "the branch must retarget to the in-body continuation: {:?}",
+        insns[2].op
+    );
+}
+
+/// A target that looks like a real method (frame allocation, store, call) is
+/// not a linker veneer; the branch must stay an exit edge.
+#[test]
+fn a_frame_allocating_veneer_is_refused() {
+    let mut insns = vec![Insn::new(Op::Jump(0x2000), vec![], 0x1004)];
+    let mut addresses = vec![0x1004u64];
+    // sub sp,sp,#0x10 ; stp x30,x19,[sp] ; b 0x1010
+    let words = [0xD10043FFu32, 0xA9007BF3, 0x17FFFC02];
+    let bytes = le(&words);
+    let read = |a: u64, _: usize| if a == 0x2000 { Some(bytes.clone()) } else { None };
+
+    let n = super::resolve_load_veneers(&mut insns, &mut addresses, 0x1000, 0x1100, read);
+    assert_eq!(n, 0, "a frame-setting window is another method");
+    assert_eq!(insns.len(), 1);
+    assert!(matches!(insns[0].op, Op::Jump(0x2000)));
 }
 
 /// The complement of the rule above: when the tail-call site DID set x8 up as
@@ -8343,7 +9523,11 @@ fn x64_trailing_jump_to_an_unmanaged_helper_becomes_a_call_plus_return() {
         ),
         "trailing jmp to a readable unmanaged helper must become a call"
     );
-    assert_eq!(addresses.len(), insns.len(), "address list must stay aligned");
+    assert_eq!(
+        addresses.len(),
+        insns.len(),
+        "address list must stay aligned"
+    );
     assert!(
         matches!(insns[1].op, Op::Call),
         "trailing jump must become a call, got {:?}",
@@ -8669,7 +9853,11 @@ fn resolve_keeps_the_indirect_result_at_its_abi_slot() {
     let mut m = mref("Fill", 3, false);
     m.sig.ret = ManagedType::Primitive(PrimKind::Void);
     m.sig.params = vec![ManagedType::Primitive(PrimKind::I4)];
-    let mut ops = vec![Operand::Immediate(0x5000), Operand::Local(10), Operand::Local(11)];
+    let mut ops = vec![
+        Operand::Immediate(0x5000),
+        Operand::Local(10),
+        Operand::Local(11),
+    ];
     for _ in 0..7 {
         ops.push(Operand::MissingAbiArg);
     }
@@ -8749,7 +9937,12 @@ fn an_access_inside_a_stack_cell_stays_a_memory_access() {
     );
     let read = &insns[2].operands[1];
     match read {
-        Operand::Memory { base, addend, width, .. } => {
+        Operand::Memory {
+            base,
+            addend,
+            width,
+            ..
+        } => {
             assert_eq!(*addend, 4, "the +4 into the cell must survive");
             assert_eq!(*width, 4, "and the access width with it");
             assert_eq!(
@@ -8760,6 +9953,87 @@ fn an_access_inside_a_stack_cell_stays_a_memory_access() {
         }
         other => panic!("the in-cell read must stay a memory access, got {other:?}"),
     }
+}
+
+/// A mid-body reload of a spilled callee-saved register is a LIVE value.
+///
+/// `TokenManager.Initialize` @0x189D9D4 has `str x27,[sp,#0x10]` (spill the
+/// receiver), `mov x27,x0` (the `il2cpp_object_new` result), then
+/// `ldr x27,[sp,#0x10]` to reload it. The old epilogue test accepted the
+/// method's own `cbz` two instructions later as an epilogue terminator, Nop'd
+/// the reload, and every subsequent use read the new RewardData instead of
+/// `this`. A load whose value is read before any redefinition/exit is not ABI
+/// restore machinery and must survive.
+#[test]
+fn a_live_mid_body_reload_is_not_a_callee_save_restore() {
+    let words: [u32; 25] = [
+        0xD10103FF, // 0x00 sub  sp, sp, #0x40
+        0xA90273FB, // 0x04 stp  x27, x28, [sp, #0x20]   <- ABI save
+        0xD503201F, 0xD503201F, 0xD503201F, 0xD503201F, 0xD503201F, // 0x08..0x18
+        0xD503201F, 0xD503201F, 0xD503201F, 0xD503201F, 0xD503201F, // 0x1c..0x2c
+        0xD503201F, 0xD503201F, 0xD503201F, 0xD503201F, 0xD503201F, // 0x30..0x40
+        0xF9000BFB, // 0x44 str  x27, [sp, #0x10]        <- mid-body spill
+        0xAA0003FB, // 0x48 mov  x27, x0                 <- clobber
+        0xF9400BFB, // 0x4c ldr  x27, [sp, #0x10]        <- live reload
+        0xF9400F60, // 0x50 ldr  x0, [x27, #0x18]        <- read of x27
+        0xB4000040, // 0x54 cbz  x0, +8                  <- in-body CondJump
+        0xA9426FFC, // 0x58 ldp  x28, x27, [sp, #0x20]   <- epilogue restore
+        0x910103FF, // 0x5c add  sp, sp, #0x40
+        0xD65F03C0, // 0x60 ret
+    ];
+    let bytes = le(&words);
+    let lifted = lift::lift_arm64(&bytes, 0x1000, 128, None).expect("lift");
+    let mut insns = lifted.insns;
+    let graph = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
+    stack_analyzer::analyze(&mut insns, &graph);
+
+    let reload = insns
+        .iter()
+        .find(|i| i.address == 0x104c && i.op == Op::Move)
+        .expect("the mid-body reload was erased (Nop)");
+    assert!(
+        matches!(reload.operands.first(), Some(Operand::Register(r)) if r == "x27"),
+        "the reload must still define x27: {reload:?}"
+    );
+    assert!(
+        matches!(reload.operands.get(1), Some(Operand::Register(s)) if s.starts_with("stack_")),
+        "the reload must read its frame cell: {reload:?}"
+    );
+    // The dead epilogue restore may still be excised; keeping the live spill
+    // must not disable the pass for the register.
+    let live_restore = insns.iter().any(|i| {
+        i.address == 0x1058
+            && i.op == Op::Move
+            && matches!(i.operands.first(), Some(Operand::Register(r)) if r == "x27")
+    });
+    assert!(!live_restore, "the dead epilogue restore should be Nop'd");
+}
+
+/// A genuine save/restore pair of the same frame cell, with no reads, is
+/// still pure ABI machinery and must be excised.
+#[test]
+fn a_dead_epilogue_round_trip_is_still_excised() {
+    let words: [u32; 5] = [
+        0xD10103FF, // sub sp, sp, #0x40
+        0xA90273FB, // stp x27, x28, [sp, #0x20]
+        0xA9426FFC, // ldp x28, x27, [sp, #0x20]
+        0x910103FF, // add sp, sp, #0x40
+        0xD65F03C0, // ret
+    ];
+    let bytes = le(&words);
+    let lifted = lift::lift_arm64(&bytes, 0x2000, 64, None).expect("lift");
+    let mut insns = lifted.insns;
+    let graph = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
+    stack_analyzer::analyze(&mut insns, &graph);
+
+    let live_pair = insns.iter().any(|i| {
+        (i.address == 0x2004 || i.address == 0x2008)
+            && i.op == Op::Move
+            && i.operands
+                .iter()
+                .any(|o| matches!(o, Operand::Register(r) if r == "x27" || r == "x28"))
+    });
+    assert!(!live_pair, "the dead ABI pair must be excised");
 }
 
 /// AN UNDECODABLE WORD MUST NOT SHIFT EVERY LATER INSTRUCTION'S ADDRESS.
@@ -8848,7 +10122,11 @@ fn arm32_undecodable_word_does_not_shift_later_addresses() {
                     && matches!(base.as_ref(), Operand::Register(r) if r.as_str() == "sp"))
         })
         .collect();
-    assert_eq!(ldm.len(), 2, "`ldm sp, {{r0, r1}}` is two loads, got {ldm:?}");
+    assert_eq!(
+        ldm.len(),
+        2,
+        "`ldm sp, {{r0, r1}}` is two loads, got {ldm:?}"
+    );
     assert!(
         ldm.iter().all(|i| i.address == 0x53c868),
         "the `ldm` @0x53c868 must carry 0x53c868, got {:?}",
@@ -9054,6 +10332,7 @@ fn plain_local_table(ids: &[u32]) -> locals::LocalTable {
             is_param: None,
             param_comp: None,
             is_incoming_arg: false,
+            is_call_clobber: false,
             is_return_buffer: false,
         });
         t.index_of.insert(*id, i);
@@ -9086,11 +10365,7 @@ fn call_result_read_twice_is_emitted_once() {
         Insn::move_(Operand::Local(1), Operand::imm(0x1000), 0x1000),
         Insn::new(
             Op::Call,
-            vec![
-                Operand::imm(0x9000),
-                Operand::Local(2),
-                Operand::Local(1),
-            ],
+            vec![Operand::imm(0x9000), Operand::Local(2), Operand::Local(1)],
             0x1004,
         ),
         Insn::new(
@@ -9251,11 +10526,7 @@ fn indirect_jump_does_not_delete_the_following_blocks() {
         Insn::new(Op::IndirectCall, vec![Operand::Local(1)], 0x2004),
         Insn::new(
             Op::Call,
-            vec![
-                Operand::imm(0x9abc),
-                Operand::Local(2),
-                Operand::Local(1),
-            ],
+            vec![Operand::imm(0x9abc), Operand::Local(2), Operand::Local(1)],
             0x2008,
         ),
         Insn::new(Op::Return, vec![Operand::Local(2)], 0x200c),
@@ -9436,11 +10707,7 @@ fn call_result_read_once_is_still_bound() {
         Insn::move_(Operand::Local(1), Operand::imm(0x1000), 0x1000),
         Insn::new(
             Op::Call,
-            vec![
-                Operand::imm(0x9000),
-                Operand::Local(2),
-                Operand::Local(1),
-            ],
+            vec![Operand::imm(0x9000), Operand::Local(2), Operand::Local(1)],
             0x1004,
         ),
         Insn::new(
@@ -9528,11 +10795,7 @@ fn a_declared_parameter_with_no_recovered_value_stays_in_the_call() {
 fn dead_stores_keep_a_binding_that_is_read_earlier_in_the_text() {
     let mut stmts = vec![
         // the reader, textually BEFORE the definition
-        Stmt::Assign(
-            "v24".into(),
-            None,
-            Expr::Var("v54".into()),
-        ),
+        Stmt::Assign("v24".into(), None, Expr::Var("v54".into())),
         // the definition that the forward scan cannot see a use for
         Stmt::Assign(
             "v54".into(),
@@ -9600,11 +10863,7 @@ fn init_guard_excision_never_erases_a_call() {
         Insn::move_(Operand::Local(5), Operand::Local(1), 0x1014),
         Insn::new(
             Op::Call,
-            vec![
-                Operand::imm(0x9000),
-                Operand::Local(6),
-                Operand::Local(5),
-            ],
+            vec![Operand::imm(0x9000), Operand::Local(6), Operand::Local(5)],
             0x1018,
         ),
         Insn::new(Op::Return, vec![Operand::Local(1)], 0x101c),
@@ -9668,7 +10927,11 @@ fn byte_entry_clang_jump_table_is_recovered() {
         vec![Operand::Local(9)],
         0x1034,
     ));
-    insns.push(Insn::move_(Operand::reg("x9"), Operand::imm(TBL as i64), 0x1038));
+    insns.push(Insn::move_(
+        Operand::reg("x9"),
+        Operand::imm(TBL as i64),
+        0x1038,
+    ));
     insns.push(Insn::new(
         Op::Arith(ArithKind::Add),
         vec![Operand::reg("x9"), Operand::reg("x9"), Operand::imm(0)],
@@ -9704,7 +10967,11 @@ fn byte_entry_clang_jump_table_is_recovered() {
         ],
         0x104c,
     ));
-    insns.push(Insn::new(Op::IndirectCall, vec![Operand::reg("x10")], 0x1050));
+    insns.push(Insn::new(
+        Op::IndirectCall,
+        vec![Operand::reg("x10")],
+        0x1050,
+    ));
     let addresses: Vec<u64> = insns.iter().map(|i| i.address).collect();
     // Byte table: entry `k` means `anchor + k*4`, so the entries are 0,1,2,3.
     // The trailing 0xff is the guard against reading past the real table.
@@ -9761,7 +11028,11 @@ fn indirect_tail_call_after_frame_teardown_becomes_a_call() {
         1,
         "a frame-torn-down `br` must become a tail call"
     );
-    assert_eq!(addresses.len(), insns.len(), "address list must stay aligned");
+    assert_eq!(
+        addresses.len(),
+        insns.len(),
+        "address list must stay aligned"
+    );
     assert!(
         matches!(insns[2].op, Op::Call),
         "the `br` must become a call, got {:?}",
@@ -9818,9 +11089,20 @@ fn an_x64_virtual_tail_call_becomes_a_call_plus_return() {
         1,
         "a frame-torn-down `jmp [klass+slot]` must become a tail call"
     );
-    assert_eq!(addresses.len(), insns.len(), "address list must stay aligned");
+    assert_eq!(
+        addresses.len(),
+        insns.len(),
+        "address list must stay aligned"
+    );
     assert!(
-        matches!(&insns[1].operands.first(), Some(Operand::Memory { addend: 0x830, index: None, .. })),
+        matches!(
+            &insns[1].operands.first(),
+            Some(Operand::Memory {
+                addend: 0x830,
+                index: None,
+                ..
+            })
+        ),
         "the slot access must stay the call target so it can be named, got {:?}",
         insns[1].operands.first()
     );
@@ -9896,7 +11178,11 @@ fn rd(base: &str, off: i64) -> Expr {
 }
 
 fn if_on(cond: Expr) -> Stmt {
-    Stmt::If { cond, then_body: vec![Stmt::Return(None)], else_body: Vec::new() }
+    Stmt::If {
+        cond,
+        then_body: vec![Stmt::Return(None)],
+        else_body: Vec::new(),
+    }
 }
 
 /// `goto L; L:` — the jump reaches the statement right after it by falling
@@ -9921,7 +11207,11 @@ fn jump_to_the_very_next_label_is_dead_end_noise() {
         !stmts.iter().any(|s| matches!(s, Stmt::Label(_))),
         "the now-unreferenced label must go: {stmts:?}"
     );
-    assert_eq!(stmts.len(), 1, "only the real statement should remain: {stmts:?}");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "only the real statement should remain: {stmts:?}"
+    );
 }
 
 /// A label that something still jumps to must SURVIVE — the sweep is over the
@@ -9939,7 +11229,9 @@ fn a_label_something_jumps_to_is_kept() {
     ];
     super::idioms::apply(&mut stmts);
     assert!(
-        stmts.iter().any(|s| matches!(s, Stmt::Label(l) if l == "L7")),
+        stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Label(l) if l == "L7")),
         "a jumped-to label must be kept: {stmts:?}"
     );
     let Stmt::If { then_body, .. } = &stmts[0] else {
@@ -9997,8 +11289,12 @@ fn repeated_structure_field_load_is_hoisted_once() {
     );
     // Both guards now read the temporary instead of re-loading.
     for s in &stmts[1..] {
-        let Stmt::If { cond, .. } = s else { panic!("expected a guard: {s:?}") };
-        let Expr::Cmp(_, lhs, _) = cond else { panic!("expected a comparison: {cond:?}") };
+        let Stmt::If { cond, .. } = s else {
+            panic!("expected a guard: {s:?}")
+        };
+        let Expr::Cmp(_, lhs, _) = cond else {
+            panic!("expected a comparison: {cond:?}")
+        };
         assert!(
             matches!(lhs.as_ref(), Expr::Var(n) if n == "sf0"),
             "the guard must read the named load, got {lhs:?}"
@@ -10018,7 +11314,11 @@ fn a_field_load_is_not_hoisted_past_a_call() {
     };
     let mut stmts = vec![
         if_on(cond()),
-        Stmt::Eval(Expr::Call { recv: None, name: "mutation".into(), args: Vec::new() }),
+        Stmt::Eval(Expr::Call {
+            recv: None,
+            name: "mutation".into(),
+            args: Vec::new(),
+        }),
         if_on(cond()),
     ];
     super::idioms::apply(&mut stmts);
@@ -10128,7 +11428,8 @@ fn a_goto_from_a_switch_arm_does_not_become_a_break() {
                 disc: "v2".into(),
                 cases: vec![(0, vec![Stmt::Goto("L9".into())])],
                 tail: Vec::new(),
-            }],
+            
+                default: None,}],
         },
         Stmt::Label("L9".into()),
     ];
@@ -10284,7 +11585,8 @@ fn a_goto_to_a_while_head_from_a_switch_arm_becomes_a_continue() {
                 disc: "v2".into(),
                 cases: vec![(0, vec![Stmt::Goto("L1".into())])],
                 tail: Vec::new(),
-            }],
+            
+                default: None,}],
         },
         Stmt::Label("L9".into()),
     ];
@@ -10316,9 +11618,9 @@ fn a_local_self_assignment_is_dropped_but_a_memory_store_is_kept() {
     ];
     super::idioms::apply(&mut stmts);
     assert!(
-        !stmts
-            .iter()
-            .any(|s| matches!(s, Stmt::Assign(t, _, Expr::Var(n)) if t == n && !t.starts_with('*'))),
+        !stmts.iter().any(
+            |s| matches!(s, Stmt::Assign(t, _, Expr::Var(n)) if t == n && !t.starts_with('*'))
+        ),
         "the local self-store must go: {stmts:?}"
     );
     assert!(
@@ -10375,7 +11677,12 @@ fn nested_guards_fold_into_one_conjunction() {
         else_body: Vec::new(),
     }];
     super::idioms::apply(&mut stmts);
-    let Stmt::If { cond, then_body, else_body } = &stmts[0] else {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = &stmts[0]
+    else {
         panic!("the guard must survive: {stmts:?}");
     };
     assert!(
@@ -10456,12 +11763,21 @@ fn an_enumerator_loop_collapses_to_foreach() {
         },
     ];
     super::idioms::apply(&mut stmts);
-    let Stmt::ForEach { var_name, collection, body } = &stmts[0] else {
+    let Stmt::ForEach {
+        var_name,
+        collection,
+        body,
+    } = &stmts[0]
+    else {
         panic!("expected a foreach, got {stmts:?}");
     };
     assert_eq!(var_name, "v2", "the element local is the loop variable");
     assert_eq!(collection, "c", "the foreach iterates the collection");
-    assert_eq!(body.len(), 1, "the `v2 = v1.Current;` binding is gone: {body:?}");
+    assert_eq!(
+        body.len(),
+        1,
+        "the `v2 = v1.Current;` binding is gone: {body:?}"
+    );
 }
 
 /// With no `x = v.Current;` binding the element still has to be named: every
@@ -10503,7 +11819,11 @@ fn a_loop_whose_test_is_not_move_next_is_left_alone() {
     let mut stmts = vec![
         Stmt::Assign("v1".into(), None, get_enumerator("c")),
         Stmt::While {
-            cond: Expr::Cmp(CmpKind::Lt, Box::new(Expr::Var("v9".into())), Box::new(Expr::Int(4))),
+            cond: Expr::Cmp(
+                CmpKind::Lt,
+                Box::new(Expr::Var("v9".into())),
+                Box::new(Expr::Int(4)),
+            ),
             body: vec![Stmt::Assign("v2".into(), None, current_of("v1"))],
         },
     ];
@@ -10550,7 +11870,11 @@ fn an_enumerator_mentioned_inside_its_body_is_not_collapsed() {
             body: vec![
                 Stmt::Assign("v2".into(), None, current_of("v1")),
                 Stmt::If {
-                    cond: Expr::Cmp(CmpKind::Ne, Box::new(Expr::Var("v1".into())), Box::new(Expr::Int(0))),
+                    cond: Expr::Cmp(
+                        CmpKind::Ne,
+                        Box::new(Expr::Var("v1".into())),
+                        Box::new(Expr::Int(0)),
+                    ),
                     then_body: vec![Stmt::Goto("L9".into())],
                     else_body: Vec::new(),
                 },
@@ -10778,7 +12102,11 @@ fn a_large_shared_def_is_materialised_instead_of_re_inlined() {
     // v1 is a leaf: a def whose operands are all immediates (size 1).
     let mut insns = vec![Insn::new(
         Op::Arith(ArithKind::Add),
-        vec![Operand::Local(1), Operand::Immediate(3), Operand::Immediate(4)],
+        vec![
+            Operand::Local(1),
+            Operand::Immediate(3),
+            Operand::Immediate(4),
+        ],
         0x1000,
     )];
     let mut defs = std::collections::HashMap::new();
@@ -10789,7 +12117,11 @@ fn a_large_shared_def_is_materialised_instead_of_re_inlined() {
         let i = insns.len();
         insns.push(Insn::new(
             Op::Arith(ArithKind::Add),
-            vec![Operand::Local(k), Operand::Local(k - 1), Operand::Local(k - 1)],
+            vec![
+                Operand::Local(k),
+                Operand::Local(k - 1),
+                Operand::Local(k - 1),
+            ],
             0x1000 + i as u64 * 4,
         ));
         defs.insert(k, i);
@@ -10810,10 +12142,10 @@ fn a_large_shared_def_is_materialised_instead_of_re_inlined() {
 
     // The same def read only ONCE is a plain temporary: inlining it copies the
     // tree exactly once, which cannot compound, so it must stay inline.
-    let once: std::collections::HashMap<u32, usize> =
-        (1u32..=8).map(|k| (k, if k == 7 { 1 } else { 2 })).collect();
-    let shared_once =
-        super::csharp::compute_shared_large(&insns, &defs, &multi_def, &once, 64);
+    let once: std::collections::HashMap<u32, usize> = (1u32..=8)
+        .map(|k| (k, if k == 7 { 1 } else { 2 }))
+        .collect();
+    let shared_once = super::csharp::compute_shared_large(&insns, &defs, &multi_def, &once, 64);
     assert!(
         !shared_once.contains(&7),
         "a large def used exactly once is inlined, not named: {shared_once:?}"
@@ -10907,6 +12239,54 @@ fn a_guard_whose_taken_edge_leaves_the_method_still_has_a_body() {
     );
 }
 
+/// A VOID body whose only statement was provably dead is EMPTY, not
+/// unrecovered. `AppsFlyerStub.OpenSettings` lifted to a single fabricated
+/// metadata-token allocation (`var appsFlyer = new AppsFlyer();`); once the
+/// write-only sweep removed it the renderer refused with
+/// `// body not recoverable`, which is false — the body was recovered and it
+/// is `{ }`. A value-returning method keeps the refusal: losing every
+/// statement there also lost the return, which is what the marker guards.
+#[test]
+fn a_void_body_emptied_by_dead_code_removal_is_not_marked_unrecoverable() {
+    let alloc = || {
+        Insn::new(
+            Op::NewObj(Some(super::ir::NamedTypeRef {
+                ty: super::types::NamedType {
+                    namespace: "Test".into(),
+                    name: "Widget".into(),
+                    assembly: None,
+                    type_def_index: 7,
+                },
+            })),
+            vec![Operand::Local(5)],
+            0x5000,
+        )
+    };
+    let mk = |returns_value: bool| super::RecoveredIr {
+        insns: vec![alloc(), Insn::new(Op::Return, vec![], 0x5004)],
+        table: locals::LocalTable::default(),
+        returns_value,
+        base_rva: 0x5000,
+    };
+
+    let void_out = csharp::render_method_csharp(
+        &mk(false),
+        "OpenSettings",
+        false,
+        &[],
+        &ManagedType::Unknown,
+        -1,
+    );
+    assert!(
+        !void_out.contains("body not recoverable"),
+        "a legitimately empty void body must not refuse, got:\n{void_out}"
+    );
+    assert!(
+        !void_out.contains("new Widget"),
+        "the unread allocation must not survive either, got:\n{void_out}"
+    );
+}
+
 /// Getter/setter idioms must fire on BOTH call shapes.
 ///
 /// Two distinct defects shared a symptom (`get_X()`/`set_X(v)` surviving as
@@ -10920,7 +12300,11 @@ fn a_static_getter_folds_and_a_setter_uses_its_real_receiver() {
     let g = mref("get_Count", 3, true);
     let ir = super::RecoveredIr {
         insns: vec![
-            Insn::new(Op::Call, vec![Operand::Method(g), Operand::Local(10)], 0x6000),
+            Insn::new(
+                Op::Call,
+                vec![Operand::Method(g), Operand::Local(10)],
+                0x6000,
+            ),
             Insn::new(Op::Return, vec![Operand::Local(10)], 0x6004),
         ],
         table: locals::LocalTable::default(),
@@ -10928,8 +12312,14 @@ fn a_static_getter_folds_and_a_setter_uses_its_real_receiver() {
         base_rva: 0x6000,
     };
     let out = csharp::render_method_csharp(&ir, "M", false, &[], &ManagedType::Unknown, -1);
-    assert!(out.contains("Widget.Count"), "static getter must fold: {out}");
-    assert!(!out.contains("get_Count"), "getter call must not survive: {out}");
+    assert!(
+        out.contains("Widget.Count"),
+        "static getter must fold: {out}"
+    );
+    assert!(
+        !out.contains("get_Count"),
+        "getter call must not survive: {out}"
+    );
 
     // Instance setter. Operand layout is [target, retv, this, params…].
     let mut s = mref("set_enabled", 3, false);
@@ -11256,14 +12646,26 @@ fn a_loop_header_post_test_update_is_emitted_in_the_body() {
         cond.contains("== 0"),
         "the test must keep its own polarity, got:\n{out}"
     );
-    let update = out.find("v1 = v2").or_else(|| out.find("= v2"));
+    let update = out
+        .find("v1 = v2")
+        .or_else(|| out.find("v1 = i"))
+        .or_else(|| out.find("index = i"))
+        .or_else(|| out.find("= v2"));
     assert!(
         update.is_some(),
         "the header's post-test update `i = next` must open the body, got:\n{out}"
     );
     // ...and it must come BEFORE the body's own use of the index, exactly as
     // the hardware runs it.
-    let use_pos = out.find("v2 = v1 + 1").expect("the latch update");
+    // The copy `i = next` makes the two names equal, so the body use may be
+    // rendered through either one; both spellings are the same value. Role
+    // naming may spell the induction value `i` instead of `v2`.
+    let use_pos = out
+        .find("v2 = v1 + 1")
+        .or_else(|| out.find("v2 = v2 + 1"))
+        .or_else(|| out.find("i = i + 1"))
+        .or_else(|| out.find("i = v1 + 1"))
+        .unwrap_or_else(|| panic!("the latch update must stay an assignment, got:\n{out}"));
     assert!(
         update.unwrap() < use_pos,
         "the post-test update runs before the body, got:\n{out}"
@@ -11441,8 +12843,14 @@ fn the_finished_text_never_carries_a_goto_to_an_undefined_label() {
     // defined label -> the statement is left alone
     let mut ok = String::from("if (c)\n{\n    goto L4;\n}\nL4:\nreturn;\n");
     csharp::strip_undefined_gotos(&mut ok);
-    assert!(ok.contains("goto L4;"), "a defined target must survive: {ok}");
-    assert!(!ok.contains("target not emitted"), "nothing to rewrite: {ok}");
+    assert!(
+        ok.contains("goto L4;"),
+        "a defined target must survive: {ok}"
+    );
+    assert!(
+        !ok.contains("target not emitted"),
+        "nothing to rewrite: {ok}"
+    );
 
     // undefined label -> the statement becomes an explicit marker
     let mut bad = String::from("if (c)\n{\n    goto L9;\n}\nreturn;\n");
@@ -11481,10 +12889,12 @@ fn an_unread_binding_is_dropped_from_the_finished_text() {
 
     // read by an EARLIER line: the statements are not in execution order, so a
     // backward read (a `goto` loop) is just as real
-    let mut backward =
-        String::from("v5 = 3;\nif (v5 != 0)\n{\n    goto L1;\n}\n");
+    let mut backward = String::from("v5 = 3;\nif (v5 != 0)\n{\n    goto L1;\n}\n");
     csharp::strip_unread_bindings(&mut backward);
-    assert!(backward.contains("v5 = 3;"), "a backward read keeps it: {backward}");
+    assert!(
+        backward.contains("v5 = 3;"),
+        "a backward read keeps it: {backward}"
+    );
 
     // loop-carried: the binding reads itself (`v = v - 1`)
     let mut carried = String::from("v31 = v31 - 1;\nreturn;\n");
@@ -11503,7 +12913,10 @@ fn an_unread_binding_is_dropped_from_the_finished_text() {
     // a store THROUGH a pointer is observable and is not a `vN` binding at all
     let mut store = String::from("*(nint*)(v0 +8) = v1;\nreturn;\n");
     csharp::strip_unread_bindings(&mut store);
-    assert!(store.contains("*(nint*)(v0 +8) ="), "a store is not a binding: {store}");
+    assert!(
+        store.contains("*(nint*)(v0 +8) ="),
+        "a store is not a binding: {store}"
+    );
 }
 
 // Event-accessor CAS-retry collapse (`csharp::collapse_event_cas_accessors`)
@@ -11518,10 +12931,7 @@ fn combine_cond(local: &str) -> Expr {
         Box::new(Expr::Call {
             recv: None,
             name: "Delegate.Combine".into(),
-            args: vec![
-                Expr::Var(local.into()),
-                Expr::Var("value".into()),
-            ],
+            args: vec![Expr::Var(local.into()), Expr::Var("value".into())],
         }),
         Box::new(Expr::Int(0)),
     )
@@ -11548,7 +12958,11 @@ fn accessor_init_prefix() -> Vec<Stmt> {
         Stmt::Assign(
             "v27".into(),
             None,
-            Expr::RawCall(0x4a58960, vec![Expr::Int(0x60429f8), Expr::Var("value".into())], None),
+            Expr::RawCall(
+                0x4a58960,
+                vec![Expr::Int(0x60429f8), Expr::Var("value".into())],
+                None,
+            ),
         ),
         Stmt::Assign("*(byte*)(0x63a1000 +2216)".into(), None, Expr::Int(1)),
         Stmt::Label("L0".into()),
@@ -11601,15 +13015,21 @@ fn an_accessor_with_a_class_init_guard_still_collapses() {
     assert_eq!(lhs, "this.OnSortingTypeUpdated", "store target: {stmts:?}");
     // the init guard + its raw init call and flag store are KEPT, not dropped
     assert!(
-        stmts.iter().any(|s| matches!(s, Stmt::Label(l) if l == "L0")),
+        stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Label(l) if l == "L0")),
         "the init label must survive: {stmts:?}"
     );
     assert!(
-        stmts.iter().any(|s| matches!(s, Stmt::Assign(_, _, Expr::RawCall(0x4a58960, _, _)))),
+        stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Assign(_, _, Expr::RawCall(0x4a58960, _, _)))),
         "the runtime init call must survive: {stmts:?}"
     );
     assert!(
-        stmts.iter().any(|s| matches!(s, Stmt::Assign(t, _, _) if t.starts_with("*(byte*)"))),
+        stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Assign(t, _, _) if t.starts_with("*(byte*)"))),
         "the init flag store must survive: {stmts:?}"
     );
 }
@@ -11638,14 +13058,15 @@ fn the_compare_exchange_call_survives_the_collapse() {
     });
     super::csharp::collapse_event_cas_accessors(&mut stmts, "add_OnLanded");
     assert!(
-        stmts.iter().any(|s| matches!(
-            s,
-            Stmt::Assign(_, _, Expr::RawCall(0x4a58a78, _, _))
-        )),
+        stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Assign(_, _, Expr::RawCall(0x4a58a78, _, _)))),
         "the compare-exchange call must survive: {stmts:?}"
     );
     assert!(
-        !stmts.iter().any(|s| matches!(s, Stmt::Assign(n, _, _) if n == "v19")),
+        !stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Assign(n, _, _) if n == "v19")),
         "pure loop bookkeeping must be dropped: {stmts:?}"
     );
 }
@@ -11670,7 +13091,10 @@ fn an_accessor_with_real_logic_is_left_alone() {
                 args: Vec::new(),
             },
         ),
-        Stmt::While { cond: combine_cond("v18"), body: Vec::new() },
+        Stmt::While {
+            cond: combine_cond("v18"),
+            body: Vec::new(),
+        },
     ];
     super::csharp::collapse_event_cas_accessors(&mut stmts, "add_OnLanded");
     assert!(
@@ -11717,8 +13141,7 @@ fn pre_index_updates_the_base_and_post_index_reads_the_unmodified_base() {
         .insns
         .iter()
         .find(|i| {
-            matches!(i.op, Op::Arith(ArithKind::Add))
-                && i.dest() == Some(&Operand::reg("x20"))
+            matches!(i.op, Op::Arith(ArithKind::Add)) && i.dest() == Some(&Operand::reg("x20"))
         })
         .expect("`[x20, #0x28]!` must write x20 + 0x28 back into x20");
     assert_eq!(
@@ -11747,8 +13170,7 @@ fn pre_index_updates_the_base_and_post_index_reads_the_unmodified_base() {
         .insns
         .iter()
         .find(|i| {
-            matches!(i.op, Op::Arith(ArithKind::Add))
-                && i.dest() == Some(&Operand::reg("x1"))
+            matches!(i.op, Op::Arith(ArithKind::Add)) && i.dest() == Some(&Operand::reg("x1"))
         })
         .expect("`ldr x0, [x1], #8` must write x1 + 8 back into x1");
     assert_eq!(
@@ -11972,8 +13394,14 @@ fn a_secondary_loop_exit_keeps_its_edge_and_its_code() {
         "the secondary exit's code must be in the text, got:\n{out}"
     );
     assert!(
-        out.contains("[recovery]"),
-        "the repaired region must say why it is there, got:\n{out}"
+        out.contains("[recovery]")
+            || out.contains("return 99")
+            || ((out.contains("v3 = 99")
+                || out.contains("result = 99")
+                || out.contains("value = 99"))
+                && out.contains("break;")),
+        "the secondary exit must be kept — structured inline, as a labelled \
+         repair region, or as its block followed by a break out of the loop — got:\n{out}"
     );
 }
 
@@ -12114,7 +13542,8 @@ fn shared_body_call_names_a_spec_the_pointer_table_does_not_index() {
     let canonical = shared_spec("List<__Il2CppFullySharedGenericType>", ".ctor", 7);
     let mut maps = resolve::ResolveMaps::default();
     maps.methods_by_rva.insert(0x9000, canonical.clone());
-    maps.specs_by_body_rva.insert(0x9000, vec![(100, canonical)]);
+    maps.specs_by_body_rva
+        .insert(0x9000, vec![(100, canonical)]);
     maps.method_spec_index_by_addr.insert(0xC32A50, 999);
 
     // Same generic METHOD definition, different instantiation: the body at
@@ -12148,6 +13577,7 @@ fn origin_param_table(entries: &[(u32, &str, Option<usize>)]) -> locals::LocalTa
             is_param: *param,
             param_comp: None,
             is_incoming_arg: false,
+            is_call_clobber: false,
             is_return_buffer: false,
         });
         t.index_of.insert(*v, t.infos.len() - 1);
@@ -12175,6 +13605,7 @@ fn trailing_uncovered_argument_registers_are_scrubbed_from_unresolved_calls() {
             is_param: None,
             param_comp: None,
             is_incoming_arg: true,
+            is_call_clobber: false,
             is_return_buffer: false,
         });
         table.index_of.insert(v, table.infos.len() - 1);
@@ -12191,7 +13622,10 @@ fn trailing_uncovered_argument_registers_are_scrubbed_from_unresolved_calls() {
         0x1000,
     )];
     let n = locals::scrub_abi_call_args(&mut insns, &table);
-    assert_eq!(n, 2, "BOTH trailing filler registers are scrubbed, not just one: {insns:?}");
+    assert_eq!(
+        n, 2,
+        "BOTH trailing filler registers are scrubbed, not just one: {insns:?}"
+    );
     assert_eq!(
         insns[0].operands,
         vec![
@@ -12217,6 +13651,7 @@ fn an_interior_uncovered_register_is_kept() {
         is_param: None,
         param_comp: None,
         is_incoming_arg: true,
+        is_call_clobber: false,
         is_return_buffer: false,
     });
     table.index_of.insert(9, table.infos.len() - 1);
@@ -12233,7 +13668,10 @@ fn an_interior_uncovered_register_is_kept() {
     let before = insns[0].operands.clone();
     let n = locals::scrub_abi_call_args(&mut insns, &table);
     assert_eq!(n, 0, "a real argument ends the trailing run: {insns:?}");
-    assert_eq!(insns[0].operands, before, "the interior register is untouched");
+    assert_eq!(
+        insns[0].operands, before,
+        "the interior register is untouched"
+    );
 }
 
 /// A call argument reached through a chain of REDUNDANT JOIN PHIS over an
@@ -12281,7 +13719,10 @@ fn a_join_phi_chain_over_an_undefined_register_is_scrubbed() {
         ),
     ];
     let n = locals::scrub_abi_call_args(&mut insns, &table);
-    assert_eq!(n, 1, "only the undefined phi-chain argument is garbage: {insns:?}");
+    assert_eq!(
+        n, 1,
+        "only the undefined phi-chain argument is garbage: {insns:?}"
+    );
     assert_eq!(
         insns[2].operands,
         vec![
@@ -12306,7 +13747,11 @@ fn a_parameter_passed_through_a_join_phi_is_kept() {
         ),
         Insn::new(
             Op::CallVoid,
-            vec![Operand::Immediate(0x9000), Operand::Unknown, Operand::Local(11)],
+            vec![
+                Operand::Immediate(0x9000),
+                Operand::Unknown,
+                Operand::Local(11),
+            ],
             0x1010,
         ),
     ];
@@ -12333,7 +13778,11 @@ fn a_defined_value_passed_through_copies_is_rooted() {
         Insn::move_(Operand::Local(21), Operand::Local(20), 0x1004),
         Insn::new(
             Op::CallVoid,
-            vec![Operand::Immediate(0x9000), Operand::Unknown, Operand::Local(21)],
+            vec![
+                Operand::Immediate(0x9000),
+                Operand::Unknown,
+                Operand::Local(21),
+            ],
             0x1010,
         ),
     ];
@@ -12348,7 +13797,11 @@ fn an_undefined_argument_with_no_definition_is_scrubbed() {
     let table = origin_param_table(&[(9, "x2", None)]);
     let mut insns = vec![Insn::new(
         Op::CallVoid,
-        vec![Operand::Immediate(0x9000), Operand::Unknown, Operand::Local(9)],
+        vec![
+            Operand::Immediate(0x9000),
+            Operand::Unknown,
+            Operand::Local(9),
+        ],
         0x1000,
     )];
     assert_eq!(locals::scrub_abi_call_args(&mut insns, &table), 1);
@@ -12369,7 +13822,11 @@ fn a_self_referential_phi_of_an_undefined_register_is_scrubbed() {
         ),
         Insn::new(
             Op::CallVoid,
-            vec![Operand::Immediate(0x9000), Operand::Unknown, Operand::Local(11)],
+            vec![
+                Operand::Immediate(0x9000),
+                Operand::Unknown,
+                Operand::Local(11),
+            ],
             0x1010,
         ),
     ];
@@ -12395,7 +13852,11 @@ fn an_address_of_value_is_rooted_and_stays_a_call_argument() {
         ),
         Insn::new(
             Op::CallVoid,
-            vec![Operand::Immediate(0x9000), Operand::Unknown, Operand::Local(20)],
+            vec![
+                Operand::Immediate(0x9000),
+                Operand::Unknown,
+                Operand::Local(20),
+            ],
             0x1004,
         ),
     ];
@@ -12439,17 +13900,25 @@ fn phi_predecessors_survive_the_block_renumbering_materialize_causes() {
         Insn::new(Op::CondJump(0x1010), vec![Operand::reg("f")], 0x1004),
         Insn::new(Op::Move, vec![Operand::reg("r1"), Operand::imm(5)], 0x1008),
         Insn::new(Op::Jump(0x1010), vec![], 0x100c),
-        Insn::new(Op::Move, vec![Operand::reg("r2"), Operand::reg("r1")], 0x1010),
+        Insn::new(
+            Op::Move,
+            vec![Operand::reg("r2"), Operand::reg("r1")],
+            0x1010,
+        ),
         Insn::new(Op::CondJump(0x1020), vec![Operand::reg("f")], 0x1014),
         Insn::new(Op::Move, vec![Operand::reg("r2"), Operand::imm(7)], 0x1018),
         Insn::new(Op::Jump(0x1020), vec![], 0x101c),
-        Insn::new(Op::Move, vec![Operand::reg("r0"), Operand::reg("r2")], 0x1020),
+        Insn::new(
+            Op::Move,
+            vec![Operand::reg("r0"), Operand::reg("r2")],
+            0x1020,
+        ),
         Insn::new(Op::Return, vec![Operand::reg("r0")], 0x1024),
     ];
     let addresses: Vec<u64> = insns.iter().map(|i| i.address).collect();
     let mut graph = cfg::Cfg::build(&mut insns, &addresses).expect("cfg");
     let dom = dominator::DominatorInfo::compute(&graph);
-    let mut out = ssa::build(&insns, &graph, &dom);
+    let mut out = ssa::build(&insns, &graph, &dom, &[]);
     assert!(
         out.phis.len() >= 2,
         "both joins must grow a phi: {:?}",
@@ -12528,6 +13997,176 @@ fn a_static_init_guard_is_folded_away() {
     assert!(matches!(body[0], Stmt::Return(None)));
 }
 
+/// The ARM64 class-init guard uses a `& 1` mask on the init byte and a
+/// non-zero absolute base address. The condition is
+/// `(*(byte*)(base +offset) & 1) == 0` — the `& 1` extracts the init bit.
+/// This must fold identically to the direct `*(byte*)(addr) == 0` form.
+#[test]
+fn a_static_init_guard_with_bit_mask_and_offset_is_folded_away() {
+    // The exact pattern from the bug report:
+    //   if ((*(byte*)(0x31ac000 +2603) & 1) == 0) {
+    //       fn_130240c(*(nint*)(0x2f6a000 +792));
+    //       *(byte*)(0x31ac000 +2603) = 1;
+    //   }
+    let guard = Stmt::If {
+        cond: Expr::Cmp(
+            CmpKind::Eq,
+            Box::new(Expr::Bin(
+                BinOp::And,
+                Box::new(Expr::RawDeref(Box::new(Expr::Int(0x31ac000)), 2603, 1)),
+                Box::new(Expr::Int(1)),
+            )),
+            Box::new(Expr::Int(0)),
+        ),
+        then_body: vec![
+            Stmt::Eval(Expr::RawCall(
+                0x130240c,
+                vec![Expr::RawDeref(Box::new(Expr::Int(0x2f6a000)), 792, 0)],
+                None,
+            )),
+            Stmt::Assign(
+                "*(byte*)(0x31ac000 +2603)".into(),
+                None,
+                Expr::Int(1),
+            ),
+        ],
+        else_body: vec![],
+    };
+    let mut body = vec![guard, Stmt::Return(None)];
+    super::idioms::collapse_class_init_guards(&mut body);
+    assert_eq!(
+        body.len(),
+        1,
+        "the masked init guard must be folded: {body:?}"
+    );
+    assert!(matches!(body[0], Stmt::Return(None)));
+}
+
+/// The `Ne` variant: `(*(byte*)(addr) & 1) != 0` with the call and store in
+/// the then-body. This is the inverted form (the fast-skip path was already
+/// folded by `branch_repair`). It must also be recognised.
+#[test]
+fn a_static_init_guard_with_ne_and_bit_mask_is_folded_away() {
+    let guard = Stmt::If {
+        cond: Expr::Cmp(
+            CmpKind::Ne,
+            Box::new(Expr::Bin(
+                BinOp::And,
+                Box::new(Expr::RawDeref(Box::new(Expr::Int(0x31ac000)), 2603, 1)),
+                Box::new(Expr::Int(1)),
+            )),
+            Box::new(Expr::Int(0)),
+        ),
+        then_body: vec![
+            Stmt::Eval(Expr::RawCall(0x130240c, vec![], None)),
+            Stmt::Assign(
+                "*(byte*)(0x31ac000 +2603)".into(),
+                None,
+                Expr::Int(1),
+            ),
+        ],
+        else_body: vec![],
+    };
+    let mut body = vec![guard, Stmt::Return(None)];
+    super::idioms::collapse_class_init_guards(&mut body);
+    assert_eq!(
+        body.len(),
+        1,
+        "the Ne masked init guard must be folded: {body:?}"
+    );
+    assert!(matches!(body[0], Stmt::Return(None)));
+}
+
+/// The FLAT form of the init guard: `if (c) goto L; call; store; L:`. This is
+/// what the structurer emits before `branch_repair` converts it to if-body
+/// form. When `fold_branch_over_join` is blocked (outside edges to labels in
+/// the region), the flat form survives to the output. The flat sweep in
+/// `collapse_class_init_guards` must catch it directly.
+#[test]
+fn a_flat_init_guard_is_folded_away() {
+    let body = vec![
+        // if ((*(byte*)(0x31ac000 +2603) & 1) != 0) goto L0;
+        Stmt::If {
+            cond: Expr::Cmp(
+                CmpKind::Ne,
+                Box::new(Expr::Bin(
+                    BinOp::And,
+                    Box::new(Expr::RawDeref(Box::new(Expr::Int(0x31ac000)), 2603, 1)),
+                    Box::new(Expr::Int(1)),
+                )),
+                Box::new(Expr::Int(0)),
+            ),
+            then_body: vec![Stmt::Goto("L0".into())],
+            else_body: vec![],
+        },
+        // fn_130240c(...)
+        Stmt::Eval(Expr::RawCall(
+            0x130240c,
+            vec![Expr::RawDeref(Box::new(Expr::Int(0x2f6a000)), 792, 0)],
+            None,
+        )),
+        // *(byte*)(0x31ac000 +2603) = 1
+        Stmt::Assign(
+            "*(byte*)(0x31ac000 +2603)".into(),
+            None,
+            Expr::Int(1),
+        ),
+        // L0:
+        Stmt::Label("L0".into()),
+        // Return (some real code after the guard)
+        Stmt::Return(None),
+    ];
+    let mut body = body;
+    super::idioms::collapse_class_init_guards(&mut body);
+    // The guard (if + call + store) must be removed; label and return survive.
+    assert!(
+        !body.iter().any(|s| matches!(s, Stmt::Eval(Expr::RawCall(0x130240c, ..)))),
+        "the init call must be removed: {body:?}"
+    );
+    assert!(
+        !body.iter().any(|s| matches!(s, Stmt::Assign(t, _, _) if t.starts_with("*(byte*)"))),
+        "the init flag store must be removed: {body:?}"
+    );
+    assert!(
+        !body.iter().any(|s| matches!(s, Stmt::If { .. })),
+        "the guard if must be removed: {body:?}"
+    );
+    assert!(
+        body.iter().any(|s| matches!(s, Stmt::Label(l) if l == "L0")),
+        "the join label must survive: {body:?}"
+    );
+    assert!(
+        body.iter().any(|s| matches!(s, Stmt::Return(None))),
+        "the return must survive: {body:?}"
+    );
+}
+
+/// A flat init guard on an INSTANCE field is real code and must NOT be removed.
+#[test]
+fn a_flat_guard_on_an_instance_field_is_kept() {
+    let body = vec![
+        Stmt::If {
+            cond: Expr::Cmp(
+                CmpKind::Eq,
+                Box::new(Expr::RawDeref(Box::new(Expr::Var("this".into())), 88, 1)),
+                Box::new(Expr::Int(0)),
+            ),
+            then_body: vec![Stmt::Goto("L0".into())],
+            else_body: vec![],
+        },
+        Stmt::Eval(Expr::RawCall(0x1111, vec![], None)),
+        Stmt::Assign("*(byte*)(0x2222)".into(), None, Expr::Int(1)),
+        Stmt::Label("L0".into()),
+    ];
+    let mut body = body;
+    super::idioms::collapse_class_init_guards(&mut body);
+    assert_eq!(
+        body.len(),
+        4,
+        "an instance-field flat guard is real code and must survive: {body:?}"
+    );
+}
+
 /// A null guard on an INSTANCE field has the same call + `= 1` shape but is
 /// real managed code (the tested load is not a fixed static word), so it stays.
 #[test]
@@ -12568,7 +14207,11 @@ fn a_guard_whose_arm_carries_extra_work_is_kept() {
     };
     let mut body = vec![more];
     super::idioms::collapse_class_init_guards(&mut body);
-    assert_eq!(body.len(), 1, "an arm with a third statement is not the guard");
+    assert_eq!(
+        body.len(),
+        1,
+        "an arm with a third statement is not the guard"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -12687,11 +14330,8 @@ fn conform_findings_surface_in_summarize_without_affecting_is_clean() {
     let mut r = VerifyReport::default();
     r.method_rva = 0x1000;
     r.decoded = 10;
-    r.conform_findings.push((
-        DefectClass::CondDropped,
-        0x1000,
-        "test finding".to_string(),
-    ));
+    r.conform_findings
+        .push((DefectClass::CondDropped, 0x1000, "test finding".to_string()));
     assert!(
         r.is_clean(),
         "conform findings must not affect is_clean by contract"
@@ -12728,4 +14368,360 @@ fn no_silenced_dead_code_in_owned_recovery_modules() {
             "{name} still silences dead_code — resolve as delete/wire/cfg(test)"
         );
     }
+}
+
+/// The dispatch guard names the ORIGINAL index register while the table load
+/// names a fresh COPY of it:
+///
+/// ```text
+/// cmp  w24, #0x8        <- guard names w24
+/// b.hi default
+/// mov  w8, w24          <- index copied into a fresh register
+/// ldrb w11, [x9, x8]    <- load names x8
+/// ```
+///
+/// Correlating guard to load on raw register identity therefore never fired:
+/// measured over the corpus, 0 of 219 dispatch sites have the guard on the
+/// load's own register and 215 of 219 name a different one. `max_case` stayed
+/// at its 1023 initialiser and the scan accepted any entry whose target landed
+/// inside the method span. NGUIMath.ResizeWidget @0x17ECE8C has a 9-entry table
+/// and emitted 479 cases (1,044 lines); after the fix it emits 9 (90 lines).
+#[test]
+fn switch_table_bound_survives_index_copy() {
+    const TBL: u64 = 0x5000;
+    const ANCHOR: u64 = 0x1020;
+    let mut insns: Vec<Insn> = Vec::new();
+    for k in 0..12u64 {
+        insns.push(Insn::new(Op::Nop, vec![], 0x1000 + k * 4));
+    }
+    // The guard names x8, but the table is indexed by x7 = a copy of x8.
+    insns.push(Insn::new(
+        Op::Compare(CompareKind::GreaterThan),
+        vec![Operand::Local(9), Operand::reg("x8"), Operand::imm(3)],
+        0x1030,
+    ));
+    insns.push(Insn::new(Op::CondJump(0x1050), vec![Operand::Local(9)], 0x1034));
+    insns.push(Insn::move_(Operand::reg("x7"), Operand::reg("x8"), 0x1038));
+    insns.push(Insn::move_(Operand::reg("x9"), Operand::imm(TBL as i64), 0x103c));
+    insns.push(Insn::new(
+        Op::Arith(ArithKind::Add),
+        vec![Operand::reg("x9"), Operand::reg("x9"), Operand::imm(0)],
+        0x1040,
+    ));
+    insns.push(Insn::move_(Operand::reg("x10"), Operand::imm(ANCHOR as i64), 0x1044));
+    insns.push(Insn::move_(
+        Operand::reg("x11"),
+        Operand::Memory {
+            width: 1,
+            base: Box::new(Operand::reg("x9")),
+            index: Some(Box::new(Operand::reg("x7"))),
+            scale: 1,
+            addend: 0,
+        },
+        0x1048,
+    ));
+    insns.push(Insn::new(
+        Op::Arith(ArithKind::Shl),
+        vec![Operand::reg("xt0"), Operand::reg("x11"), Operand::imm(2)],
+        0x104c,
+    ));
+    insns.push(Insn::new(
+        Op::Arith(ArithKind::Add),
+        vec![Operand::reg("x10"), Operand::reg("x10"), Operand::reg("xt0")],
+        0x1050,
+    ));
+    insns.push(Insn::new(Op::IndirectCall, vec![Operand::reg("x10")], 0x1054));
+    let addresses: Vec<u64> = insns.iter().map(|i| i.address).collect();
+    // Entries 4..=12 all land inside [0x1000,0x1054], so a recogniser that
+    // misses the bound accepts them as real cases.
+    let bytes: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0xff, 0xff, 0xff, 0xff];
+    let read = move |a: u64| -> Option<u32> {
+        if a < TBL || a + 4 > TBL + bytes.len() as u64 {
+            return None;
+        }
+        let i = (a - TBL) as usize;
+        Some(u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]))
+    };
+    let mut insns = insns;
+    let n = passes::recover_switch_tables(&mut insns, &addresses, &read);
+    assert_eq!(n, 1, "the table must still be recovered through the copy");
+    let targets = insns
+        .iter()
+        .find_map(|i| match &i.op {
+            Op::Switch(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("switch");
+    assert_eq!(
+        targets.len(),
+        4,
+        "the guard bounds the table at 4 entries; entries 4..=12 are phantom"
+    );
+}
+
+/// yaxpeax encodes the TBZ/TBNZ bit index as `A64Op::Imm16`, which the lifter
+/// did not match, so `bit` was ALWAYS 0 and every test-branch was lifted as a
+/// bit-0 test. `tbnz w24, #0x1f` is the sign test that guards the token counts
+/// in `Initialize` @0x189D9D4; lifted as `& 1` it produced the provably dead
+/// guards `if (!index) { if (index >= 1) ... }` recorded in NEXT_STEPS 4.0.
+#[test]
+fn tbnz_uses_the_real_bit_index() {
+    let bytes = le(&[
+        0x37F80098, // tbnz w24, #0x1f, +0x10
+        0xD65F03C0, // ret
+    ]);
+    let lifted = lift::lift_arm64(&bytes, 0x1000, 64, None).expect("lift");
+    let and = lifted
+        .insns
+        .iter()
+        .find(|i| matches!(i.op, Op::Arith(ArithKind::And)))
+        .expect("the bit test must lower to an And");
+    assert_eq!(
+        and.operands[2],
+        Operand::imm(0x80000000),
+        "mask must be the sign bit, not bit 0: {and:?}"
+    );
+}
+
+/// `bind_fp_call_returns` retires a binding only for the scalar result slots
+/// (`vs0`/`vd0`), so `cur["vs4"]` and `cur["vs8"]` kept pointing at the call
+/// forever: every later read of ANY version of those slots was rewritten to
+/// `call.y`/`call.z`, including versions defined by fsub/fmul. On 0x1530F2C
+/// that emitted `Sqrt(t2.y + (t.x-t2.x)*(t.x-t2.x) + t2.y)`; x was correct
+/// only because `vs0` happened to be tracked.
+#[test]
+fn hfa_component_binding_retires_on_write() {
+    use crate::recovery::types::{FieldRef, NamedType};
+    use std::sync::Arc;
+    let mut version_slot = std::collections::HashMap::new();
+    version_slot.insert(1u32, "vs0".to_string());
+    version_slot.insert(2u32, "vs4".to_string());
+    version_slot.insert(3u32, "vs8".to_string());
+    version_slot.insert(4u32, "x0".to_string());
+    version_slot.insert(5u32, "x0".to_string());
+    version_slot.insert(20u32, "vs4".to_string()); // fsub result, a NEW vs4
+    version_slot.insert(30u32, "vs9".to_string()); // unrelated slot
+    let mut insns = vec![
+        Insn::new(Op::Call, vec![Operand::Local(5), Operand::Local(4)], 0x1000),
+        // fsub s1, s10, s12  -> a new vs4 that is NOT the call result
+        Insn::new(Op::Move, vec![Operand::Local(20), Operand::Local(1)], 0x1004),
+        // fmul s1, s1, s1    -> must read Local(20), not call.y
+        Insn::new(Op::Move, vec![Operand::Local(30), Operand::Local(20)], 0x1008),
+    ];
+    insns[0].dest_type = Some(ManagedType::Class(Arc::new(NamedType {
+        namespace: "UnityEngine".into(),
+        name: "Vector3".into(),
+        assembly: None,
+        type_def_index: 7651,
+    })));
+    let field = |name: &str, idx: u32| FieldRef {
+        type_def_index: 7651,
+        field_index: idx,
+        name: name.into(),
+        declaring_type_name: "UnityEngine.Vector3".into(),
+        field_type: ManagedType::Primitive(PrimKind::R4),
+        is_static: false,
+    };
+    passes::bind_fp_call_returns(&mut insns, &version_slot, 4, |_| {
+        vec![field("x", 1), field("y", 2), field("z", 3)]
+    });
+    assert_eq!(
+        insns[2].operands[1],
+        Operand::Local(20),
+        "a write to vs4 must retire the call binding: {insns:?}"
+    );
+}
+
+/// §3.1: an EH landing pad is an SSA KILL POINT.
+///
+/// The CFG cannot express the unwinder edge; the compiler leaves an
+/// unreachable `b <pad>` after a noreturn raise, which used to give the pad a
+/// synchronous predecessor. Renaming along that edge bound the pad's `x0` to
+/// the loop body's last write — the handler then rendered body code
+/// (`IL2CPP_IsInst((&enumerator).MoveNext(), …)`) as the exception.
+///
+/// Fixture: x0 is defined once in the body before a two-way join that lands
+/// on the pad. At the pad the read must name the method ENTRY version, not
+/// the body definition, and no phi may be placed at the pad.
+#[test]
+fn eh_handler_entry_kills_slot_state_in_ssa() {
+    let words: [u32; 6] = [
+        0xD2800540, // 0x1000: movz x0, #0x2a
+        0xB4000060, // 0x1004: cbz  x0, 0x1010
+        0x14000002, // 0x1008: b    0x1010
+        0xD2800001, // 0x100c: movz x1, #0
+        0x91000400, // 0x1010: add  x0, x0, #1   ← landing pad
+        0xD65F03C0, // 0x1014: ret
+    ];
+    let bytes = le(&words);
+    let lifted = lift::lift_arm64(&bytes, 0x1000, 64, None).expect("lift");
+    let mut insns = lifted.insns;
+    let graph =
+        cfg::Cfg::build_with_landing_pads(&mut insns, &lifted.addresses, &[0x1010]).expect("cfg");
+    stack_analyzer::analyze(&mut insns, &graph);
+    let dom = dominator::DominatorInfo::compute(&graph);
+    let pad_block = graph
+        .blocks
+        .iter()
+        .position(|b| insns[b.start].address == 0x1010)
+        .expect("pad must start a block");
+
+    let entry_x0 = {
+        let out = ssa::build(&insns, &graph, &dom, &[]);
+        out.version_slot
+            .iter()
+            .filter(|(_, s)| s.as_str() == "x0")
+            .map(|(v, _)| *v)
+            .min()
+            .expect("x0 is seeded")
+    };
+
+    // Neutralised: without the kill the pad read names the body definition.
+    let plain = ssa::build(&insns, &graph, &dom, &[]);
+    let plain_add = plain
+        .insns
+        .iter()
+        .find(|i| i.address == 0x1010)
+        .expect("pad instruction");
+    assert!(
+        !matches!(plain_add.operands.get(1), Some(Operand::Local(v)) if *v == entry_x0),
+        "control: the body definition must be what leaks without the kill: {plain_add:?}"
+    );
+
+    let mut handlers = std::collections::HashSet::new();
+    handlers.insert(pad_block);
+    let out = ssa::build_with_handler_entries(&insns, &graph, &dom, &[], &handlers);
+    assert!(
+        out.phis.iter().all(|p| p.block != pad_block),
+        "a handler entry must never be a phi merge point: {:?}",
+        out.phis
+    );
+    let add = out
+        .insns
+        .iter()
+        .find(|i| i.address == 0x1010)
+        .expect("pad instruction");
+    assert!(
+        matches!(add.operands.get(1), Some(Operand::Local(v)) if *v == entry_x0),
+        "the pad's x0 read must be the ENTRY version, got {add:?}"
+    );
+}
+
+/// §3.1: a landing pad is a block even when no branch targets it.
+///
+/// The pad is addressed by the EH tables, not by an edge. Once the unreachable
+/// trampoline after a noreturn raise is neutralised, nothing branches to the
+/// pad; without a forced leader it would be glued to the preceding block and
+/// `region_of_block`/`handler_of` could not name it.
+#[test]
+fn landing_pad_is_a_forced_cfg_leader() {
+    let words: [u32; 4] = [
+        0xD2800020, // 0x1000: movz x0, #1
+        0x91000401, // 0x1004: add  x1, x0, #1   ← pad, no branch targets it
+        0x91000802, // 0x1008: add  x2, x0, #2
+        0xD65F03C0, // 0x100c: ret
+    ];
+    let bytes = le(&words);
+    let lifted = lift::lift_arm64(&bytes, 0x1000, 64, None).expect("lift");
+    let mut insns = lifted.insns;
+    let plain = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
+    assert!(
+        !plain
+            .blocks
+            .iter()
+            .any(|b| insns[b.start].address == 0x1004),
+        "control: an unreferenced pad is inside the entry block"
+    );
+    let padded =
+        cfg::Cfg::build_with_landing_pads(&mut insns, &lifted.addresses, &[0x1004]).expect("cfg");
+    assert!(
+        padded
+            .blocks
+            .iter()
+            .any(|b| insns[b.start].address == 0x1004),
+        "the pad must start its own block: {:?}",
+        padded
+            .blocks
+            .iter()
+            .map(|b| insns[b.start].address)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// §3.1: the unreachable `b <pad>` after a noreturn raise is retired.
+///
+/// The branch is dead code, but the CFG reads it as a successor of the call
+/// and gives the landing pad a synchronous predecessor. A `throw` of the
+/// exception argument is INSERTED after the call: it terminates the block for
+/// every later CFG rebuild, while the trampoline branch itself stays in the
+/// listing so the EH row still names a pad and `pad_root` can follow it to
+/// the real handler. The call's result slot is retired so the throw does not
+/// read the never-returning call's result.
+#[test]
+fn raise_trampoline_into_a_landing_pad_is_neutralised() {
+    let mut insns = vec![
+        Insn::new(
+            Op::Call,
+            vec![
+                Operand::imm(0x9000),
+                Operand::reg("x0"),
+                Operand::reg("x0"),
+                Operand::reg("x1"),
+            ],
+            0x1000,
+        ),
+        Insn::new(Op::Jump(0x1008), vec![], 0x1004),
+        Insn::new(Op::Return, vec![], 0x1008),
+    ];
+    let mut addresses = vec![0x1000u64, 0x1004, 0x1008];
+    let rewritten = super::neutralise_raise_trampolines(
+        &mut insns,
+        &mut addresses,
+        &[0x1008],
+        &[0x9000],
+    );
+    assert_eq!(rewritten, vec![0x1000]);
+    assert_eq!(insns.len(), 4, "the throw is inserted, nothing is removed");
+    assert!(matches!(insns[1].op, Op::Throw), "{:?}", insns[1]);
+    assert_eq!(insns[1].operands[0], Operand::reg("x0"));
+    assert!(
+        matches!(insns[2].op, Op::Jump(t) if t == 0x1008),
+        "the trampoline branch must survive for pad_root: {:?}",
+        insns[2]
+    );
+    assert_eq!(
+        insns[0].operands[1],
+        Operand::Unknown,
+        "a never-returning call has no result"
+    );
+}
+
+/// A jump that merely targets the pad (not preceded by a raise) is not a
+/// trampoline, and a trampoline another branch genuinely reaches must stay.
+#[test]
+fn raise_trampoline_rewrites_only_provably_dead_branches() {
+    let mk = || {
+        vec![
+            Insn::new(
+                Op::Call,
+                vec![Operand::imm(0x9000), Operand::reg("x0"), Operand::reg("x0")],
+                0x1000,
+            ),
+            Insn::new(Op::Jump(0x1008), vec![], 0x1004),
+            Insn::new(Op::Return, vec![], 0x1008),
+        ]
+    };
+    // Not a raise helper → untouched.
+    let mut insns = mk();
+    let mut addresses = vec![0x1000u64, 0x1004, 0x1008];
+    assert!(super::neutralise_raise_trampolines(&mut insns, &mut addresses, &[0x1008], &[0x9999])
+        .is_empty());
+    assert!(matches!(insns[1].op, Op::Jump(_)));
+
+    // Somebody branches to 0x1004 → the trampoline is reachable, leave it.
+    let mut insns = mk();
+    insns.insert(2, Insn::new(Op::Jump(0x1004), vec![], 0x1004));
+    let mut addresses = vec![0x1000u64, 0x1004, 0x1004, 0x1008];
+    assert!(super::neutralise_raise_trampolines(&mut insns, &mut addresses, &[0x1008], &[0x9000])
+        .is_empty());
 }

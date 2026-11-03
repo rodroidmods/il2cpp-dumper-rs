@@ -23,11 +23,11 @@
 //! Newobj+ctor fusion happened in resolve; here NewObj emits newobj directly.
 //! Unrecoverable constructs emit diagnostic strings (visible in ILSpy).
 
-use std::collections::HashMap;
+use cil::{ConversionType, LoadType, NumberSign};
 use dotnetdll::resolved::il as cil;
 use dotnetdll::resolved::members::{FieldSource, MethodSource, UserMethod};
 use dotnetdll::resolved::types::{BaseType, CustomTypeModifier, LocalVariable, MethodType};
-use cil::{ConversionType, LoadType, NumberSign};
+use std::collections::HashMap;
 
 use super::ir::{ArithKind, CompareKind, FloatArithKind, Insn, Op, Operand, SelectVariant};
 use super::types::{ManagedType, PrimKind};
@@ -91,7 +91,10 @@ impl<'a> Emitter<'a> {
         unused: &std::collections::HashSet<usize>,
         returns_value: bool,
     ) -> EmitOutput {
-        let mut b = Body { insns: vec![], fixups: vec![] };
+        let mut b = Body {
+            insns: vec![],
+            fixups: vec![],
+        };
 
         // remap table indices → compact local slots (skipping unused).
         // Prebuild version→table-index inverted map ONCE (was O(V²): a full
@@ -108,7 +111,10 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             let info = &table.infos[li];
-            let ty = self.resolver.method_type(&info.ty).unwrap_or_else(object_mt);
+            let ty = self
+                .resolver
+                .method_type(&info.ty)
+                .unwrap_or_else(object_mt);
             locals.push(LocalVariable::Variable {
                 custom_modifiers: Vec::<CustomTypeModifier>::new(),
                 pinned: false,
@@ -127,7 +133,11 @@ impl<'a> Emitter<'a> {
         // down from u32::MAX-2); legacy shared sentinels (MAX / MAX-1 from
         // the arm32/x86 lifters) are covered by the same sweep.
         let int32_mt = || MethodType::Base(Box::new(BaseType::Int32));
-        let push_scratch = |version: u32, name: &str, slot_map: &mut HashMap<u32, u16>, locals: &mut Vec<LocalVariable>, local_names: &mut Vec<String>| {
+        let push_scratch = |version: u32,
+                            name: &str,
+                            slot_map: &mut HashMap<u32, u16>,
+                            locals: &mut Vec<LocalVariable>,
+                            local_names: &mut Vec<String>| {
             let idx = locals.len() as u16;
             locals.push(LocalVariable::Variable {
                 custom_modifiers: Vec::<CustomTypeModifier>::new(),
@@ -146,10 +156,14 @@ impl<'a> Emitter<'a> {
         scratch_ids.sort_unstable();
         scratch_ids.dedup();
         for (n, &v) in scratch_ids.iter().enumerate() {
-            let is_cmp = insns
-                .iter()
-                .any(|i| i.dest().and_then(|d| d.as_local()) == Some(v) && matches!(i.op, Op::Compare(_)));
-            let name = if is_cmp { format!("_cmp{n}") } else { format!("_mask{n}") };
+            let is_cmp = insns.iter().any(|i| {
+                i.dest().and_then(|d| d.as_local()) == Some(v) && matches!(i.op, Op::Compare(_))
+            });
+            let name = if is_cmp {
+                format!("_cmp{n}")
+            } else {
+                format!("_mask{n}")
+            };
             push_scratch(v, &name, &mut slot_map, &mut locals, &mut local_names);
         }
         let slot_of = |v: u32| -> u16 { slot_map.get(&v).copied().unwrap_or(0) };
@@ -407,7 +421,10 @@ impl<'a> Emitter<'a> {
         b.emit(cil::Instruction::load_string(msg));
         match self.resolver.console_write_line() {
             Some(src) => {
-                b.emit(cil::Instruction::Call { tail_call: false, param0: src });
+                b.emit(cil::Instruction::Call {
+                    tail_call: false,
+                    param0: src,
+                });
             }
             None => {
                 b.emit(cil::Instruction::Pop);
@@ -417,12 +434,7 @@ impl<'a> Emitter<'a> {
 
     // ---- operand loading ----------------------------------------------------
 
-    fn load(
-        &self,
-        op: Option<&Operand>,
-        slot_of: &dyn Fn(u32) -> u16,
-        b: &mut Body,
-    ) {
+    fn load(&self, op: Option<&Operand>, slot_of: &dyn Fn(u32) -> u16, b: &mut Body) {
         let op = op.cloned().unwrap_or(Operand::Unknown);
         match op {
             Operand::Immediate(v) => {
@@ -466,7 +478,10 @@ impl<'a> Emitter<'a> {
                 match self.resolver.field_source(&f) {
                     Some(fs) => {
                         if f.is_static {
-                            b.emit(cil::Instruction::LoadStaticField { volatile: false, param0: fs });
+                            b.emit(cil::Instruction::LoadStaticField {
+                                volatile: false,
+                                param0: fs,
+                            });
                         } else {
                             b.emit(cil::Instruction::LoadNull); // object loaded separately by gen_move path
                         }
@@ -481,38 +496,37 @@ impl<'a> Emitter<'a> {
             // (see the module docs), but unlike a bare `Field` it now has a real
             // object reference to load against. When the field cannot be
             // resolved, push a single null so the eval stack stays balanced.
-            Operand::InstanceField { base, field } => {
-                match self.resolver.field_source(&field) {
-                    Some(fs) => {
-                        self.load(Some(base.as_ref()), slot_of, b);
-                        b.emit(cil::Instruction::LoadField {
-                            unaligned: None,
-                            volatile: false,
-                            param0: fs,
-                        });
-                    }
-                    None => {
-                        b.emit(cil::Instruction::LoadNull);
-                    }
+            Operand::InstanceField { base, field } => match self.resolver.field_source(&field) {
+                Some(fs) => {
+                    self.load(Some(base.as_ref()), slot_of, b);
+                    b.emit(cil::Instruction::LoadField {
+                        unaligned: None,
+                        volatile: false,
+                        param0: fs,
+                    });
                 }
-            }
-            Operand::Method(m) => {
-                match self.resolver.user_method(&m) {
-                    Some(um) => {
-                        b.emit(cil::Instruction::LoadMethodPointer(MethodSource::User(um)));
-                    }
-                    None => {
-                        b.emit(cil::Instruction::LoadNull);
-                    }
+                None => {
+                    b.emit(cil::Instruction::LoadNull);
                 }
-            }
+            },
+            Operand::Method(m) => match self.resolver.user_method(&m) {
+                Some(um) => {
+                    b.emit(cil::Instruction::LoadMethodPointer(MethodSource::User(um)));
+                }
+                None => {
+                    b.emit(cil::Instruction::LoadNull);
+                }
+            },
             Operand::Type(t) => {
                 // typeof(T): ldtoken <type>; call Type::GetTypeFromHandle
                 match self.resolver.type_token_source(&t.ty) {
                     Some(mt) => {
                         b.emit(cil::Instruction::LoadTokenType(mt));
                         if let Some(getter) = self.resolver.get_type_from_handle() {
-                            b.emit(cil::Instruction::Call { tail_call: false, param0: getter });
+                            b.emit(cil::Instruction::Call {
+                                tail_call: false,
+                                param0: getter,
+                            });
                         }
                     }
                     None => {
@@ -560,12 +574,7 @@ impl<'a> Emitter<'a> {
 
     // ---- stores ---------------------------------------------------------------
 
-    fn store(
-        &self,
-        dest: Option<&Operand>,
-        slot_of: &dyn Fn(u32) -> u16,
-        b: &mut Body,
-    ) {
+    fn store(&self, dest: Option<&Operand>, slot_of: &dyn Fn(u32) -> u16, b: &mut Body) {
         match dest {
             Some(Operand::Local(v)) => {
                 b.emit(cil::Instruction::StoreLocal(slot_of(*v)));
@@ -577,7 +586,10 @@ impl<'a> Emitter<'a> {
                 // TOS holds the value; static store needs it directly
                 match self.resolver.field_source(f) {
                     Some(fs) => {
-                        b.emit(cil::Instruction::StoreStaticField { volatile: false, param0: fs });
+                        b.emit(cil::Instruction::StoreStaticField {
+                            volatile: false,
+                            param0: fs,
+                        });
                     }
                     None => {
                         b.emit(cil::Instruction::Pop);
@@ -592,12 +604,7 @@ impl<'a> Emitter<'a> {
 
     // ---- moves ------------------------------------------------------------------
 
-    fn gen_move(
-        &self,
-        insn: &Insn,
-        slot_of: &dyn Fn(u32) -> u16,
-        b: &mut Body,
-    ) {
+    fn gen_move(&self, insn: &Insn, slot_of: &dyn Fn(u32) -> u16, b: &mut Body) {
         let dst = insn.operands.first().cloned();
         let src = insn.operands.get(1).cloned();
 
@@ -611,7 +618,11 @@ impl<'a> Emitter<'a> {
                     Some(fs) => {
                         self.load(Some(&obj), slot_of, b);
                         self.load(src.as_ref(), slot_of, b);
-                        b.emit(cil::Instruction::StoreField { unaligned: None, volatile: false, param0: fs });
+                        b.emit(cil::Instruction::StoreField {
+                            unaligned: None,
+                            volatile: false,
+                            param0: fs,
+                        });
                         return;
                     }
                     None => {}
@@ -638,7 +649,10 @@ impl<'a> Emitter<'a> {
             if f.is_static {
                 if let Some(fs) = self.resolver.field_source(f) {
                     self.load(src.as_ref(), slot_of, b);
-                    b.emit(cil::Instruction::StoreStaticField { volatile: false, param0: fs });
+                    b.emit(cil::Instruction::StoreStaticField {
+                        volatile: false,
+                        param0: fs,
+                    });
                     return;
                 }
             }
@@ -650,13 +664,7 @@ impl<'a> Emitter<'a> {
 
     // ---- arithmetic ----------------------------------------------------------------
 
-    fn gen_arith(
-        &self,
-        kind: ArithKind,
-        insn: &Insn,
-        slot_of: &dyn Fn(u32) -> u16,
-        b: &mut Body,
-    ) {
+    fn gen_arith(&self, kind: ArithKind, insn: &Insn, slot_of: &dyn Fn(u32) -> u16, b: &mut Body) {
         if matches!(kind, ArithKind::Rol | ArithKind::Ror) {
             // no single CIL rotate opcode — diagnostic keeps output honest
             self.diagnostic("rotate (BitOperations.Rotate*)", b);
@@ -680,7 +688,12 @@ impl<'a> Emitter<'a> {
         };
         b.emit(emitted);
         // float coercion hint (IlGenerator.cs:615-626)
-        if insn.dest_type.as_ref().map(|t| t.is_float()).unwrap_or(false) {
+        if insn
+            .dest_type
+            .as_ref()
+            .map(|t| t.is_float())
+            .unwrap_or(false)
+        {
             b.emit(cil::Instruction::ConvertFloat32);
         }
         self.store(insn.dest(), slot_of, b);
@@ -756,12 +769,7 @@ impl<'a> Emitter<'a> {
 
     // ---- calls ------------------------------------------------------------------------
 
-    fn gen_call(
-        &self,
-        insn: &Insn,
-        slot_of: &dyn Fn(u32) -> u16,
-        b: &mut Body,
-    ) {
+    fn gen_call(&self, insn: &Insn, slot_of: &dyn Fn(u32) -> u16, b: &mut Body) {
         let Some(m) = method_of(insn) else {
             self.diagnostic("call to unresolved address", b);
             return;
@@ -773,7 +781,11 @@ impl<'a> Emitter<'a> {
         // layout: [Method, ret?, this?, params...]
         let mut cursor = 2usize;
         if !m.sig.is_static {
-            let this_op = insn.operands.get(cursor).cloned().unwrap_or(Operand::Unknown);
+            let this_op = insn
+                .operands
+                .get(cursor)
+                .cloned()
+                .unwrap_or(Operand::Unknown);
             match this_op {
                 Operand::Local(v) => {
                     b.emit(cil::Instruction::LoadLocal(slot_of(v)));
@@ -789,19 +801,17 @@ impl<'a> Emitter<'a> {
         }
         let remaining_ops: Vec<Operand> = insn.operands.iter().skip(cursor).cloned().collect();
         self.load_call_args_with(&m, &remaining_ops, slot_of, b);
-        b.emit(cil::Instruction::Call { tail_call: false, param0: src });
+        b.emit(cil::Instruction::Call {
+            tail_call: false,
+            param0: src,
+        });
         // balance: non-void result already positioned at operand 1
         if !m.sig.is_void_like() {
             self.store(insn.dest(), slot_of, b);
         }
     }
 
-    fn gen_call_void(
-        &self,
-        insn: &Insn,
-        slot_of: &dyn Fn(u32) -> u16,
-        b: &mut Body,
-    ) {
+    fn gen_call_void(&self, insn: &Insn, slot_of: &dyn Fn(u32) -> u16, b: &mut Body) {
         let Some(m) = method_of(insn) else {
             self.diagnostic("call to unresolved address", b);
             return;
@@ -812,7 +822,11 @@ impl<'a> Emitter<'a> {
         };
         let mut cursor = 1usize;
         if !m.sig.is_static {
-            let this_op = insn.operands.get(cursor).cloned().unwrap_or(Operand::Unknown);
+            let this_op = insn
+                .operands
+                .get(cursor)
+                .cloned()
+                .unwrap_or(Operand::Unknown);
             match this_op {
                 Operand::Local(v) => {
                     b.emit(cil::Instruction::LoadLocal(slot_of(v)));
@@ -828,7 +842,10 @@ impl<'a> Emitter<'a> {
         }
         let remaining: Vec<Operand> = insn.operands.iter().skip(cursor).cloned().collect();
         self.load_call_args_with(&m, &remaining, slot_of, b);
-        b.emit(cil::Instruction::Call { tail_call: false, param0: src });
+        b.emit(cil::Instruction::Call {
+            tail_call: false,
+            param0: src,
+        });
     }
 
     fn load_call_args_with(
@@ -840,8 +857,13 @@ impl<'a> Emitter<'a> {
     ) {
         for (i, pty) in m.sig.params.iter().enumerate() {
             match available.get(i) {
-                Some(o @ (Operand::Local(_) | Operand::Immediate(_) | Operand::StringLiteral { .. }
-                        | Operand::FloatLiteral(_) | Operand::DoubleLiteral(_))) => {
+                Some(
+                    o @ (Operand::Local(_)
+                    | Operand::Immediate(_)
+                    | Operand::StringLiteral { .. }
+                    | Operand::FloatLiteral(_)
+                    | Operand::DoubleLiteral(_)),
+                ) => {
                     self.load(Some(o), slot_of, b);
                 }
                 Some(Operand::Field(f)) => {
@@ -866,11 +888,18 @@ impl<'a> Emitter<'a> {
             return;
         };
         if f.is_static {
-            b.emit(cil::Instruction::LoadStaticField { volatile: false, param0: fs });
+            b.emit(cil::Instruction::LoadStaticField {
+                volatile: false,
+                param0: fs,
+            });
         } else {
             // object ref unknown at this point → null deref-safe placeholder
             b.emit(cil::Instruction::LoadNull);
-            b.emit(cil::Instruction::LoadField { unaligned: None, volatile: false, param0: fs });
+            b.emit(cil::Instruction::LoadField {
+                unaligned: None,
+                volatile: false,
+                param0: fs,
+            });
         }
     }
 }
@@ -915,7 +944,6 @@ fn push_default(t: &ManagedType, b: &mut Body) {
 fn object_mt() -> MethodType {
     MethodType::Base(Box::new(BaseType::Object))
 }
-
 
 fn replace_branch_target(i: &cil::Instruction, target: usize) -> cil::Instruction {
     match i {

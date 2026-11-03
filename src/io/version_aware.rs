@@ -16,7 +16,10 @@ impl VersionRange {
 
 impl Default for VersionRange {
     fn default() -> Self {
-        Self { min: 0.0, max: 999.0 }
+        Self {
+            min: 0.0,
+            max: 999.0,
+        }
     }
 }
 

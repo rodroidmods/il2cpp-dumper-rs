@@ -1,10 +1,10 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" />
   <img src="https://img.shields.io/badge/IL2CPP-v16--v39-blueviolet?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/License-GPLv3-green?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
 </p>
 
-<h1 align="center">🛡️ Rodroid Il2CppDumper V8.0</h1>
+<h1 align="center">🛡️ Rodroid Il2CppDumper V8.5</h1>
 
 <p align="center">
   <b>A blazing-fast, cross-platform IL2CPP binary dumper written in Rust.</b><br/>
@@ -33,6 +33,7 @@
 | **script.json** | ✅ Yes | ✅ Yes | ✅ Yes |
 | **stringliteral.json** | ✅ Yes | ✅ Yes | ✅ Yes |
 | **Split Dump Per Type (DiffableCS)** | ❌ No | ❌ No | ✅ **Yes (parallel)** |
+| **C# Decompiler (native bodies → C#)** | ❌ No | ❌ No | ✅ **Yes (pre-alpha)** |
 | **Variable-width indices (v39/Unity 6)** | ❌ No | ❌ No | ✅ **Yes** |
 | **Auto-XOR Metadata Decryption** | ❌ No | ❌ No | ✅ **Yes** |
 | **Latest Unity Formats (v104, v106)** | ❌ No | ❌ No | ✅ **Yes** |
@@ -101,6 +102,24 @@
 - **stringliteral.json** — All string literal values and indices
 - **DummyDLL** — Reconstructed .NET assemblies for dnSpy/ILSpy (parallelized)
 
+### C# Decompiler — PRE-ALPHA (v8)
+- **Recovered method bodies** — native ARM64 / ARM32 / x86-64 IL2CPP bodies
+  rendered as C#-style pseudocode inline in `dump.cs` (and/or the split dump),
+  in parallel via `rayon`.
+- **High-level constructs** — `if`/`while`/`for`/`foreach`/`switch`,
+  `try`/`catch`/`finally`, `&&`/`||` guard chains, ternaries, object
+  initializers, `ref`/`out` parameters, closures, delegates.
+- **Metadata-aware naming** — fields, static fields, string literals, types,
+  vtable/devirtualised calls, generic instantiations, class-init checks.
+- **Engine internal calls** — Unity icall stubs (`…_Injected`) and delegate
+  runtime methods render as `[MethodImpl(InternalCall)] extern` declarations,
+  not as resolver bodies.
+- **Scoped by filter** — `csharpIncludeAssemblies` / `csharpIncludeTypes`
+  limit which bodies are recovered; `csharpFullDump` keeps the rest of the dump
+  intact.
+- **Pre-alpha:** output is readable C#, not guaranteed-compilable C#. Progress
+  and remaining gaps are tracked in `HANDOFF.md` §1 and `NEXT_STEPS.md` §0.
+
 ### C++ Headers & Scaffolding
 - **il2cpp-functions.h** — C++ scaffold with function pointer typedefs for hooking
 - **Itanium ABI Name Mangling** — Correct C++ mangled names for all IL2CPP types
@@ -155,6 +174,89 @@
   3. Current `type_enum` invalid + XOR'd `type_enum` valid (catches obfuscator-only patterns like `0x27 → Class`, `0x24 → ValueType`)
 - ~95 % of encrypted Il2CppType entries recovered (class names, value types, generic instances, field type references). The remaining ~5 % are **intentional decoy fields** with the `LITERAL` (0x40) attribute flag set on real instance fields — same limitation as the C# CODM dumper; not an encryption gap.
 - Toggle via `--codm` flag or `Codm: true` in config — additive code path, leaves standard Unity games untouched
+
+### What's new in v8.5 — the pre-alpha decompiler sync
+
+**Version 8.5.0. The C# decompiler is declared PRE-ALPHA.** The metadata path
+(`dump.cs`, DummyDLL, `il2cpp.h`, `script.json`, `stringliteral.json`) is
+stable; recovered bodies are still improving and are not yet guaranteed to
+compile. Alpha is gated on the worklist in `NEXT_STEPS.md` §0.
+
+#### Fixed in v8.5
+
+- **Free Fire, Free Fire MAX and Free Fire India:** an IL2CPP **version
+  detection** failure made these games fail to dump at all. The version is now
+  detected correctly and they dump successfully.
+- **CODM:** a Call of Duty Mobile binary could not produce a **full dump**;
+  v8.5 writes the complete dump.
+- **Zero-warning build**, and **all engine debug output is off by default** —
+  every trace is behind an `ILR_*` environment gate (`ILR_DEBUG=1` to re-enable
+  the progress logs).
+- The identical v8.5 engine now ships in the CLI, the Tauri desktop/mobile app
+  and the Android app (app version 8.5, `versionCode` 85).
+
+#### Recovered C# — what the pre-alpha engine added over the v8 beta
+
+The engine grew from ~111k lines (v8.0) to **~225k lines**; the decompiler
+(`src/recovery/`) alone went from 33 files / 78k lines to **118 files /
+187k lines**.
+
+- **Icall stubs render as `extern`.** Unity engine methods are native internal
+  calls — their IL2CPP body is the lazy resolver
+  (`*(nint*)(slot) = fn_resolve(…)` then `blr`), not managed code. Those bodies
+  now print Unity's own shape,
+  `[MethodImpl(MethodImplOptions.InternalCall)] public extern …;`. On the second
+  study corpus (*Tomb of Maze*): resolver noise **386 → 0**, extern declarations
+  **685 → 1,067**.
+- **Honest unreachable warnings.** `// WARNING: N of M blocks unreachable` now
+  fires only when a reachable block genuinely ends in an unresolved indirect
+  dispatch — it used to stamp neighbouring one-line functions whose decode
+  window merely overlapped (179 → 3 on the same corpus).
+- **Delegate `Invoke` sugar** and delegate runtime methods
+  (`Invoke`/`BeginInvoke`/`EndInvoke`) render as declarations instead of their
+  `br` dispatch.
+- **Guard-chain flattening** (`if (!x) return;` early-exit cascades unrolled),
+  **tail-return ternaries** (`if (C) return E; return F;` →
+  `return C ? E : F;`), **guard merging** to `&&`-chains, **object
+  initializers**, **switch-arm grouping**.
+- **Closure/display-class fields**: `*(nint*)(v351 +32)` becomes
+  `v351.cellData`, including fields of those fields (−702 raw sites).
+- **Byref bodies**: `ref`/`out` parameters deref correctly, and dead-store
+  elimination now refuses to delete a store to a `ref`/`out` parameter.
+- **Class-init handling**: raw byte stores `*(byte*)(0x31ac000 +2603) = 1` take
+  the `ClassInit.init_…` name their own guard already used (1,714 stores
+  named).
+- **Empty bodies recovered** (`// body not recoverable` 1,248 → 418; the
+  residue is genuine argument-shuffling thunks).
+- **`E; return;` is `return E;`.** In a value-returning method a bare
+  expression immediately before an operand-less `return` can only be the
+  return value — the shape left behind when the walker loses the link between
+  a call's result slot and the return register (`Camera.get_current` used to
+  print `Camera.currentInternal; return;`). This single fold took
+  `// body not recoverable` from **418 → 5** on the reference corpus and
+  **33 → 6** on the second one.
+- **No fabricated allocations.** The runtime's class-init thunk is sampled into
+  the allocator family, so its unused result printed as
+  `var camera = new Camera();` (`Camera.FireOnPreCull`) or as a stub method's
+  whole body (`AppsFlyerStub.OpenSettings`). An unread, argument-less
+  allocation is now removed as what it is — dead code: **1,945 → 39** such
+  statements on the reference corpus, ~780 real allocations left intact.
+
+Measured on the reference Temple Run 2 corpus (`OUT_R208AC`, 24,195 methods,
+`Assembly-CSharp` only): **512,595 lines / 18.1 MB**, `target not emitted`
+**291** (from 6,449), raw `*(…)` accesses **36,410** (from 55,121),
+`*(nint*)(…)` **26,434**, gotos **10,263**, `// body not recoverable` **5**
+(from 1,248), verifier annotations **1,280 suspect / 248 undefined locals**,
+duplicate labels **0**, quiet full dump **178–200 s** on a 2-core host. Second
+corpus (*Tomb of Maze*, with `UnityEngine.CoreModule` selected): **199,598
+lines**, **1,067** icall externs, `body not recoverable` **6**.
+
+#### New option
+
+- **`csharpFullDump`** (default `false`): with a class filter active, keep the
+  complete type/method dump and limit recovered **bodies** to the selection —
+  every other method renders `{ }`. Without it, a filter reduces the dump
+  itself to the selected types.
 
 ### What's new in v8.0 — the C# Decompiler release
 
@@ -312,7 +414,7 @@ il2cpp_dumper UnityFramework global-metadata.dat
     ╦╦  ╔═╗╔═╗╔═╗  ╔╦╗╦ ╦╔╦╗╔═╗╔═╗╦═╗
     ║║  ╠═╝║  ╠═╝   ║║║ ║║║║╠═╝║╣ ╠╦╝
     ╩╩═╝╚  ╚═╝╩    ═╩╝╚═╝╩ ╩╩  ╚═╝╩╚═
-    Version v8.0.0
+    Version v8.5.0
   ─────────────────────────────────────
 
   📂 Output .\Dump0
@@ -373,6 +475,7 @@ Place `config.json` next to the binary (or pass `--config path/to/config.json`).
 | **Disassembly** | `dumpDisassembly`, `dumpDisassemblyTarget` (0=Both, 1=dump.cs, 2=DiffableCs), `dumpDisassemblyHexBytes`, `dumpDisassemblyFieldNames`, `dumpDisassemblyAnnotations`, `dumpDisassemblyCfg`, `maxDisassemblyInstructions` |
 | **C++ headers** | `generateCppScaffold`, `mangleNames`, `enhancedIdaMetadata`, `generateUnityHeaders`, `compilerLayout` (`GCC`/`MSVC`), `useTopologicalSort` |
 | **Static metadata (v6)** | `dumpStaticFieldMetadata` (default `false`), `dumpFieldRvaData`, `maxFieldRvaDumpBytes` |
+| **C# decompiler (v8, pre-alpha)** | `csharpTarget` (0=Both, 1=dump.cs, 2=Split), `csharpInteractive`, `csharpMaxBodySize` (0 = no limit), `csharpIncludeAssemblies`, `csharpIncludeTypes`, **`csharpFullDump`** (v8.5: keep every type when a filter is active, bodies only for the selection) |
 | **Advanced** | `forceIl2cppVersion`, `forceVersion`, `forceDump`, `noRedirectedPointer`, `codm` |
 
 ### v6 static metadata example

@@ -1,9 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
-use crate::io::{checked_array_len, BinaryStream};
-use crate::error::{Result, Error};
-use crate::search::SearchSection;
-use crate::disassembler::Architecture;
 use super::structures::*;
+use crate::disassembler::Architecture;
+use crate::error::{Error, Result};
+use crate::io::{BinaryStream, checked_array_len};
+use crate::search::SearchSection;
+use std::collections::{BTreeSet, HashMap};
 
 pub fn auto_plus_count_limit(is_wasm: bool) -> u64 {
     if is_wasm { 0x35000 } else { 0x50000 }
@@ -80,7 +80,12 @@ pub fn refine_code_registration(
     stream.set_position(cr_offset);
     let version = stream.version;
     let cr = Il2CppCodeRegistration::read(stream, version)?;
-    Ok(apply_auto_plus_heuristics(stream, code_registration, &cr, count_limit))
+    Ok(apply_auto_plus_heuristics(
+        stream,
+        code_registration,
+        &cr,
+        count_limit,
+    ))
 }
 
 /// Does an array of `count` pointers have any chance of existing in the image?
@@ -128,25 +133,53 @@ pub fn code_registration_plausibility(
     file_len: u64,
 ) -> std::result::Result<(), String> {
     let mut pairs: Vec<(&'static str, u64, u64)> = vec![
-        ("genericMethodPointers", cr.generic_method_pointers_count, cr.generic_method_pointers),
-        ("invokerPointers", cr.invoker_pointers_count, cr.invoker_pointers),
+        (
+            "genericMethodPointers",
+            cr.generic_method_pointers_count,
+            cr.generic_method_pointers,
+        ),
+        (
+            "invokerPointers",
+            cr.invoker_pointers_count,
+            cr.invoker_pointers,
+        ),
     ];
     if version <= 24.1 {
-        pairs.push(("methodPointers", cr.method_pointers_count, cr.method_pointers));
+        pairs.push((
+            "methodPointers",
+            cr.method_pointers_count,
+            cr.method_pointers,
+        ));
     }
     if version >= 22.0 {
         // The `name` is the field *family*: the message reads `{name}Count`.
-        pairs.push(("reversePInvokeWrapper", cr.reverse_pinvoke_wrapper_count, cr.reverse_pinvoke_wrappers));
-        pairs.push(("unresolvedVirtualCall", cr.unresolved_virtual_call_count, cr.unresolved_virtual_call_pointers));
+        pairs.push((
+            "reversePInvokeWrapper",
+            cr.reverse_pinvoke_wrapper_count,
+            cr.reverse_pinvoke_wrappers,
+        ));
+        pairs.push((
+            "unresolvedVirtualCall",
+            cr.unresolved_virtual_call_count,
+            cr.unresolved_virtual_call_pointers,
+        ));
     }
     if version >= 23.0 {
         pairs.push(("interopData", cr.interop_data_count, cr.interop_data));
     }
     if version >= 24.2 {
-        pairs.push(("codeGenModules", cr.code_gen_modules_count, cr.code_gen_modules));
+        pairs.push((
+            "codeGenModules",
+            cr.code_gen_modules_count,
+            cr.code_gen_modules,
+        ));
     }
     if version >= 24.3 {
-        pairs.push(("windowsRuntimeFactory", cr.windows_runtime_factory_count, cr.windows_runtime_factory_table));
+        pairs.push((
+            "windowsRuntimeFactory",
+            cr.windows_runtime_factory_count,
+            cr.windows_runtime_factory_table,
+        ));
     }
     check_count_pointer_pairs(&pairs, ptr_size, file_len)
 }
@@ -159,16 +192,32 @@ pub fn metadata_registration_plausibility(
     file_len: u64,
 ) -> std::result::Result<(), String> {
     let mut pairs: Vec<(&'static str, u64, u64)> = vec![
-        ("genericClasses", mr.generic_classes_count, mr.generic_classes),
+        (
+            "genericClasses",
+            mr.generic_classes_count,
+            mr.generic_classes,
+        ),
         ("genericInsts", mr.generic_insts_count, mr.generic_insts),
-        ("genericMethodTable", mr.generic_method_table_count, mr.generic_method_table),
+        (
+            "genericMethodTable",
+            mr.generic_method_table_count,
+            mr.generic_method_table,
+        ),
         ("types", mr.types_count, mr.types),
         ("methodSpecs", mr.method_specs_count, mr.method_specs),
         ("fieldOffsets", mr.field_offsets_count, mr.field_offsets),
-        ("typeDefinitionsSizes", mr.type_definitions_sizes_count, mr.type_definitions_sizes),
+        (
+            "typeDefinitionsSizes",
+            mr.type_definitions_sizes_count,
+            mr.type_definitions_sizes,
+        ),
     ];
     if version >= 19.0 {
-        pairs.push(("metadataUsages", mr.metadata_usages_count, mr.metadata_usages));
+        pairs.push((
+            "metadataUsages",
+            mr.metadata_usages_count,
+            mr.metadata_usages,
+        ));
     }
     check_count_pointer_pairs(&pairs, ptr_size, file_len)
 }
@@ -248,6 +297,16 @@ pub struct Il2Cpp {
     /// through `__got` stubs — turns `fn_4a58bac` chains into
     /// `___cxa_throw`-style identifications with zero guessing.
     pub bind_symbols: HashMap<u64, String>,
+    /// RVA → name of DEFINED `__cxa`-family functions inside the image.
+    /// Android .so files statically link libc++, so `__cxa_throw` is an export
+    /// of this binary rather than an import with a PLT stub: raise helpers
+    /// `BL` it directly and no bind table names the target. This map lets the
+    /// raise classifier recognise those terminals by symbol-table name.
+    pub cxa_func_rvas: HashMap<u64, String>,
+    /// GOT VA → addend for RELATIVE relocations. The addend is the static
+    /// field storage address in .bss/.data. Used by recovery to resolve
+    /// `*(nint*)(GOT_VA + offset)` patterns to named static fields.
+    pub got_relative_relocations: HashMap<u64, u64>,
     pub codm: bool,
     pub type_definition_sizes: Vec<Il2CppTypeDefinitionSizes>,
     /// Arrays that were skipped because their count cannot exist in the image.
@@ -299,6 +358,8 @@ impl Il2Cpp {
             exported_symbols: Vec::new(),
             api_export_rvas: HashMap::new(),
             bind_symbols: HashMap::new(),
+            cxa_func_rvas: HashMap::new(),
+            got_relative_relocations: HashMap::new(),
             codm: false,
             type_definition_sizes: Vec::new(),
             rejected_arrays: Vec::new(),
@@ -339,19 +400,28 @@ impl Il2Cpp {
             field_offsets_are_pointers: elf.field_offsets_are_pointers,
             type_dic: elf.type_dic.clone(),
             eh_tables: crate::recovery::exceptions::EhTables::None, // filled by init_elf
-            va_segments: elf.segments.iter().map(|s| VaSegment {
-                vaddr: s.p_vaddr,
-                memsz: s.p_memsz,
-                offset: s.p_offset,
-            }).collect(),
-            data_sections: elf.segments.iter().filter(|s| {
-                s.p_memsz != 0 && matches!(s.p_flags, 2 | 4 | 6)
-            }).map(|s| SearchSection::new(
-                s.p_offset,
-                s.p_offset + s.p_filesz,
-                s.p_vaddr,
-                s.p_vaddr + s.p_memsz,
-            )).collect(),
+            va_segments: elf
+                .segments
+                .iter()
+                .map(|s| VaSegment {
+                    vaddr: s.p_vaddr,
+                    memsz: s.p_memsz,
+                    offset: s.p_offset,
+                })
+                .collect(),
+            data_sections: elf
+                .segments
+                .iter()
+                .filter(|s| s.p_memsz != 0 && matches!(s.p_flags, 2 | 4 | 6))
+                .map(|s| {
+                    SearchSection::new(
+                        s.p_offset,
+                        s.p_offset + s.p_filesz,
+                        s.p_vaddr,
+                        s.p_vaddr + s.p_memsz,
+                    )
+                })
+                .collect(),
             rgctxs_dictionary: elf.rgctxs_dictionary.clone(),
             is_pe: false,
             reverse_pinvoke_wrappers: Vec::new(),
@@ -361,6 +431,8 @@ impl Il2Cpp {
             exported_symbols: Vec::new(),
             api_export_rvas: HashMap::new(),
             bind_symbols: HashMap::new(),
+            cxa_func_rvas: HashMap::new(),
+            got_relative_relocations: elf.got_relative_relocations.clone(),
             codm: elf.codm_diag,
             type_definition_sizes: elf.type_definition_sizes.clone(),
             rejected_arrays: Vec::new(),
@@ -376,22 +448,27 @@ impl Il2Cpp {
     ) -> Result<()> {
         let orig_version = self.stream.version;
         let limit = auto_plus_count_limit(is_wasm);
-        let cr = match refine_code_registration(
-            &mut self.stream,
-            code_registration,
-            map_vatr,
-            limit,
-        ) {
-            Ok(c) => c,
-            Err(_) => code_registration,
-        };
+        let cr =
+            match refine_code_registration(&mut self.stream, code_registration, map_vatr, limit) {
+                Ok(c) => c,
+                Err(_) => code_registration,
+            };
         self.version = self.stream.version;
 
         // The address the version heuristics hand back is only trusted while a
         // real `Il2CppCodeRegistration` can be sitting there. A heuristic can
         // shift the address onto the wrong field — which reads a *pointer* as a
         // *count*, and a single impossible count used to fail the whole run.
-        let cr = self.resolve_code_registration(cr, map_vatr);
+        // FF MAX ships the 31.1 code-registration layout while the metadata
+        // says 31; without this the module arrays read as (0,0) and every
+        // method pointer becomes -1 (see ffmax-static-dump-31.1-notes.md).
+        // The witness runs BEFORE resolution: resolving under the wrong 31.0
+        // layout is what emitted the harmless-but-alarming "does not look like
+        // a valid struct" warning, and the witness already proves the base.
+        let cr = match self.upgrade_v31_1_by_module_witness(cr, map_vatr) {
+            Some(adopted) => adopted,
+            None => self.resolve_code_registration(cr, map_vatr),
+        };
 
         let result = match self.init(cr, metadata_registration, map_vatr) {
             Ok(()) => Ok(()),
@@ -420,19 +497,15 @@ impl Il2Cpp {
         self.stream.is_32bit = self.is_32bit;
         self.version = self.stream.version;
 
-
         let mr_offset = self.resolve_metadata_registration(metadata_registration, map_vatr)?;
         let mr = {
             self.stream.set_position(mr_offset);
             Il2CppMetadataRegistration::read(&mut self.stream, self.version)?
         };
 
-
-
         let types_offset = map_vatr(mr.types)?;
         self.stream.set_position(types_offset);
         let type_ptrs = self.stream.read_ptr_array_inline(mr.types_count as usize)?;
-
 
         self.types.clear();
         self.type_dic.clear();
@@ -466,7 +539,12 @@ impl Il2Cpp {
                 self.types.push(t);
                 self.type_dic.insert(*ptr, idx);
             } else {
-                let t_offset = map_vatr(*ptr).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("type[{}] ptr=0x{:x}: {}", idx, ptr, e)))?;
+                let t_offset = map_vatr(*ptr).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("type[{}] ptr=0x{:x}: {}", idx, ptr, e),
+                    )
+                })?;
                 self.stream.set_position(t_offset);
                 let mut t = Il2CppType::read(&mut self.stream)?;
                 if self.codm {
@@ -479,13 +557,15 @@ impl Il2Cpp {
             }
         }
         if tolerant {
-            eprintln!("[CODM] init_codm decoded {} of {} Il2CppType entries (skipped {})",
-                decoded, type_ptrs.len(), skipped);
+            eprintln!(
+                "[CODM] init_codm decoded {} of {} Il2CppType entries (skipped {})",
+                decoded,
+                type_ptrs.len(),
+                skipped
+            );
         }
 
-
         if mr.generic_insts_count > 0 {
-
             self.generic_inst_pointers = self.read_ptr_array_at(
                 "genericInsts",
                 mr.generic_insts,
@@ -502,38 +582,34 @@ impl Il2Cpp {
                     Err(_) => break,
                 }
             }
-
         }
 
         if mr.method_specs_count > 0 && mr.method_specs > 0 {
-
             let ms_offset = map_vatr(mr.method_specs)?;
             self.stream.set_position(ms_offset);
             self.method_specs.clear();
             for _ in 0..mr.method_specs_count {
-                self.method_specs.push(Il2CppMethodSpec::read(&mut self.stream)?);
+                self.method_specs
+                    .push(Il2CppMethodSpec::read(&mut self.stream)?);
             }
-
         }
 
         if mr.generic_method_table > 0 && mr.generic_method_table_count > 0 {
-
             let gmt_offset = map_vatr(mr.generic_method_table)?;
             self.stream.set_position(gmt_offset);
             self.generic_method_table.clear();
             for _ in 0..mr.generic_method_table_count {
-                self.generic_method_table.push(
-                    Il2CppGenericMethodFunctionsDefinitions::read(&mut self.stream, self.version)?
-                );
+                self.generic_method_table
+                    .push(Il2CppGenericMethodFunctionsDefinitions::read(
+                        &mut self.stream,
+                        self.version,
+                    )?);
             }
-
         }
-
 
         let cr_offset = map_vatr(code_registration)?;
         self.stream.set_position(cr_offset);
         let cr = Il2CppCodeRegistration::read(&mut self.stream, self.version)?;
-
 
         if self.codm {
             if cr.method_pointers > 0 && cr.method_pointers_count > 0 {
@@ -563,7 +639,10 @@ impl Il2Cpp {
                 );
             }
 
-            if self.version < 27.0 && cr.custom_attribute_generators > 0 && cr.custom_attribute_count > 0 {
+            if self.version < 27.0
+                && cr.custom_attribute_generators > 0
+                && cr.custom_attribute_count > 0
+            {
                 self.custom_attribute_generators = self.read_ptr_array_at(
                     "customAttributeGenerators",
                     cr.custom_attribute_generators,
@@ -586,8 +665,11 @@ impl Il2Cpp {
                 match map_vatr(mr.field_offsets) {
                     Ok(fo_offset) => {
                         if self.field_offsets_are_pointers {
-                            self.field_offset_pointers =
-                                self.read_ptr_array_field("fieldOffsets", fo_offset, mr.field_offsets_count);
+                            self.field_offset_pointers = self.read_ptr_array_field(
+                                "fieldOffsets",
+                                fo_offset,
+                                mr.field_offsets_count,
+                            );
                         } else if let Ok(n) = checked_array_len(
                             mr.field_offsets_count,
                             4,
@@ -604,9 +686,12 @@ impl Il2Cpp {
                             }
                             self.field_offsets = vec![raw];
                         } else {
-                            eprintln!("[WARN] field_offsets_count invalid: {}", mr.field_offsets_count);
+                            eprintln!(
+                                "[WARN] field_offsets_count invalid: {}",
+                                mr.field_offsets_count
+                            );
                         }
-                    },
+                    }
                     Err(e) => eprintln!("[WARN] Failed to map field_offsets: {e}"),
                 }
             }
@@ -659,7 +744,10 @@ impl Il2Cpp {
                 );
             }
 
-            if self.version < 27.0 && cr.custom_attribute_generators > 0 && cr.custom_attribute_count > 0 {
+            if self.version < 27.0
+                && cr.custom_attribute_generators > 0
+                && cr.custom_attribute_count > 0
+            {
                 self.custom_attribute_generators = self.read_ptr_array_at(
                     "customAttributeGenerators",
                     cr.custom_attribute_generators,
@@ -681,8 +769,11 @@ impl Il2Cpp {
             if mr.field_offsets > 0 && mr.field_offsets_count > 0 {
                 let fo_offset = map_vatr(mr.field_offsets)?;
                 if self.field_offsets_are_pointers {
-                    self.field_offset_pointers =
-                        self.read_ptr_array_field("fieldOffsets", fo_offset, mr.field_offsets_count);
+                    self.field_offset_pointers = self.read_ptr_array_field(
+                        "fieldOffsets",
+                        fo_offset,
+                        mr.field_offsets_count,
+                    );
                 } else {
                     match checked_array_len(
                         mr.field_offsets_count,
@@ -722,15 +813,13 @@ impl Il2Cpp {
                     .iter()
                     .map(|&ptr| if ptr == 0 { None } else { map_vatr(ptr).ok() })
                     .collect();
-                self.type_definition_sizes =
-                    read_type_definition_sizes(&mut self.stream, &mapped);
+                self.type_definition_sizes = read_type_definition_sizes(&mut self.stream, &mapped);
             }
         }
 
         self.build_method_spec_lookup();
 
         if self.version >= 24.2 {
-
             self.load_code_gen_modules(&cr, map_vatr)?;
 
             // A raw memory dump can hold its registrations in memory the ELF
@@ -743,14 +832,10 @@ impl Il2Cpp {
                 let names = self.image_names.clone();
                 let n = self.locate_code_gen_modules_in_dump(&names);
                 if n > 0 {
-                    eprintln!(
-                        "Located {n} code-gen modules by name in the dump's runtime region"
-                    );
+                    eprintln!("Located {n} code-gen modules by name in the dump's runtime region");
                 }
             }
-
         }
-
 
         Ok(())
     }
@@ -762,7 +847,12 @@ impl Il2Cpp {
     /// `rejected_arrays`, the array is skipped, and the rest of the run — every
     /// type, method and field — is still recovered. When the registration is
     /// right this never fires.
-    fn read_ptr_array_field(&mut self, field: &'static str, mapped_offset: u64, count: u64) -> Vec<u64> {
+    fn read_ptr_array_field(
+        &mut self,
+        field: &'static str,
+        mapped_offset: u64,
+        count: u64,
+    ) -> Vec<u64> {
         if count == 0 {
             return Vec::new();
         }
@@ -848,7 +938,9 @@ impl Il2Cpp {
         stream.set_position(start);
         let mut live = 0u32;
         for _ in 0..n {
-            let Ok(p) = stream.read_ptr() else { return false };
+            let Ok(p) = stream.read_ptr() else {
+                return false;
+            };
             if p == 0 {
                 continue;
             }
@@ -883,7 +975,14 @@ impl Il2Cpp {
                 continue;
             }
             let Ok(off) = map_vatr(addr) else { continue };
-            if Self::sample_looks_like_pointers(&mut self.stream, map_vatr, off, count, ptr_size, file_len) {
+            if Self::sample_looks_like_pointers(
+                &mut self.stream,
+                map_vatr,
+                off,
+                count,
+                ptr_size,
+                file_len,
+            ) {
                 score += 1;
             }
         }
@@ -904,13 +1003,23 @@ impl Il2Cpp {
             (cr.method_pointers, cr.method_pointers_count),
             (cr.generic_method_pointers, cr.generic_method_pointers_count),
             (cr.invoker_pointers, cr.invoker_pointers_count),
-            (cr.reverse_pinvoke_wrappers, cr.reverse_pinvoke_wrapper_count),
+            (
+                cr.reverse_pinvoke_wrappers,
+                cr.reverse_pinvoke_wrapper_count,
+            ),
         ] {
             if addr == 0 || count == 0 {
                 continue;
             }
             let Ok(off) = map_vatr(addr) else { continue };
-            if Self::sample_looks_like_pointers(&mut self.stream, map_vatr, off, count, ptr_size, file_len) {
+            if Self::sample_looks_like_pointers(
+                &mut self.stream,
+                map_vatr,
+                off,
+                count,
+                ptr_size,
+                file_len,
+            ) {
                 score += 1;
             }
         }
@@ -964,7 +1073,8 @@ impl Il2Cpp {
                     let better = match best {
                         None => true,
                         Some((best_score, best_shift, _)) => {
-                            score > best_score || (score == best_score && shift.abs() < best_shift.abs())
+                            score > best_score
+                                || (score == best_score && shift.abs() < best_shift.abs())
                         }
                     };
                     if better {
@@ -973,9 +1083,14 @@ impl Il2Cpp {
                 }
                 None => {
                     if first_reason.is_empty() {
-                        first_reason = metadata_registration_plausibility(&mr, self.version, ptr_size, file_len)
-                            .err()
-                            .unwrap_or_default();
+                        first_reason = metadata_registration_plausibility(
+                            &mr,
+                            self.version,
+                            ptr_size,
+                            file_len,
+                        )
+                        .err()
+                        .unwrap_or_default();
                     }
                 }
             }
@@ -1004,6 +1119,93 @@ impl Il2Cpp {
 
     /// The CodeRegistration twin of `resolve_metadata_registration`, applied to
     /// the address the version heuristics produced.
+    /// Exact-ish witness for the FF MAX-style v31.1 layout (see
+    /// `ffmax-static-dump-31.1-notes.md` §8.1). Metadata only says "31", and
+    /// the 31.0 layout reads the codeGenModules pair two slots early — at the
+    /// true 31.1 base that yields `(0, 0)` and every method becomes -1.
+    ///
+    /// Under 31.1 the module count is the metadata image count; when the image
+    /// count is not known yet (it is populated after init in most formats) the
+    /// silent-failure signature itself is the witness: the 31.0 view has
+    /// `codeGenModulesCount == 0` and the 31.1 view has a small non-zero count
+    /// whose array is an in-image pointer array. The address is kept; only the
+    /// version is upgraded before `init` reads the module arrays.
+    fn upgrade_v31_1_by_module_witness(
+        &mut self,
+        code_registration: u64,
+        map_vatr: &dyn Fn(u64) -> Result<u64>,
+    ) -> Option<u64> {
+        if self.stream.version != 31.0 {
+            return None;
+        }
+        let ptr = self.stream.pointer_size() as u64;
+        let f310 = Il2CppCodeRegistration::field_count(31.0) as u64;
+        let f311 = Il2CppCodeRegistration::field_count(31.1) as u64;
+        let dbg = std::env::var("ILR_31DBG").is_ok();
+        // Try the resolved base first, then the layout shifts that separate the
+        // 31.0 and 31.1 views of the same words (the pair is two slots wide).
+        for slots in [0i64, -2, 2, -1, 1] {
+            let cand = if slots >= 0 {
+                code_registration.saturating_add(slots as u64 * ptr)
+            } else {
+                code_registration.saturating_sub(slots.unsigned_abs() * ptr)
+            };
+            let read_slot = |stream: &mut BinaryStream, addr: u64| -> Result<u64> {
+                stream.set_position(map_vatr(addr)?);
+                stream.read_ptr()
+            };
+            let Ok(count310) =
+                read_slot(&mut self.stream, cand + (f310 - 2) * ptr)
+            else {
+                continue;
+            };
+            let Ok(count311) =
+                read_slot(&mut self.stream, cand + (f311 - 2) * ptr)
+            else {
+                continue;
+            };
+            if !v31_1_module_witness(self.image_names.len() as u64, count310, count311) {
+                if dbg {
+                    eprintln!(
+                        "[31dbg] cand={cand:#x} slots={slots} img={} c310={count310} c311={count311} rejected",
+                        self.image_names.len()
+                    );
+                }
+                continue;
+            }
+            let Ok(modules) =
+                read_slot(&mut self.stream, cand + (f311 - 1) * ptr)
+            else {
+                continue;
+            };
+            if modules == 0 {
+                continue;
+            }
+            let mut ok = true;
+            for k in 0..3u64.min(count311) {
+                match read_slot(&mut self.stream, modules + k * ptr) {
+                    Ok(p) if p != 0 && map_vatr(p).is_ok() => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            self.stream.version = 31.1;
+            crate::output::note("Detected il2cpp version 31.1 (codeGenModules witness)");
+            if dbg {
+                eprintln!(
+                    "[31dbg] ACCEPT cand={cand:#x} slots={slots} c310={count310} c311={count311} modules={modules:#x}"
+                );
+            }
+            return Some(cand);
+        }
+        None
+    }
+
     fn resolve_code_registration(
         &mut self,
         address: u64,
@@ -1029,7 +1231,8 @@ impl Il2Cpp {
                     let better = match best {
                         None => true,
                         Some((best_score, best_shift, _)) => {
-                            score > best_score || (score == best_score && shift.abs() < best_shift.abs())
+                            score > best_score
+                                || (score == best_score && shift.abs() < best_shift.abs())
                         }
                     };
                     if better {
@@ -1038,9 +1241,10 @@ impl Il2Cpp {
                 }
                 None => {
                     if first_reason.is_empty() {
-                        first_reason = code_registration_plausibility(&cr, self.version, ptr_size, file_len)
-                            .err()
-                            .unwrap_or_default();
+                        first_reason =
+                            code_registration_plausibility(&cr, self.version, ptr_size, file_len)
+                                .err()
+                                .unwrap_or_default();
                     }
                 }
             }
@@ -1110,8 +1314,10 @@ impl Il2Cpp {
 
                 let method_idx = table.indices.method_index as usize;
                 if method_idx < self.generic_method_pointers.len() {
-                    self.method_spec_generic_method_pointers
-                        .insert(table.generic_method_index as usize, self.generic_method_pointers[method_idx]);
+                    self.method_spec_generic_method_pointers.insert(
+                        table.generic_method_index as usize,
+                        self.generic_method_pointers[method_idx],
+                    );
                 }
             }
             let _ = table_idx;
@@ -1131,22 +1337,25 @@ impl Il2Cpp {
             return 0;
         }
         let base = self.image_base;
-        let located = crate::il2cpp::dump_scan::locate_modules_by_name(
-            self.stream.data(),
-            base,
-            names,
-        );
+        let located =
+            crate::il2cpp::dump_scan::locate_modules_by_name(self.stream.data(), base, names);
         let mut accepted = 0usize;
         for module in located {
-            let Some(offset) = module.method_pointers.checked_sub(base) else { continue };
+            let Some(offset) = module.method_pointers.checked_sub(base) else {
+                continue;
+            };
             if offset + 8 > self.stream.len() {
                 continue;
             }
             self.stream.set_position(offset);
-            let Ok(ptrs) = self.stream.read_ptr_array_inline(module.method_pointer_count as usize) else {
+            let Ok(ptrs) = self
+                .stream
+                .read_ptr_array_inline(module.method_pointer_count as usize)
+            else {
                 continue;
             };
-            self.code_gen_module_method_pointers.insert(module.name.clone(), ptrs);
+            self.code_gen_module_method_pointers
+                .insert(module.name.clone(), ptrs);
             accepted += 1;
         }
         accepted
@@ -1162,7 +1371,9 @@ impl Il2Cpp {
         }
 
         let modules_offset = map_vatr(cr.code_gen_modules)?;
-        let module_ptrs = self.stream.read_ptr_array(modules_offset, cr.code_gen_modules_count as usize)?;
+        let module_ptrs = self
+            .stream
+            .read_ptr_array(modules_offset, cr.code_gen_modules_count as usize)?;
 
         for ptr in module_ptrs {
             let mod_offset = map_vatr(ptr)?;
@@ -1174,7 +1385,10 @@ impl Il2Cpp {
 
             let method_ptrs = if module.method_pointers > 0 && module.method_pointer_count > 0 {
                 let mp_offset = map_vatr(module.method_pointers)?;
-                match self.stream.read_ptr_array(mp_offset, module.method_pointer_count as usize) {
+                match self
+                    .stream
+                    .read_ptr_array(mp_offset, module.method_pointer_count as usize)
+                {
                     Ok(v) => v,
                     Err(_) => {
                         let n = module.method_pointer_count as u64;
@@ -1190,7 +1404,8 @@ impl Il2Cpp {
                 Vec::new()
             };
 
-            self.code_gen_module_method_pointers.insert(module_name.clone(), method_ptrs);
+            self.code_gen_module_method_pointers
+                .insert(module_name.clone(), method_ptrs);
             self.code_gen_modules.insert(module_name, module);
         }
 
@@ -1289,7 +1504,10 @@ impl Il2Cpp {
         Ok(Il2CppGenericClass {
             type_definition_index,
             type_ptr,
-            context: Il2CppGenericContext { class_inst, method_inst },
+            context: Il2CppGenericContext {
+                class_inst,
+                method_inst,
+            },
             cached_class,
         })
     }
@@ -1328,7 +1546,9 @@ impl Il2Cpp {
     }
 
     pub fn get_il2cpp_type(&self, pointer: u64) -> Option<&Il2CppType> {
-        self.type_dic.get(&pointer).and_then(|idx| self.types.get(*idx))
+        self.type_dic
+            .get(&pointer)
+            .and_then(|idx| self.types.get(*idx))
     }
 
     pub fn map_vatr(&self, addr: u64) -> Result<u64> {
@@ -1623,8 +1843,10 @@ mod tests {
         let mut buf = vec![0u8; 0x400];
         // Two size structs: {instance 16, native -1, static 8, thread 0} and
         // {instance 40, native -1, static 0, thread 24}.
-        buf[0x300..0x310].copy_from_slice(&[16, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0, 0, 0, 0, 0, 0, 0]);
-        buf[0x310..0x320].copy_from_slice(&[40, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 24, 0, 0, 0]);
+        buf[0x300..0x310]
+            .copy_from_slice(&[16, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0, 0, 0, 0, 0, 0, 0]);
+        buf[0x310..0x320]
+            .copy_from_slice(&[40, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 24, 0, 0, 0]);
         // The pointer array the metadata registration names, plus one null slot.
         put_u64(&mut buf, 0x200, 0x300);
         put_u64(&mut buf, 0x208, 0x310);
@@ -1649,7 +1871,8 @@ mod tests {
     #[test]
     fn reading_the_pointer_table_as_structs_is_visibly_wrong() {
         let mut buf = vec![0u8; 0x400];
-        buf[0x300..0x310].copy_from_slice(&[16, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0, 0, 0, 0, 0, 0, 0]);
+        buf[0x300..0x310]
+            .copy_from_slice(&[16, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0, 0, 0, 0, 0, 0, 0]);
         put_u64(&mut buf, 0x200, 0x300);
 
         let mut stream = BinaryStream::new(buf.clone());
@@ -1674,14 +1897,71 @@ mod tests {
         put_u64(&mut buf, 8, 0x90);
         let identity = |a: u64| Ok(a);
         let mut stream = BinaryStream::new(buf);
-        assert!(Il2Cpp::sample_looks_like_pointers(&mut stream, &identity, 0, 2, 8, 0x100));
+        assert!(Il2Cpp::sample_looks_like_pointers(
+            &mut stream,
+            &identity,
+            0,
+            2,
+            8,
+            0x100
+        ));
         // All-zero table: no evidence either way, so it is not a negative.
         let mut zero = BinaryStream::new(vec![0u8; 0x100]);
-        assert!(!Il2Cpp::sample_looks_like_pointers(&mut zero, &identity, 0, 2, 8, 0x100));
+        assert!(!Il2Cpp::sample_looks_like_pointers(
+            &mut zero, &identity, 0, 2, 8, 0x100
+        ));
         // A pointer past the end of the image can never be real.
         let mut wild = vec![0u8; 0x100];
         put_u64(&mut wild, 0, 0x1000_0000);
         let mut stream = BinaryStream::new(wild);
-        assert!(!Il2Cpp::sample_looks_like_pointers(&mut stream, &identity, 0, 1, 8, 0x100));
+        assert!(!Il2Cpp::sample_looks_like_pointers(
+            &mut stream,
+            &identity,
+            0,
+            1,
+            8,
+            0x100
+        ));
+    }
+}
+
+/// The witness predicate behind [`Il2Cpp::upgrade_v31_1_by_module_witness`].
+///
+/// With a known image count the 31.1 `codeGenModulesCount` must equal it
+/// exactly (FF MAX: 57) and the 31.0 view must differ. Without it, only the
+/// silent-failure signature is accepted: the 31.0 view sees 0 modules where a
+/// real image (v24.2+) always has at least one, and the 31.1 view sees a small
+/// non-zero count whose array is validated by the caller.
+fn v31_1_module_witness(image_count: u64, count310: u64, count311: u64) -> bool {
+    if image_count > 0 {
+        count310 != image_count && count311 == image_count
+    } else {
+        count310 == 0 && count311 > 0 && count311 <= 1024
+    }
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::v31_1_module_witness;
+
+    #[test]
+    fn ffmax_witness_upgrades() {
+        // image_count = 57, 31.0 view reads the WNF count (0), 31.1 the
+        // module count (57). Raw words: notes §1/§2.
+        assert!(v31_1_module_witness(57, 0, 57));
+    }
+
+    #[test]
+    fn a_true_31_0_registration_is_not_upgraded() {
+        assert!(!v31_1_module_witness(57, 57, 0));
+        assert!(!v31_1_module_witness(57, 57, 58));
+    }
+
+    #[test]
+    fn unknown_image_count_requires_the_silent_failure_signature() {
+        assert!(v31_1_module_witness(0, 0, 57));
+        assert!(!v31_1_module_witness(0, 5, 57));
+        assert!(!v31_1_module_witness(0, 0, 0));
+        assert!(!v31_1_module_witness(0, 0, 4096));
     }
 }

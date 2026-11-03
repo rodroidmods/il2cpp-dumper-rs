@@ -52,7 +52,8 @@ fn i32_at(data: &[u8], at: usize) -> Option<i32> {
 }
 
 fn u16_at(data: &[u8], at: usize) -> Option<u16> {
-    data.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    data.get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
 #[derive(Default)]
@@ -117,7 +118,9 @@ fn score_stride(
     for i in 0..count {
         let at = base + i * stride;
         let Some(name) = u32_at(data, at) else { break };
-        let Some(decl) = i32_at(data, at + 4) else { break };
+        let Some(decl) = i32_at(data, at + 4) else {
+            break;
+        };
         s.count += 1;
 
         let name_at = str_base.saturating_add(name as usize);
@@ -203,10 +206,15 @@ pub fn detect_method_stride(
         let better = match &best {
             None => true,
             Some((best_stride, best_score, best_ok)) => {
-                let best_rank = (*best_ok, best_score.name_fraction() + best_score.decl_fraction());
+                let best_rank = (
+                    *best_ok,
+                    best_score.name_fraction() + best_score.decl_fraction(),
+                );
                 let this_rank = (ok, s.name_fraction() + s.decl_fraction());
                 this_rank > best_rank
-                    || (this_rank == best_rank && stride == declared_stride && *best_stride != declared_stride)
+                    || (this_rank == best_rank
+                        && stride == declared_stride
+                        && *best_stride != declared_stride)
             }
         };
         if better {
@@ -219,9 +227,7 @@ pub fn detect_method_stride(
             stride: declared_stride,
             declared: declared_stride,
             accepted: false,
-            reason: format!(
-                "no candidate stride divides the {methods_size}-byte methods section"
-            ),
+            reason: format!("no candidate stride divides the {methods_size}-byte methods section"),
         },
         Some((stride, score, ok)) if ok && stride != declared_stride => MethodLayout {
             stride,

@@ -37,12 +37,28 @@ pub struct Cfg {
 impl Cfg {
     /// Build blocks; `rva_to_index` maps branch-target RVAs → instruction idx.
     pub fn build(insns: &mut [Insn], addresses: &[u64]) -> Option<Cfg> {
+        Self::build_with_landing_pads(insns, addresses, &[])
+    }
+
+    /// As [`Cfg::build`], plus `landing_pads`: RVA starts of EH landing pads.
+    ///
+    /// A pad is a handler entry, not ordinary flow. When its only incoming
+    /// branch is the unreachable trampoline after a noreturn raise
+    /// (`bl raise; b pad`), deleting that branch must not merge the pad into
+    /// the preceding block: EH padding is addressed by RVA, and a pad that
+    /// does not start a block cannot be a handler. Forcing the leader keeps
+    /// the pad a block for the structurer's `region_of_block`/`handler_of`
+    /// mapping while the CFG edge stays gone.
+    pub fn build_with_landing_pads(
+        insns: &mut [Insn],
+        addresses: &[u64],
+        landing_pads: &[u64],
+    ) -> Option<Cfg> {
         // Debug: ILR_CFG_MISS=0xBASE dumps address/index mapping mismatches
         let dbg_miss = match std::env::var("ILR_CFG_MISS").as_deref() {
             Ok("1") => true,
             Ok(v) => insns.first().is_some_and(|i| {
-                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
-                    == Some(i.address)
+                u64::from_str_radix(v.trim_start_matches("0x"), 16).ok() == Some(i.address)
             }),
             Err(_) => false,
         };
@@ -61,11 +77,14 @@ impl Cfg {
             rva_to_index.entry(a).or_insert(i);
         }
         if dbg_miss {
-            eprintln!("[cfg] insns={} addresses={}" , insns.len(), addresses.len());
+            eprintln!("[cfg] insns={} addresses={}", insns.len(), addresses.len());
             for (i, insn) in insns.iter().enumerate() {
                 let ai = addresses.get(i).copied();
                 if ai != Some(insn.address) {
-                    eprintln!("[cfg-mismatch] i{} insn_addr={:#x} arr_addr={:?} op={:?}", i, insn.address, ai, insn.op);
+                    eprintln!(
+                        "[cfg-mismatch] i{} insn_addr={:#x} arr_addr={:?} op={:?}",
+                        i, insn.address, ai, insn.op
+                    );
                 }
             }
         }
@@ -93,12 +112,10 @@ impl Cfg {
             let op = std::mem::replace(&mut insn.op, Op::Move);
             insn.op = match op {
                 Op::Jump(rva) => Op::Jump(
-                    resolve_target(&rva_to_index, &addresses, rva, i)
-                        .unwrap_or(end_sentinel),
+                    resolve_target(&rva_to_index, &addresses, rva, i).unwrap_or(end_sentinel),
                 ),
                 Op::CondJump(rva) => Op::CondJump(
-                    resolve_target(&rva_to_index, &addresses, rva, i)
-                        .unwrap_or(end_sentinel),
+                    resolve_target(&rva_to_index, &addresses, rva, i).unwrap_or(end_sentinel),
                 ),
                 other => other,
             };
@@ -130,6 +147,29 @@ impl Cfg {
             }
         }
 
+        // Handler-entry pads are addressed by RVA, not by an edge. The
+        // unwinder edge is not part of this CFG, and once the unreachable
+        // trampoline branch after a noreturn raise is neutralised a pad can
+        // have no branch target at all. Force the leader at the first
+        // instruction at-or-after the pad (the same slide `resolve_target`
+        // uses) so the pad remains a block the EH mapping can name.
+        for &pad in landing_pads {
+            if pad == 0 {
+                continue;
+            }
+            let mut best: Option<usize> = None;
+            let mut best_addr = u64::MAX;
+            for (i, &a) in addresses.iter().enumerate() {
+                if a >= pad && a < best_addr {
+                    best_addr = a;
+                    best = Some(i);
+                }
+            }
+            if let Some(i) = best {
+                leaders[i] = true;
+            }
+        }
+
         let mut blocks = Vec::new();
         let mut start = 0;
         for i in 1..=insns.len() {
@@ -150,11 +190,14 @@ impl Cfg {
             v
         };
 
-        let valid = |t: usize| -> Option<usize> {
-            block_of.get(t).copied().filter(|&x| x != usize::MAX)
-        };
+        let valid =
+            |t: usize| -> Option<usize> { block_of.get(t).copied().filter(|&x| x != usize::MAX) };
         let fall_of = |b: &Block| -> Option<usize> {
-            if b.end < insns.len() { valid(b.end) } else { None }
+            if b.end < insns.len() {
+                valid(b.end)
+            } else {
+                None
+            }
         };
 
         let mut successors = Vec::with_capacity(blocks.len());
@@ -173,9 +216,11 @@ impl Cfg {
                     // sees them as dead and DCE deletes them.
                     if succ.is_empty() && *t >= end_sentinel {
                         if let Some(fb) = fall_of(b) {
-                            let payload =
-                                &insns[blocks[fb].start..blocks[fb].end];
-                            if payload.iter().any(|i| matches!(i.op, Op::Call | Op::IndirectCall)) {
+                            let payload = &insns[blocks[fb].start..blocks[fb].end];
+                            if payload
+                                .iter()
+                                .any(|i| matches!(i.op, Op::Call | Op::IndirectCall))
+                            {
                                 succ.push(fb);
                             }
                         }
@@ -184,10 +229,7 @@ impl Cfg {
                 }
                 Op::CondJump(t) => {
                     // semantic order: taken, fallthrough
-                    [valid(*t), fall_of(b)]
-                        .into_iter()
-                        .flatten()
-                        .collect()
+                    [valid(*t), fall_of(b)].into_iter().flatten().collect()
                 }
                 Op::Switch(targets) => {
                     // EVERY resolvable case target, in target order. Duplicate

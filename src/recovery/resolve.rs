@@ -17,8 +17,8 @@
 
 use super::ir::{Insn, Op, Operand};
 use super::locals::LocalTable;
-use super::types::{FieldRef, ManagedType, MethodRef, MethodSigInfo};
-use std::collections::HashMap;
+use super::types::{FieldRef, ManagedType, MethodRef, MethodSigInfo, NamedType, PrimKind};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,6 +28,17 @@ pub struct ResolveMaps {
     pub methods_by_rva: HashMap<u64, MethodRef>,
     /// metadata-usage / literal-slot address → string-literal index
     pub literal_index_by_addr: HashMap<u64, u32>,
+    /// Address of a POINTER TO a literal slot → the same string-literal index.
+    ///
+    /// Where the literal table is not addressed directly the toolchain reaches
+    /// a literal through a relocated pointer: `ldr x8,[slot]` loads the ADDRESS
+    /// of the encoded word and the next load reads the word. The scan records
+    /// the word's own address, so a site that goes through the pointer never
+    /// resolved and the load was typed as the declaring class's klass —
+    /// `return typeof(PotionsManager)` where `"icon_disabled_1"` belongs
+    /// (`GetPotionIconName` @0x1990BCC). In the v108 build 19,435 of the 19,252
+    /// literal words are reachable this way, so this is the common case.
+    pub literal_ptr_index_by_addr: HashMap<u64, u32>,
     pub literals: HashMap<u32, String>,
     /// metadata-usage slot address → `MethodSpec` index (MethodRef usages).
     /// The slot holds the concrete instantiation of a generic method — what a
@@ -79,6 +90,16 @@ pub struct ResolveMaps {
     pub vtable_slots: HashMap<(i32, usize), MethodRef>,
     /// klass pointer RVA → TypeDef index
     pub klass_to_tdi: HashMap<u64, i32>,
+    /// metadata-usage slot RVA → the FULL managed type the slot names.
+    ///
+    /// `klass_to_tdi` only covers named class/value-type/generic-instantiation
+    /// slots, because that is what field/vtable resolution needs. The renderer
+    /// needs the rest: `SzArray` slots (`il2cpp_array_new_specific` takes the
+    /// ARRAY class), primitives (`typeof(int)`), and generic instantiations
+    /// without a TypeDef. Without this map every such slot fell through to
+    /// `void*.ptr_0x…`, which is why 1,259 of 1,316 array allocations had no
+    /// element type and ~3.3k type comparisons read a raw pointer.
+    pub usage_type_by_addr: HashMap<u64, ManagedType>,
     /// TypeDef index → (namespace, name) for klass slots seen in usages —
     /// lets key_function_recovery type NewObj without a metadata callback
     pub tdi_names: HashMap<i32, (String, String)>,
@@ -98,6 +119,110 @@ pub struct ResolveMaps {
     /// name + signature (positional ABI trimming becomes safe once the call
     /// is rendered through the signature).
     pub native_wrappers: HashMap<u64, Vec<MethodRef>>,
+    /// Pre-computed instance field layouts: `(tdi, byte_offset) → (field_name, declaring_type_name)`.
+    /// Populated during `RecoveryContext` construction from the metadata's type/field defs.
+    /// Used by the post-hoc field annotation pass to resolve `RawDeref` to `Field`.
+    pub field_layouts: HashMap<(i32, i64), (String, String)>,
+    /// Pre-computed instance field types: `(tdi, byte_offset) → field_type_tdi`.
+    /// Populated alongside `field_layouts`. Used by the pointer chain resolution
+    /// in the field annotation pass to resolve multi-level dereference chains
+    /// (e.g. `*(nint*)(*(nint*)(obj +16) +8)` → `obj.Field1.Field2`).
+    pub field_types: HashMap<(i32, i64), i32>,
+    /// `(tdi, byte_offset) → declared access width` for instance fields whose
+    /// width is unambiguous (primitives, enums, references). A store may only
+    /// be named as this field when the access width matches; a `ValueType`
+    /// struct field is deliberately absent (a narrower store would be writing
+    /// a sub-field, not the struct).
+    pub field_widths: HashMap<(i32, i64), u8>,
+    /// Pre-computed static field layouts: `global_VA → (field_name, type_name)`.
+    /// Populated from `field_index_by_addr` (metadata-usage slot addresses) during
+    /// `RecoveryContext` construction. Used by the post-hoc field annotation pass
+    /// to resolve `RawDeref(Int(base), offset, _)` to `StaticField(type, field)`.
+    pub static_field_layouts: HashMap<u64, (String, String)>,
+    /// Type display name → byte size, for array-element stride checks.
+    ///
+    /// Arrays used to sugar element accesses only for the built-in element
+    /// names (`object`, `string`, `int`, …); a `MyClass[]` or `MyStruct[]`
+    /// element store was refused because an arbitrary name could be a struct
+    /// of any size. Metadata knows the answer: references are pointer-sized,
+    /// value types have an `instance_size`. Short names are kept only when
+    /// unambiguous; full `Namespace.Name` keys are always present.
+    pub named_type_sizes: HashMap<String, u64>,
+    /// Pre-computed reverse map: `(tdi, field_name) → field_type_tdi`.
+    /// Built once from field_layouts + field_types during RecoveryContext construction.
+    /// Used by pointer chain resolution to look up field types by name.
+    pub field_type_by_name: HashMap<(i32, String), i32>,
+    /// Per-TypeDef instance fields in declaration layout:
+    /// `tdi → [(byte_offset, field_name, declared_type_tdi_or_-1)]`.
+    ///
+    /// Only fields DECLARED by that type (inherited ones live on the parent's
+    /// entry). This is the table the embedded-layout descent needs: an access
+    /// at `obj + 0x1C` where the type has a `HAPI_GeoInfo` field at 0x14 is
+    /// `_geoInfo.id`, and finding that requires the fields' offsets AND their
+    /// declared type indexes, which `field_layouts`/`field_types` cannot be
+    /// scanned by without walking the whole map per query.
+    pub tdi_fields: HashMap<i32, Vec<(i64, String, i32)>>,
+    /// TypeDefs that are VALUE types. The embedded-layout descent may only
+    /// enter a value-type field: a class-typed field's storage holds a
+    /// POINTER, so an offset measured from the outer object can never land
+    /// inside the pointee.
+    pub value_type_tdis: std::collections::HashSet<i32>,
+    /// `(tdi, field_name) → full generic type text` for fields declared as a
+    /// generic INSTANCE (`Dictionary<int, Token>`, `List<object>`). The
+    /// allocation/ctor name from shared generic metadata only carries the
+    /// generic definition with `object` arguments; the field's declared
+    /// instantiation is authoritative for a `new` assigned to it.
+    pub field_generic_text: HashMap<(i32, String), String>,
+    /// TypeDef indices whose type is an INTERFACE. An allocation may not be
+    /// typed as an interface (`new IFoo()` is invalid), so allocation retyping
+    /// refuses these.
+    pub interface_tdis: HashSet<i32>,
+    /// TypeDef parent chains: `tdi → [tdi, parent_tdi, grandparent_tdi, …]`.
+    /// Used by the field annotation pass to walk base-class chains when looking
+    /// up a field at an offset (inherited fields live on the parent's layout).
+    pub type_parent_chains: HashMap<i32, Vec<i32>>,
+    /// Pre-computed enum member names: `tdi → (constant_value → member_name)`.
+    /// Populated during `RecoveryContext` construction for every enum type in
+    /// the metadata. Used by the enum_names reconstruction pass to replace
+    /// integer constants with `EnumType.MemberName` when the context indicates
+    /// an enum type.
+    pub enum_members: HashMap<i32, HashMap<i64, String>>,
+    /// Pre-computed attribute constructor names: `RVA → attribute_type_name`.
+    /// Maps each custom attribute generator function pointer (RVA) to the
+    /// short name of the attribute type it constructs (e.g. "SerializeField",
+    /// "Header", "Tooltip"). Populated during `RecoveryContext` construction
+    /// from `custom_attribute_generators` + `attribute_type_ranges`. Used by
+    /// the attribute recovery pass to recognise attribute constructor calls
+    /// in static initialisers and emit `[AttributeName(args)]` comments.
+    pub attribute_ctor_names: HashMap<u64, String>,
+    /// GOT address → relocation addend. Maps each GOT slot address to the
+    /// value it will point to at runtime (from ELF relocations). Used to
+    /// resolve `*(nint*)(got_base + offset)` patterns to their actual targets.
+    pub got_addend_by_addr: HashMap<u64, u64>,
+    /// Virtual address → method name. Pre-computed from methods_by_rva by
+    /// converting RVAs to VAs. Used for quick lookup during field annotation
+    /// when we have a VA (e.g., from GOT addends) instead of an RVA.
+    pub method_name_by_va: HashMap<u64, (String, String)>,
+    /// Pre-computed static field offsets within the static_fields structure:
+    /// `(type_name, byte_offset) → (field_name, declaring_type_name)`.
+    /// Populated during `RecoveryContext` construction. Used by the field
+    /// annotation pass to resolve `RawDeref(Field(base, "static_fields"), offset)`
+    /// to `StaticField(type_name, field_name)` when the type is known from the
+    /// klass pointer or a variable and the offset matches a static field's position.
+    pub static_field_offsets: HashMap<(String, i64), (String, String)>,
+    /// Declared type of a static field: `(declaring_type_name, field_name) → tdi`.
+    /// Lets pointer-chain resolution continue through `Type.StaticField`
+    /// (`TRWorldInfo.RunnerGame +216`), which previously stopped at the
+    /// static field and left the instance deref raw.
+    pub static_field_types: HashMap<(String, String), i32>,
+    /// Pre-computed reverse of `tdi_names`: `"TypeName"` or `"Namespace.TypeName"` → tdi.
+    /// Built once during `RecoveryContext` construction so that `infer_types_from_stmts`
+    /// does not rebuild it per method (thousands of times).
+    pub tdi_names_reverse: HashMap<String, i32>,
+    /// Pre-computed method name → return type tdi (only when unambiguous).
+    /// Built once during `RecoveryContext` construction so that `infer_types_from_stmts`
+    /// does not rebuild it per method.
+    pub method_return_tdi: HashMap<String, i32>,
 }
 
 #[derive(Debug)]
@@ -146,7 +271,15 @@ pub fn run(insns: &mut [Insn], table: &LocalTable, maps: &ResolveMaps) -> Resolv
     let no_fields = HashMap::new();
     let no_parents = HashMap::new();
     let mut no_owner = |_: u32| -> Option<(String, String, ManagedType)> { None };
-    run_with_fields(insns, table, maps, &no_fields, &mut no_owner, 8, &no_parents)
+    run_with_fields(
+        insns,
+        table,
+        maps,
+        &no_fields,
+        &mut no_owner,
+        8,
+        &no_parents,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,7 +305,7 @@ pub fn run_with_fields(
     // the static-init guard this reads is still intact — `ssa::eliminate` and
     // the optimization loop both dissect it.
     super::runtime_helpers::detect(insns);
-    key_function_recovery(insns, maps, &mut stats);
+    key_function_recovery(insns, maps, field_index_by_addr, &mut stats);
     // AFTER `key_function_recovery`: the call-site evidence this pass needs is
     // the `NewObj(T)` a `.ctor` belongs to, and that op only exists once the
     // allocation call has been recognised. Running it before produced 82
@@ -191,11 +324,17 @@ pub fn run_with_fields(
     recover_abi_arguments(insns, table);
     // Only now, with every call named as precisely as the metadata allows, is
     // the raw ABI argument dump turned into the signature-shaped operand list
-    // the renderer reads.
-    reslice_call_arguments(insns);
+    // the renderer reads. Address-taken cells are excluded from operand
+    // tracing: a callee can write them, so their initialiser is not their
+    // value at a later call site (0x18A3A1C passed 0 instead of the token).
+    let addressed = collect_addressed_locals(insns);
+    reslice_call_arguments(insns, &addressed);
     fuse_constructor_calls(insns, &mut stats);
     resolve_getters(insns, &mut stats);
     rewrite_virtual_calls(insns, table, maps, parents, ptr_size, &mut stats);
+    if std::env::var("ILR_NOIFACE").is_err() {
+        rewrite_interface_invoke_calls(insns, table, maps, parents, &mut stats);
+    }
     stats
 }
 
@@ -206,40 +345,60 @@ pub fn run_with_fields(
 /// example, `GetComponent<Rigidbody>` on a body used by many component types).
 fn refine_component_type_from_store(insns: &mut [Insn]) {
     for i in 0..insns.len() {
-        let Some(Operand::Method(method)) = insns[i].operands.first() else { continue };
-        if !method.name.starts_with("GetComponent<") || !matches!(method.sig.ret, ManagedType::Opaque(_)) {
+        let Some(Operand::Method(method)) = insns[i].operands.first() else {
+            continue;
+        };
+        if !method.name.starts_with("GetComponent<")
+            || !matches!(method.sig.ret, ManagedType::Opaque(_))
+        {
             continue;
         }
         let method_name = method.name.clone();
-        let Some(dst) = insns[i].operands.get(1).and_then(Operand::as_local) else { continue };
+        let Some(dst) = insns[i].operands.get(1).and_then(Operand::as_local) else {
+            continue;
+        };
         let field_type = insns[i + 1..].iter().take(3).find_map(|next| {
-            if !matches!(next.op, Op::Move) { return None; }
+            if !matches!(next.op, Op::Move) {
+                return None;
+            }
             let target = next.operands.first()?;
             let value = next.operands.get(1)?;
-            if value.as_local() != Some(dst) { return None; }
+            if value.as_local() != Some(dst) {
+                return None;
+            }
             match target {
                 Operand::Field(field) => Some(field.field_type.clone()),
                 _ => None,
             }
         });
         let member_receiver_type = insns[i + 1..].iter().take(24).find_map(|next| {
-            if !matches!(next.op, Op::Call) { return None; }
-            let Operand::Method(callee) = next.operands.first()? else { return None };
+            if !matches!(next.op, Op::Call) {
+                return None;
+            }
+            let Operand::Method(callee) = next.operands.first()? else {
+                return None;
+            };
             if !callee.name.starts_with("get_")
                 || next.operands.get(2).and_then(Operand::as_local) != Some(dst)
                 || callee.type_def_index < 0
             {
                 return None;
             }
-            Some(ManagedType::Class(std::sync::Arc::new(super::types::NamedType {
-                namespace: callee.declaring_namespace.clone(),
-                name: callee.declaring_type_name.clone(),
-                assembly: (!callee.assembly.is_empty()).then(|| callee.assembly.clone()),
-                type_def_index: callee.type_def_index,
-            })))
+            Some(ManagedType::Class(std::sync::Arc::new(
+                super::types::NamedType {
+                    namespace: callee.declaring_namespace.clone(),
+                    name: callee.declaring_type_name.clone(),
+                    assembly: (!callee.assembly.is_empty()).then(|| callee.assembly.clone()),
+                    type_def_index: callee.type_def_index,
+                },
+            )))
         });
-        let Some(field_type) = field_type.or(member_receiver_type) else { continue };
-        let ManagedType::Class(nt) = &field_type else { continue };
+        let Some(field_type) = field_type.or(member_receiver_type) else {
+            continue;
+        };
+        let ManagedType::Class(nt) = &field_type else {
+            continue;
+        };
         let concrete_name = format!("GetComponent<{}>", nt.name);
         if let Some(Operand::Method(method)) = insns[i].operands.first_mut() {
             if method.name == method_name {
@@ -251,7 +410,6 @@ fn refine_component_type_from_store(insns: &mut [Insn]) {
 }
 
 // ---------------------------------------------------------------------------
-
 
 /// Static-field resolution: `Move dst, Imm(slot_addr)` where slot_addr is a
 /// FieldInfo metadata-usage → `dst` becomes `Type.field` (ldsfld value or
@@ -271,9 +429,17 @@ fn resolve_static_fields(
         // keeps as `Memory { base: abs, addend: <address> }`. Accepting only
         // `Immediate` left every static-field access on an x64 build unnamed —
         // the v24.5 dump renders them all as `*(nint*)(v0 +9909760)`.
-        let Some(a) = insns[i].operands.get(1).and_then(|s| absolute_address(insns, i, s)) else { continue };
+        let Some(a) = insns[i]
+            .operands
+            .get(1)
+            .and_then(|s| absolute_address(insns, i, s))
+        else {
+            continue;
+        };
         let a = a as i64;
-        let Some(d) = insns[i].dest().and_then(|d| d.as_local()) else { continue };
+        let Some(d) = insns[i].dest().and_then(|d| d.as_local()) else {
+            continue;
+        };
         // An `adrp` page is not an address — the static field's slot is the
         // page PLUS the constant folded in at the use site. Naming the page
         // named a neighbouring field. See `page_base_offset_uses`.
@@ -285,23 +451,38 @@ fn resolve_static_fields(
                 let Some(&fi) = field_index_by_addr.get(&(a.wrapping_add(k) as u64)) else {
                     continue;
                 };
-                let Some((tname, fname, fty)) = field_owner(fi) else { continue };
-                let Some(w) = insns[j].dest().and_then(|x| x.as_local()) else { continue };
+                let Some((tname, fname, fty)) = field_owner(fi) else {
+                    continue;
+                };
+                let Some(w) = insns[j].dest().and_then(|x| x.as_local()) else {
+                    continue;
+                };
                 let addr = insns[j].address;
-                insns[j] = Insn::new(Op::Move, vec![Operand::Local(w), Operand::Field(FieldRef {
-                    type_def_index: -1,
-                    field_index: fi,
-                    name: fname,
-                    declaring_type_name: tname.clone(),
-                    field_type: fty,
-                    is_static: true,
-                })], addr);
+                insns[j] = Insn::new(
+                    Op::Move,
+                    vec![
+                        Operand::Local(w),
+                        Operand::Field(FieldRef {
+                            type_def_index: -1,
+                            field_index: fi,
+                            name: fname,
+                            declaring_type_name: tname.clone(),
+                            field_type: fty,
+                            is_static: true,
+                        }),
+                    ],
+                    addr,
+                );
                 stats.statics_resolved += 1;
             }
             continue;
         }
-        let Some(&fi) = field_index_by_addr.get(&(a as u64)) else { continue };
-        let Some((tname, fname, fty)) = field_owner(fi) else { continue };
+        let Some(&fi) = field_index_by_addr.get(&(a as u64)) else {
+            continue;
+        };
+        let Some((tname, fname, fty)) = field_owner(fi) else {
+            continue;
+        };
         insns[i].operands[1] = Operand::Field(FieldRef {
             type_def_index: -1,
             field_index: fi,
@@ -328,7 +509,9 @@ fn resolve_string_accessors(insns: &mut [Insn], maps: &ResolveMaps, stats: &mut 
         // See `resolve_static_fields`: on x64 the literal slot is loaded
         // RIP-relative, so the address is the `Memory`'s addend and a bare
         // `Immediate` match named no string literal on any PE build.
-        let Some(addr) = absolute_address(insns, i, &src) else { continue };
+        let Some(addr) = absolute_address(insns, i, &src) else {
+            continue;
+        };
         // An `adrp` page is not an address: the literal slot is the page plus
         // the constant folded in at the use site. `StringLiteral` carries the
         // literal VALUE (and sets the destination type to String), so naming
@@ -438,15 +621,23 @@ pub(super) fn spec_loaded_by_call(insns: &[Insn], at: usize, maps: &ResolveMaps)
         if !matches!(insns[k].op, Op::Move) {
             continue;
         }
-        let Some(d) = insns[k].dest().and_then(|x| x.as_local()) else { continue };
-        let Some(src) = insns[k].operands.get(1) else { continue };
+        let Some(d) = insns[k].dest().and_then(|x| x.as_local()) else {
+            continue;
+        };
+        let Some(src) = insns[k].operands.get(1) else {
+            continue;
+        };
         // A page is not an address; adding its folded constant belongs to (1),
         // where a use that feeds this call is evidence of what it passes.
         if is_page_materialization(insns, k) && page_base_offset_uses(insns, k, d).is_some() {
             continue;
         }
-        let Some(addr) = absolute_address(insns, k, src) else { continue };
-        let Some(&spec) = by_addr.get(&addr) else { continue };
+        let Some(addr) = absolute_address(insns, k, src) else {
+            continue;
+        };
+        let Some(&spec) = by_addr.get(&addr) else {
+            continue;
+        };
         if insns[k + 1..at].iter().any(|n| n.use_locals().contains(&d)) {
             continue;
         }
@@ -472,7 +663,9 @@ fn spec_loaded_through_args(
         return None;
     }
     for k in (lo..at).rev() {
-        let Some(d) = insns[k].dest().and_then(|x| x.as_local()) else { continue };
+        let Some(d) = insns[k].dest().and_then(|x| x.as_local()) else {
+            continue;
+        };
         if !want.contains(&d) {
             continue;
         }
@@ -489,7 +682,9 @@ fn spec_loaded_through_args(
             .is_some_and(|l| want.contains(&l))
     };
     for k in (lo..at).rev() {
-        let Some(d) = insns[k].dest().and_then(|x| x.as_local()) else { continue };
+        let Some(d) = insns[k].dest().and_then(|x| x.as_local()) else {
+            continue;
+        };
         if !want.contains(&d) {
             continue;
         }
@@ -654,7 +849,49 @@ fn resolve_call_targets(insns: &mut [Insn], maps: &ResolveMaps, stats: &mut Reso
 /// parameter silently dropped because the arbitrary member took none). Every
 /// pass that reads a call's arguments therefore runs first, `resolve_folded_names`
 /// settles the member, and only then is the list rebuilt.
-fn reslice_call_arguments(insns: &mut [Insn]) {
+/// Every local whose storage is addressed by an operand (`&local`).
+fn collect_addressed_locals(insns: &[Insn]) -> std::collections::HashSet<u32> {
+    fn walk(op: &Operand, out: &mut std::collections::HashSet<u32>) {
+        match op {
+            Operand::AddressOf(inner) => {
+                match inner.as_ref() {
+                    Operand::Local(v) => {
+                        out.insert(*v);
+                    }
+                    Operand::Memory { base, .. } => {
+                        if let Operand::Local(v) = base.as_ref() {
+                            out.insert(*v);
+                        }
+                    }
+                    _ => {}
+                }
+                walk(inner, out);
+            }
+            Operand::ArrayLength(inner) => walk(inner, out),
+            Operand::Memory { base, index, .. } => {
+                walk(base, out);
+                if let Some(i) = index {
+                    walk(i, out);
+                }
+            }
+            Operand::ArrayAccess { array, index } => {
+                walk(array, out);
+                walk(index, out);
+            }
+            Operand::InstanceField { base, .. } => walk(base, out),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for insn in insns {
+        for op in &insn.operands {
+            walk(op, &mut out);
+        }
+    }
+    out
+}
+
+fn reslice_call_arguments(insns: &mut [Insn], addressed: &std::collections::HashSet<u32>) {
     for i in 0..insns.len() {
         if !matches!(insns[i].op, Op::Call) {
             continue;
@@ -677,7 +914,7 @@ fn reslice_call_arguments(insns: &mut [Insn]) {
         let raw: Vec<Option<Operand>> = orig
             .iter()
             .map(|op| {
-                Some(match resolve_through_moves(insns, i, op) {
+                Some(match resolve_through_moves(insns, i, op, Some(addressed)) {
                     // a tracer that gave up, or came back empty-handed, must
                     // never overwrite a live operand
                     None | Some(Operand::Unknown) => op.clone(),
@@ -689,20 +926,31 @@ fn reslice_call_arguments(insns: &mut [Insn]) {
         let mut new_ops = Vec::with_capacity(m.sig.params.len() + 3);
         new_ops.push(Operand::Method(m.clone()));
         // result position (Call only)
-        new_ops.push(insns[i].operands.get(1).cloned().unwrap_or(Operand::Unknown));
+        new_ops.push(
+            insns[i]
+                .operands
+                .get(1)
+                .cloned()
+                .unwrap_or(Operand::Unknown),
+        );
 
         let mut cursor = 0usize;
         if !m.sig.is_static {
             // this = first reference-typed arg register holding a class local.
             // A missing receiver is an ABI fact — mark it, never fake a value.
             let this_op = raw.first().and_then(|o| o.clone());
-            new_ops.push(this_op.unwrap_or_else(|| default_for(
-                &super::types::ManagedType::Class(super::types::NamedType::object()),
-            )));
+            new_ops.push(this_op.unwrap_or_else(|| {
+                default_for(&super::types::ManagedType::Class(
+                    super::types::NamedType::object(),
+                ))
+            }));
             cursor += 1;
         }
         for pty in &m.sig.params {
-            let op = raw.get(cursor).and_then(|o| o.clone()).unwrap_or_else(|| default_for(pty));
+            let op = raw
+                .get(cursor)
+                .and_then(|o| o.clone())
+                .unwrap_or_else(|| default_for(pty));
             new_ops.push(op);
             cursor += 1;
         }
@@ -715,7 +963,12 @@ fn reslice_call_arguments(insns: &mut [Insn]) {
         let sret = insns[i]
             .operands
             .get(super::passes::SRET_OPERAND)
-            .filter(|o| !matches!(o, Operand::Unknown | Operand::MissingAbiArg | Operand::Register(_)))
+            .filter(|o| {
+                !matches!(
+                    o,
+                    Operand::Unknown | Operand::MissingAbiArg | Operand::Register(_)
+                )
+            })
             .cloned();
         super::passes::place_sret(&mut new_ops, sret);
         insns[i].operands = new_ops;
@@ -1106,9 +1359,7 @@ fn carrier_value_at(
             // means the local that really carried the value has the OTHER
             // register's origin, and reading this definition instead hands the
             // call a stale value. Refuse.
-            Some(Operand::Local(w))
-                if local_origin(table, w).is_some_and(is_any_arg_register) =>
-            {
+            Some(Operand::Local(w)) if local_origin(table, w).is_some_and(is_any_arg_register) => {
                 return None;
             }
             Some(src)
@@ -1217,13 +1468,20 @@ fn default_for(t: &super::types::ManagedType) -> Operand {
 }
 
 /// Trace an operand back through Moves to its most-resolved form.
-fn resolve_through_moves(insns: &[Insn], at: usize, op: &Operand) -> Option<Operand> {
+fn resolve_through_moves(
+    insns: &[Insn],
+    at: usize,
+    op: &Operand,
+    addressed: Option<&std::collections::HashSet<u32>>,
+) -> Option<Operand> {
     match op {
         Operand::Register(name) => {
             // trace register defs backwards; follow Moves AND call results
             // (receiver often = result of the preceding managed call)
             for insn in insns[..at].iter().rev().take(96) {
-                let Some(dest) = insn.dest().cloned() else { continue };
+                let Some(dest) = insn.dest().cloned() else {
+                    continue;
+                };
                 match dest {
                     Operand::Local(_) => {}
                     Operand::Register(ref n) if *n == *name => {
@@ -1231,8 +1489,8 @@ fn resolve_through_moves(insns: &[Insn], at: usize, op: &Operand) -> Option<Oper
                             Op::Move => return insn.operands.get(1).cloned(),
                             Op::Call => {
                                 // value produced by the preceding call: KEEP the
-                // register reference — SSA renaming + def-map will inline
-                // the producing call expression at render time.
+                                // register reference — SSA renaming + def-map will inline
+                                // the producing call expression at render time.
                                 return Some(Operand::Register(name.clone()));
                             }
                             _ => return None,
@@ -1244,6 +1502,14 @@ fn resolve_through_moves(insns: &[Insn], at: usize, op: &Operand) -> Option<Oper
             None
         }
         Operand::Local(v) => {
+            // An addressed cell is mutated through its address (an `out`
+            // parameter write). Its last textual definition is NOT its value
+            // at this use: 0x18A3A1C traced `TryGetValue(key, &cell)`'s out
+            // cell back to the `cell = 0` initialiser and passed 0 where the
+            // decoded token belongs.
+            if addressed.is_some_and(|a| a.contains(v)) {
+                return None;
+            }
             for insn in insns[..at].iter().rev().take(96) {
                 if let Some(Operand::Local(dv)) = insn.dest() {
                     if *dv == *v {
@@ -1279,6 +1545,15 @@ fn is_page_materialization(insns: &[Insn], at: usize) -> bool {
 }
 
 /// Does this instruction read local `v` anywhere in its operands?
+///
+/// Every variant is listed EXPLICITLY. The old body ended in `_ => false` and
+/// so could not see a local used as an `InstanceField` receiver or as an
+/// `ArrayAccess` base/index. `page_base_offset_uses` is the only caller and it
+/// uses this answer to decide whether a page materialization is "only ever used
+/// with a constant offset": a use it cannot see is a use it treats as absent, so
+/// the page was resolved as a complete address and the `#lo` became an offset
+/// into an unrelated slot. Adding an Operand variant must break this match at
+/// compile time rather than silently answer "no".
 fn operand_reads_local(op: &Operand, v: u32) -> bool {
     match op {
         Operand::Local(x) => *x == v,
@@ -1287,7 +1562,20 @@ fn operand_reads_local(op: &Operand, v: u32) -> bool {
             operand_reads_local(base, v)
                 || index.as_deref().is_some_and(|i| operand_reads_local(i, v))
         }
-        _ => false,
+        Operand::InstanceField { base, .. } => operand_reads_local(base, v),
+        Operand::ArrayAccess { array, index } => {
+            operand_reads_local(array, v) || operand_reads_local(index, v)
+        }
+        Operand::Register(_)
+        | Operand::Immediate(_)
+        | Operand::FloatLiteral(_)
+        | Operand::DoubleLiteral(_)
+        | Operand::StringLiteral { .. }
+        | Operand::Method(_)
+        | Operand::Field(_)
+        | Operand::Type(_)
+        | Operand::MissingAbiArg
+        | Operand::Unknown => false,
     }
 }
 
@@ -1333,7 +1621,14 @@ pub(super) fn page_base_offset_uses(
                     Operand::Immediate(v) => Some(*v),
                     _ => None,
                 })?;
-                uses.push((j, if matches!(k, ArithKind::Sub) { -imm } else { imm }));
+                uses.push((
+                    j,
+                    if matches!(k, ArithKind::Sub) {
+                        -imm
+                    } else {
+                        imm
+                    },
+                ));
             }
             // `ldr xN, [xN, #lo]` — the low bits folded into the addressing mode
             Op::Move => {
@@ -1354,18 +1649,359 @@ pub(super) fn page_base_offset_uses(
             _ => return None,
         }
     }
-    if uses.is_empty() {
-        None
-    } else {
-        Some(uses)
-    }
+    if uses.is_empty() { None } else { Some(uses) }
 }
-
-
 
 // ---------------------------------------------------------------------------
 
-fn key_function_recovery(insns: &mut [Insn], maps: &ResolveMaps, stats: &mut ResolveStats) {
+/// Follow `Move` chains (`v1 = v2; v2 = imm`) from `op` back to a stable
+/// operand. `resolve_through_moves` follows ONE def; metadata-slot addresses
+/// routinely travel through two or three copies before a call.
+fn resolve_operand_deep(insns: &[Insn], at: usize, op: &Operand, depth: usize) -> Operand {
+    let mut cur = op.clone();
+    for _ in 0..depth {
+        let Some(next) = resolve_through_moves(insns, at, &cur, None) else {
+            break;
+        };
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// The static address an operand names, when it is one:
+///   * `Immediate(a)`            — an address constant, or
+///   * `[Imm(b) + addend]`       — a load from the fixed address `b+addend`.
+///
+/// A nested load (`[ [Imm(b)] ]`) is not a static address; `klass_operand_type`
+/// peels those one level at a time.
+fn static_addr_of(op: &Operand) -> Option<u64> {
+    match op {
+        Operand::Immediate(a) => Some(*a as u64),
+        Operand::Memory {
+            base,
+            index: None,
+            addend,
+            ..
+        } => match base.as_ref() {
+            Operand::Immediate(b) => Some((*b as u64).wrapping_add(*addend as u64)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`static_addr_of`], with the page LOCAL resolved.
+///
+/// `adrp x9, page; ldr x0, [x9, #off]` reaches the IR as
+/// `x0 = [Local(page) + off]` as soon as SSA has materialized the `adrp` into
+/// its own local version, and `static_addr_of` only accepts
+/// `base: Immediate`. So the ordinary Android spelling of "the address of a
+/// metadata-usage cell" matched nothing, and every
+/// `il2cpp_codegen_initialize_runtime_metadata(&slot)` call was invisible to
+/// the detector that drops it (`key_function_recovery`), which is why those
+/// calls survived as `fn_…(&slot)`.
+///
+/// Only an ENTRY-constant base is folded: a local whose definition is a
+/// constant, possibly through register copies. A computed base is an address
+/// the analysis does not know, and is refused.
+fn static_addr_of_deep(insns: &[Insn], at: usize, op: &Operand) -> Option<u64> {
+    if let Some(a) = static_addr_of(op) {
+        return Some(a);
+    }
+    let Operand::Memory {
+        base,
+        index: None,
+        addend,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    let Operand::Local(v) = base.as_ref() else {
+        return None;
+    };
+    let mut cur = *v;
+    for _ in 0..4 {
+        let d = ssa_def_of(insns, at, cur)?;
+        if !matches!(insns[d].op, Op::Move) {
+            return None;
+        }
+        match insns[d].operands.get(1)? {
+            Operand::Immediate(b) => return Some((*b as u64).wrapping_add(*addend as u64)),
+            Operand::Local(w) if *w != cur => cur = *w,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Resolve a metadata-usage slot (or a GOT slot that points at one) to its
+/// TypeDef and display name.
+fn type_at_slot(maps: &ResolveMaps, slot: u64) -> Option<super::ir::NamedTypeRef> {
+    if let Some(t) = klass_tdi_to_type(maps, slot) {
+        return Some(t);
+    }
+    // Metadata-usage slots are routinely reached through the GOT: the slot
+    // holds the runtime address of the usage cell, which is what
+    // `klass_to_tdi` keys.
+    if let Some(&addend) = maps.got_addend_by_addr.get(&slot) {
+        return klass_tdi_to_type(maps, addend);
+    }
+    None
+}
+
+/// The instruction that last defines register `name` strictly before `at`.
+fn def_of_reg_before(insns: &[Insn], at: usize, name: &str) -> Option<usize> {
+    (0..at.min(insns.len()))
+        .rev()
+        .find(|&j| matches!(insns[j].dest(), Some(Operand::Register(n)) if n == name))
+}
+
+/// The constant value an operand provably holds.
+///
+/// Folds the constant-carrying shapes the ARM64 lifter produces:
+///   * `adrp`/`movz`          → `Immediate`,
+///   * a register copy          → follow the defining `Move`,
+///   * `ldr x, [page, #off]`   → the slot at `page + off`; when that slot is
+///     RELATIVE-relocated its live value IS the relocation addend, the only
+///     pointer value knowable without a running process.
+///
+/// Anything else refuses: a computed address is not an address this analysis
+/// knows, and answering a plausible-looking constant for one would name the
+/// wrong class.
+fn static_value_of(
+    maps: &ResolveMaps,
+    insns: &[Insn],
+    at: usize,
+    op: &Operand,
+    depth: usize,
+) -> Option<u64> {
+    if depth == 0 {
+        return None;
+    }
+    match op {
+        Operand::Immediate(a) => Some(*a as u64),
+        Operand::Memory {
+            base,
+            index: None,
+            addend,
+            ..
+        } => {
+            let slot = static_value_of(maps, insns, at, base, depth - 1)?
+                .wrapping_add(*addend as u64);
+            maps.got_addend_by_addr.get(&slot).copied()
+        }
+        Operand::Register(name) => {
+            let d = def_of_reg_before(insns, at, name)?;
+            if !matches!(insns[d].op, Op::Move) {
+                return None;
+            }
+            static_value_of(maps, insns, d, insns[d].operands.get(1)?, depth - 1)
+        }
+        Operand::Local(v) => {
+            let d = ssa_def_of(insns, at, *v)?;
+            if !matches!(insns[d].op, Op::Move) {
+                return None;
+            }
+            static_value_of(maps, insns, d, insns[d].operands.get(1)?, depth - 1)
+        }
+        _ => None,
+    }
+}
+
+/// The class an operand provably names, from metadata evidence only.
+///
+/// Handles every shape the code generator emits for a `Type_t*` value:
+///   * the usage-slot address itself (`Immediate(slot)`),
+///   * a load from the slot (`[slot]`),
+///   * a load from a GOT slot that points at the usage slot (`[[got]]`), which
+///     is the normal cross-`adrp` form on Android,
+///   * the same reached through the ordinary `adrp; ldr; ldr` chain, where the
+///     middle register is NOT a constant:
+///
+///     ```text
+///     adrp x8, page
+///     ldr  x8, [x8, #off]   ; x8 = the relocated pointer stored at page+off
+///     ldr  x0, [x8]         ; x0 = klass
+///     ```
+///
+/// The old body consulted only `static_addr_of` (an `Immediate` base) and then
+/// recursed into `Memory.base`, so the fourth shape — where `base` is a bare
+/// register — answered `None`. Every allocation through it lost its klass, and
+/// `fuse_constructor_calls` then named the object from the `.ctor` instead.
+/// Identical-code-folding merges every trivial constructor onto ONE `ret` in
+/// this binary, so that fallback named the wrong class: `new Token()` printed
+/// as `new Object()`, and because the local was then typed `Object` no field
+/// could be named on it either — the whole `token.Reward = …` block degraded
+/// to raw `*(nint*)(v + 16)` stores.
+fn klass_operand_type(
+    maps: &ResolveMaps,
+    insns: &[Insn],
+    at: usize,
+    op: &Operand,
+    depth: usize,
+) -> Option<super::ir::NamedTypeRef> {
+    if depth == 0 {
+        return None;
+    }
+    match op {
+        // The operand IS the cell address (`&slot`), or a plain constant.
+        Operand::Immediate(a) => type_at_slot(maps, *a as u64),
+        Operand::Memory {
+            base,
+            index: None,
+            addend,
+            ..
+        } => {
+            // The address this load reads from.
+            if let Some(addr) = static_value_of(maps, insns, at, base, depth - 1)
+                .map(|a| a.wrapping_add(*addend as u64))
+            {
+                if let Some(t) = type_at_slot(maps, addr) {
+                    return Some(t);
+                }
+            }
+            klass_operand_type(maps, insns, at, base, depth - 1)
+        }
+        Operand::Register(name) => {
+            let d = def_of_reg_before(insns, at, name)?;
+            if !matches!(insns[d].op, Op::Move) {
+                return None;
+            }
+            klass_operand_type(maps, insns, d, insns[d].operands.get(1)?, depth - 1)
+        }
+        Operand::Local(v) => {
+            let d = ssa_def_of(insns, at, *v)?;
+            if !matches!(insns[d].op, Op::Move) {
+                return None;
+            }
+            klass_operand_type(maps, insns, d, insns[d].operands.get(1)?, depth - 1)
+        }
+        _ => None,
+    }
+}
+
+/// Is this address a metadata-usage cell? That is the argument of
+/// `il2cpp_codegen_initialize_runtime_metadata` — it passes the slot, not the
+/// value, so the operand is an address constant (or a GOT-wrapped one).
+fn is_metadata_usage_slot(
+    maps: &ResolveMaps,
+    field_index_by_addr: &HashMap<u64, u32>,
+    addr: u64,
+) -> bool {
+    let hit = |a: u64| {
+        maps.klass_to_tdi.contains_key(&a)
+            || maps.literal_index_by_addr.contains_key(&a)
+            || maps.method_spec_index_by_addr.contains_key(&a)
+            || field_index_by_addr.contains_key(&a)
+    };
+    hit(addr)
+        || maps
+            .got_addend_by_addr
+            .get(&addr)
+            .is_some_and(|a| hit(*a))
+}
+
+/// `&value` in the two shapes the lifter produces for an out-address.
+fn is_value_address(op: &Operand) -> bool {
+    matches!(op, Operand::AddressOf(_))
+}
+
+/// The next non-Nop instruction at or after `i + 1`.
+fn next_real_insn(insns: &[Insn], i: usize) -> Option<usize> {
+    (i + 1..insns.len()).find(|&j| !matches!(insns[j].op, Op::Nop))
+}
+
+/// The constructor call immediately following a NewObj result, when it is one:
+/// `next_call` is a resolved `.ctor` whose receiver is `dst`. Returns whether
+/// the constructor takes NO declared parameters (so fusing it cannot drop a
+/// real argument).
+fn ctor_after(insns: &[Insn], i: usize, dst: u32) -> Option<bool> {
+    let j = next_real_insn(insns, i)?;
+    if !matches!(insns[j].op, Op::Call | Op::CallVoid) {
+        return None;
+    }
+    let Some(Operand::Method(m)) = insns[j].operands.first() else {
+        return None;
+    };
+    if m.name != ".ctor" {
+        return None;
+    }
+    let receiver_ok = insns[j]
+        .operands
+        .get(2)
+        .or_else(|| insns[j].operands.get(1))
+        .and_then(Operand::as_local)
+        == Some(dst);
+    receiver_ok.then_some(m.sig.params.is_empty())
+}
+
+/// [`ctor_after`] with the callee resolved from a RAW call target as well.
+///
+/// `ctor_after` accepts only `Operand::Method`, i.e. a call the resolve pass
+/// already named. The constructor that follows an allocation is frequently NOT
+/// named: on this binary identical-code-folding merges every trivial `.ctor`
+/// onto one shared `ret`, so the target arrives as a bare `Immediate` and the
+/// allocate/construct pair was invisible. Resolving through
+/// `maps.methods_by_rva` — the same table the pass uses everywhere else —
+/// recovers the pairing without guessing.
+fn ctor_after_resolved(insns: &[Insn], i: usize, dst: u32, maps: &ResolveMaps) -> bool {
+    if let Some(known) = ctor_after(insns, i, dst) {
+        return known;
+    }
+    let Some(j) = next_real_insn(insns, i) else {
+        return false;
+    };
+    if !matches!(insns[j].op, Op::Call | Op::CallVoid) {
+        return false;
+    }
+    let Some(Operand::Immediate(t)) = insns[j].operands.first() else {
+        return false;
+    };
+    let Some(m) = maps.methods_by_rva.get(&(*t as u64)) else {
+        return false;
+    };
+    if m.name != ".ctor" || !m.sig.params.is_empty() {
+        return false;
+    }
+    insns[j]
+        .operands
+        .get(2)
+        .or_else(|| insns[j].operands.get(1))
+        .and_then(Operand::as_local)
+        == Some(dst)
+}
+
+fn key_function_recovery(
+    insns: &mut [Insn],
+    maps: &ResolveMaps,
+    field_index_by_addr: &HashMap<u64, u32>,
+    stats: &mut ResolveStats,
+) {
+    // Every local any instruction READS, computed once. A call's destination
+    // slot is a write, so it is excluded by `dest_position`.
+    //
+    // This exists because the shape detectors below asked `is_void` (i.e.
+    // `Op::CallVoid`) whether a call's result is discarded — and **no lifter
+    // ever emits `Op::CallVoid`** (`lift*.rs` contains no constructor for it;
+    // the ARM64 `BL`/`BLR` arms both build `Op::Call`). The question they
+    // actually need answered is "is this result used", which is a property of
+    // the dataflow, not of the opcode.
+    let mut read_locals: HashSet<u32> = HashSet::new();
+    for insn in insns.iter() {
+        let dpos = Insn::dest_position(&insn.op);
+        for (k, op) in insn.operands.iter().enumerate() {
+            if Some(k) == dpos {
+                continue;
+            }
+            let mut u = Vec::new();
+            op.uses(&mut u);
+            read_locals.extend(u);
+        }
+    }
     for i in 0..insns.len() {
         if !matches!(insns[i].op, Op::Call | Op::CallVoid) {
             continue;
@@ -1374,13 +2010,127 @@ fn key_function_recovery(insns: &mut [Insn], maps: &ResolveMaps, stats: &mut Res
             continue;
         };
         let t = target as u64;
+        let is_void = matches!(insns[i].op, Op::CallVoid);
+        // Does anything read this call's result? See `read_locals` above: this
+        // is the fact `is_void` was standing in for.
+        let result_unread = match insns[i].dest() {
+            None => true,
+            Some(Operand::Local(v)) => !read_locals.contains(v),
+            // A still-unnamed register: be conservative and keep the call.
+            Some(_) => false,
+        };
+        // Operand layout: Call [target, result, x0, x1, …],
+        //                 CallVoid [target, x0, x1, …].
+        let x0_at = if is_void { 1 } else { 2 };
+        let x0 = insns[i]
+            .operands
+            .get(x0_at)
+            .map(|o| resolve_operand_deep(insns, i, o, 4));
+        let x1 = insns[i]
+            .operands
+            .get(x0_at + 1)
+            .map(|o| resolve_operand_deep(insns, i, o, 4));
+        let x0_klass = x0.as_ref().and_then(|o| klass_operand_type(maps, insns, i, o, 8));
+        let x1_klass = x1.as_ref().and_then(|o| klass_operand_type(maps, insns, i, o, 8));
+        // A target proven not to be a function entry must not acquire a
+        // helper role from a call-site SHAPE. This is how a resolved indirect
+        // dispatch into a jump table became `IL2CPP_IsInst(obj, 16)` /
+        // one-argument IsInst in every method that called it.
+        let non_entry = super::runtime_helpers::is_non_entry(t);
+        // An allocation is also provable by SHAPE at the call site, without
+        // naming the helper at all:
+        //   * the target is not a managed method (it is a runtime helper),
+        //   * x0 is a KLASS VALUE (a load through a metadata-usage cell),
+        //   * the result is immediately constructed by a zero-argument `.ctor`.
+        //
+        // Nothing else in IL2CPP takes a klass value in x0 and is followed by a
+        // constructor on its own result. This evidence is stronger than the
+        // helper's name, and unlike the name it does not depend on the target
+        // appearing in the frequency sample `classify_bodies` walks.
+        let alloc_by_shape = !is_void
+            && !maps.methods_by_rva.contains_key(&t)
+            && x0_klass.is_some()
+            && insns[i]
+                .dest()
+                .and_then(Operand::as_local)
+                .is_some_and(|d| ctor_after_resolved(insns, i, d, maps));
+        // PRECEDENCE, and it is load-bearing. An allocation is the most specific
+        // shape in this function, and several broader families below would
+        // otherwise claim it first and `continue` — most importantly
+        // `maps.metadata_init`, whose detector matches "the body reads the
+        // class-init byte `[klass+0x135]`". `il2cpp_object_new` reads exactly
+        // that byte (it runs the cctor before allocating), so on this binary the
+        // shared allocator thunk was classified as metadata bookkeeping and its
+        // every call site hit the `continue` in the metadata-init block below.
+        // The call then stayed a plain `Call`, `fuse_constructor_calls` named
+        // the object from its `.ctor`, and because identical-code-folding merges
+        // every trivial `.ctor` onto one `ret`, that name was an arbitrary
+        // class: `new Token()` printed as `new Object()`, and since the local
+        // was then typed `Object` no field could be named on it either — the
+        // whole `token.Reward = …` block degraded to `*(nint*)(v + 16)` stores.
+        let wants_object_new = !non_entry
+            && (maps.object_new.contains(&t)
+                || super::runtime_helpers::role_of(t)
+                    == Some(super::runtime_helpers::RuntimeHelper::ObjectNew)
+                || alloc_by_shape);
+
+        // Runtime metadata initialization: a VOID call whose first argument is
+        // the ADDRESS of a metadata-usage cell. The helper decodes the cell
+        // into the runtime object graph; the managed source never contained
+        // this call, and its result is discarded by construction. This is the
+        // only shape that passes a usage-slot ADDRESS (a class-init helper is
+        // passed the resolved class VALUE).
+        // The gate is `result_unread`, NOT `is_void`: see `read_locals` above.
+        // A RESOLVED target is excluded outright — this helper is a VM internal
+        // that never has a metadata body, so a nameable method taking a usage
+        // cell is a real call and dropping it would delete managed code.
+        if !non_entry && !wants_object_new && result_unread && !maps.methods_by_rva.contains_key(&t)
+        {
+            if let Some(slot) = x0
+                .as_ref()
+                .and_then(|o| static_addr_of_deep(insns, i, o))
+            {
+                if is_metadata_usage_slot(maps, field_index_by_addr, slot) {
+                    super::runtime_helpers::note_shape(
+                        t,
+                        super::runtime_helpers::RuntimeHelper::MetadataInit,
+                    );
+                    super::verify::ledger_note(
+                        insns[i].address,
+                        super::verify::LedgerKind::DroppedRuntimeCall,
+                    );
+                    insns[i] = Insn::new(Op::Nop, Vec::new(), insns[i].address);
+                    stats.key_functions += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Box call shape: `v = helper(class, &value)`. Kept as a call (rather
+        // than rewritten to `Op::Box`, which cannot carry the value into the
+        // renderer); the statement-stage fold turns it into the value
+        // expression. Recording the role here also overrides a broad
+        // object_new alias for the same target.
+        if !non_entry && !is_void && x0_klass.is_some() && x1.as_ref().is_some_and(is_value_address)
+        {
+            super::runtime_helpers::note_shape(t, super::runtime_helpers::RuntimeHelper::Box);
+            continue;
+        }
+
+        // Instance-of shape: object in x0, class in x1. A broad object_new
+        // alias is overridden here only when x0 is provably NOT a class: an
+        // allocator's first argument is always the class.
+        if !non_entry && !is_void && x0_klass.is_none() && x1_klass.is_some() {
+            super::runtime_helpers::note_shape(t, super::runtime_helpers::RuntimeHelper::IsInst);
+            continue;
+        }
 
         // il2cpp_codegen_initialize_class / InitializeMethodMetadata-family:
         // runtime metadata bookkeeping (verified: body checks [klass+0x132]
         // cctor byte / method slots). NOT managed logic — the C# source never
         // had these calls. Drop them entirely instead of rendering
         // `fn_4a58b98(...)` noise that misreads as a real operation.
-        if maps.metadata_init.contains(&t) {
+        if !wants_object_new && maps.metadata_init.contains(&t) {
             // NEVER drop a call whose return value is consumed downstream.
             // The init-shape detector matches shared helpers that ALSO
             // allocate (`il2cpp_codegen_object_new` checks the class-init
@@ -1433,7 +2183,7 @@ fn key_function_recovery(insns: &mut [Insn], maps: &ResolveMaps, stats: &mut Res
                 .operands
                 .iter()
                 .skip(2)
-                .map(|op| resolve_through_moves(insns, i, op))
+                .map(|op| resolve_through_moves(insns, i, op, None))
                 .map(|o| o.unwrap_or(Operand::MissingAbiArg))
                 .collect();
             let recv = raw_args.first().cloned().unwrap_or(Operand::Unknown);
@@ -1441,9 +2191,7 @@ fn key_function_recovery(insns: &mut [Insn], maps: &ResolveMaps, stats: &mut Res
             let margs: Vec<Operand> = raw_args.into_iter().skip(1).collect();
             let dst = insns[i].dest().cloned().unwrap_or(Operand::Unknown);
             insns[i] = Insn::new(
-                Op::ObjcMsgSend {
-                    selector: sel,
-                },
+                Op::ObjcMsgSend { selector: sel },
                 std::iter::once(dst)
                     .chain(std::iter::once(recv))
                     .chain(margs)
@@ -1458,35 +2206,83 @@ fn key_function_recovery(insns: &mut [Insn], maps: &ResolveMaps, stats: &mut Res
         if maps.raise_exception.contains(&t) {
             let arg = insns[i]
                 .operands
-                .get(if matches!(insns[i].op, Op::CallVoid) { 1 } else { 2 })
+                .get(if matches!(insns[i].op, Op::CallVoid) {
+                    1
+                } else {
+                    2
+                })
                 .cloned()
-                .and_then(|o| resolve_through_moves(insns, i, &o))
+                .and_then(|o| resolve_through_moves(insns, i, &o, None))
                 .unwrap_or(Operand::Unknown);
+            
+            // Try to extract the exception message by tracing the exception object back to its NewObj constructor
+            if let Operand::Local(local_id) = &arg {
+                // Search backwards for the instruction that defines this local
+                for j in (0..i).rev() {
+                    if let Some(dest) = insns[j].dest() {
+                        if dest.as_local() == Some(*local_id) {
+                            // Found the defining instruction
+                            if matches!(insns[j].op, Op::Call | Op::CallVoid) {
+                                // It's a call - check if it's a constructor call with a string argument
+                                let first_arg_idx = if matches!(insns[j].op, Op::CallVoid) { 1 } else { 2 };
+                                if let Some(first_arg) = insns[j].operands.get(first_arg_idx) {
+                                    if let Some(resolved) = resolve_through_moves(insns, j, first_arg, None) {
+                                        if let Operand::StringLiteral { value, .. } = resolved {
+                                            super::runtime_helpers::note_raise_message(t, value.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            
             insns[i] = Insn::new(Op::Throw, vec![arg], insns[i].address);
             stats.key_functions += 1;
             continue;
         }
 
-        // object_new(klass) → NewObj(type when klass known)
-        if maps.object_new.contains(&t) {
-            let klass_arg = insns[i]
-                .operands
-                .get(2)
-                .and_then(|o| resolve_through_moves(insns, i, o));
-            // the klass may be materialized as a constant (post-fold) or as a
-            // load from a metadata-usage slot with a known constant base
-            let klass_addr = match klass_arg {
-                Some(Operand::Immediate(a)) => Some(a as u64),
-                Some(Operand::Memory { base, addend, .. }) => match base.as_ref() {
-                    Operand::Immediate(b) => {
-                        Some((*b as u64).wrapping_add(addend as u64))
-                    }
-                    _ => None,
-                },
-                _ => None,
+        // object_new(klass) → NewObj(type when klass known). A target whose
+        // BODY was proven to be il2cpp_object_new participates even when the
+        // statistical classifier missed it (the largest allocator variants are
+        // not exported and do not thunk to the exported anchor).
+        // An allocation is also provable by SHAPE at the call site, without
+        // naming the helper at all:
+        //   * the target is not a managed method (it is a runtime helper),
+        //   * x0 is a KLASS VALUE (a load through a metadata-usage cell),
+        //   * the result is immediately constructed by a zero-argument `.ctor`.
+        //
+        // Nothing else in IL2CPP takes a klass value in x0 and is followed by a
+        // constructor on its own result. This evidence is stronger than the
+        // helper's name, and unlike the name it does not depend on the target
+        // appearing in the frequency sample `classify_bodies` walks (top 128).
+        // The shared `new T()` allocator is a `b`-chain thunk that is common
+        // but not top-128, so the name route missed it and every allocation fell
+        // through to `fuse_constructor_calls`, which names the object from its
+        // `.ctor` — and every trivial `.ctor` in this binary is folded onto one
+        // `ret`, so that name was arbitrary. `new Token()` printed as
+        // `new Object()`, which then made every `token.X = …` store unnameable.
+        if wants_object_new {
+            // A void call cannot be an allocation use: the result is the
+            // object. Broad alias chains put bookkeeping wrappers in the
+            // object_new family; they stay calls.
+            if is_void {
+                continue;
+            }
+            // The result slot is still a REGISTER at this point (SSA renames
+            // registers to locals later), so it must be carried through
+            // verbatim.
+            let Some(dst) = insns[i].dest().cloned() else {
+                continue;
             };
-            let tyref = klass_addr.and_then(|a| klass_tdi_to_type(maps, a));
-            let dst = insns[i].dest().cloned().unwrap_or(Operand::Unknown);
+            let dst_local = dst.as_local();
+            // The klass is x0. Metadata evidence: a constant slot address, a
+            // load from it, or a GOT load that points at the usage cell.
+            let tyref = x0
+                .as_ref()
+                .and_then(|o| klass_operand_type(maps, insns, i, o, 8));
             // ONLY claim a constructor when the klass actually resolves.
             //
             // An UNTYPED `NewObj(None)` is not a harmless placeholder: the
@@ -1502,27 +2298,32 @@ fn key_function_recovery(insns: &mut [Insn], maps: &ResolveMaps, stats: &mut Res
             // `NewObj(None)` and then deleted, leaving the guard EMPTY. Four
             // real calls, gone, with no marker in the output.
             //
-            // The cost of the gate is readability, not fidelity: a genuine
-            // allocation whose klass we cannot name now stays a call and is
-            // no longer fused with the following `.ctor` into `new T(...)` —
-            // but it is still THERE, which the erased version was not.
+            // The one safe untyped rewrite is when the allocation is provably
+            // paired with a ZERO-ARGUMENT `.ctor`: `fuse_constructor_calls`
+            // immediately names the type from the constructor and nothing is
+            // dropped.
             if let Some(ty) = tyref {
-                insns[i] = Insn::new(Op::NewObj(Some(ty)), vec![dst], insns[i].address);
+                insns[i] = Insn::new(
+                    Op::NewObj(Some(ty)),
+                    vec![dst.clone()],
+                    insns[i].address,
+                );
+                stats.key_functions += 1;
+            } else if dst_local.is_some_and(|d| ctor_after(insns, i, d) == Some(true)) {
+                insns[i] = Insn::new(Op::NewObj(None), vec![dst.clone()], insns[i].address);
                 stats.key_functions += 1;
             }
             continue;
         }
 
-        // box family: box(klass, T* value) → Box(dst, value-by-address)
+        // box family: box(klass, T* value). The call is LEFT IN PLACE: the
+        // renderer can slice it to its two proven arguments, and the
+        // statement-stage pass folds it into the value expression. `Op::Box`
+        // cannot carry the value into the renderer, so emitting it here would
+        // lose the only interesting operand.
         if maps.box_fn.contains(&t) {
-            let val = insns[i]
-                .operands
-                .get(3)
-                .and_then(|o| resolve_through_moves(insns, i, o))
-                .unwrap_or(Operand::Unknown);
-            let dst = insns[i].dest().cloned().unwrap_or(Operand::Unknown);
-            insns[i] = Insn::new(Op::Box(None), vec![dst, val], insns[i].address);
-            stats.key_functions += 1;
+            super::runtime_helpers::note_shape(t, super::runtime_helpers::RuntimeHelper::Box);
+            continue;
         }
     }
 }
@@ -1550,6 +2351,29 @@ fn seed_class_tdi(table: &LocalTable, local: u32) -> Option<i32> {
     let &li = table.index_of.get(&local)?;
     match &table.infos[li].ty {
         ManagedType::Class(nt) if nt.type_def_index >= 0 => Some(nt.type_def_index),
+        _ => None,
+    }
+}
+
+/// Receiver type when the receiver is a FIELD (or a copy of one):
+/// `v5 = this._ctrl` carries the field's declared type in its `FieldRef`,
+/// even when the LocalTable never typed `v5`. Without this every virtual
+/// call on a field receiver (`this._ctrl.Method()`) stayed `fnptr_` unless
+/// the field happened to also be in the type table.
+fn receiver_tdi_through_fields(insns: &[Insn], upto: usize, v: u32, depth: u8) -> Option<i32> {
+    if depth == 0 {
+        return None;
+    }
+    let d = ssa_def_of(insns, upto, v)?;
+    if !matches!(insns[d].op, Op::Move) {
+        return None;
+    }
+    match insns[d].operands.get(1)? {
+        Operand::InstanceField { field, .. } | Operand::Field(field) => match &field.field_type {
+            ManagedType::Class(nt) if nt.type_def_index >= 0 => Some(nt.type_def_index),
+            _ => None,
+        },
+        Operand::Local(w) if *w != v => receiver_tdi_through_fields(insns, d, *w, depth - 1),
         _ => None,
     }
 }
@@ -1607,25 +2431,73 @@ fn fuse_constructor_calls(insns: &mut [Insn], stats: &mut ResolveStats) {
         let Some(Some(new_dst)) = insns[i].dest().cloned().as_ref().map(|d| d.as_local()) else {
             continue;
         };
-        // find next real instruction
+        // Walk to the `.ctor`, stepping over Nops AND over copies that merely
+        // rename the allocation result.
+        //
+        // `mov x25, x0` after the allocation reaches the IR as
+        // `Move [alias, dst]`, and requiring the ctor to be the IMMEDIATELY
+        // next real instruction left the pair unfused at every such site. An
+        // unfused pair is not cosmetic: the `.ctor` survives as its own
+        // statement, the renderer inlines the `NewObj` definition at each use
+        // of the local, and the result is `new Token()...ctor()` plus a fresh
+        // `new Token()` for every field store. Only copies OF THE ALLOCATION
+        // are stepped over, at most four, so an unrelated `Move` still stops
+        // the walk.
+        let mut aliases: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        aliases.insert(new_dst);
         let mut j = i + 1;
-        while j < insns.len() && matches!(insns[j].op, Op::Nop) {
-            j += 1;
+        let mut hops = 0usize;
+        loop {
+            while j < insns.len() && matches!(insns[j].op, Op::Nop) {
+                j += 1;
+            }
+            if j >= insns.len() || hops > 4 {
+                break;
+            }
+            if matches!(insns[j].op, Op::Call | Op::CallVoid) {
+                break;
+            }
+            if matches!(insns[j].op, Op::Move) {
+                let copy = insns[j]
+                    .dest()
+                    .and_then(|d| d.as_local())
+                    .zip(insns[j].operands.get(1).and_then(|o| o.as_local()));
+                if let Some((a, src)) = copy {
+                    if aliases.contains(&src) {
+                        aliases.insert(a);
+                        j += 1;
+                        hops += 1;
+                        continue;
+                    }
+                }
+            }
+            break;
         }
         if j >= insns.len() || !matches!(insns[j].op, Op::Call | Op::CallVoid) {
             continue;
         }
-        // receiver must be the newobj result (position depends on static-ness
-        // which we cannot know until resolved — accept both layouts)
+        // receiver must be the newobj result, or one of its copies (position
+        // depends on static-ness which we cannot know until resolved — accept
+        // both layouts)
         let receiver_ok = insns[j]
             .operands
             .get(2)
             .or_else(|| insns[j].operands.get(1))
-            .map(|op| matches!(op, Operand::Local(v) if Some(*v) == Some(new_dst)))
-            .unwrap_or(false);
+            .and_then(|op| op.as_local())
+            .is_some_and(|v| aliases.contains(&v));
         // ctor heuristic: resolved to a method literally named ".ctor"
-        let is_ctor = matches!(insns[j].operands.first(), Some(Operand::Method(m)) if m.name == ".ctor");
-        if receiver_ok && is_ctor {
+        let is_ctor =
+            matches!(insns[j].operands.first(), Some(Operand::Method(m)) if m.name == ".ctor");
+        // Fuse ARGUMENT-TAKING constructors only at the statement stage. The
+        // `NewObj` op cannot carry constructor arguments, so fusing one here
+        // would silently delete them (`new Foo(a, b)` → `new Foo()`). The
+        // expression-stage fold (`reconstruct::expr_cleanup::fold_ctor_calls`)
+        // merges `v = new T(); v..ctor(args)` into `new T(args)` instead.
+        let zero_arg_ctor = matches!(
+            insns[j].operands.first(),
+            Some(Operand::Method(m)) if m.sig.params.is_empty()
+        );
+        if receiver_ok && is_ctor && zero_arg_ctor {
             // merge: upgrade NewObj's type knowledge and drop the ctor call
             if let (Op::NewObj(ty), Some(Operand::Method(m))) =
                 (&insns[i].op, insns[j].operands.first())
@@ -1727,8 +2599,7 @@ fn resolve_folded_names(
                 insns[i].operands[0] = Operand::Method(m.clone());
                 insns[i].dest_type = Some(m.sig.ret.clone());
                 stats.shared_calls_picked += 1;
-                super::timing::SHARED_PICKED
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::timing::SHARED_PICKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(why) => {
                 fold_site_dbg(cands, insns, i, &cur, table, why, raw);
@@ -1977,7 +2848,10 @@ fn abi_int_slots(raw: &[Operand], table: &LocalTable) -> Option<usize> {
         match op {
             // A hole: no origin to check, so it is taken as an integer slot.
             Operand::MissingAbiArg => {}
-            Operand::Local(v) => match table.index_of.get(v).map(|&li| &table.infos[li].slot_origin)
+            Operand::Local(v) => match table
+                .index_of
+                .get(v)
+                .map(|&li| &table.infos[li].slot_origin)
             {
                 Some(origin) if is_int_arg_register(origin) => identified = true,
                 // an FP slot: the integer run ended
@@ -2187,7 +3061,10 @@ fn fold_site_dbg(
         statics,
         cands.len(),
         params,
-        raw.iter().take(9).map(|o| format!("{o}")).collect::<Vec<_>>(),
+        raw.iter()
+            .take(9)
+            .map(|o| format!("{o}"))
+            .collect::<Vec<_>>(),
         insns[i].operands.len(),
         insns[i]
             .operands
@@ -2210,7 +3087,10 @@ fn fold_site_dbg(
         .first()
         .filter(|o| !matches!(**o, Operand::MissingAbiArg | Operand::Unknown))
     {
-        let ty = table.index_of.get(rv).map(|li| format!("{:?}", table.infos[*li].ty));
+        let ty = table
+            .index_of
+            .get(rv)
+            .map(|li| format!("{:?}", table.infos[*li].ty));
         eprintln!("[foldsite]    receiver v{rv} seeded={ty:?}");
     }
 }
@@ -2276,12 +3156,18 @@ fn fold_dbg(insns: &[Insn], upto: usize, v: u32) {
                         .operands
                         .iter()
                         .skip(1)
-                        .map(|o| match o.as_local().and_then(|w| ssa_def_of(insns, insns.len(), w)) {
-                            Some(d) => format!("{}", insns[d].op),
-                            None => "nodef".into(),
+                        .map(|o| {
+                            match o.as_local().and_then(|w| ssa_def_of(insns, insns.len(), w)) {
+                                Some(d) => format!("{}", insns[d].op),
+                                None => "nodef".into(),
+                            }
                         })
                         .collect();
-                    format!(" n={} from=[{}]", op.operands.len() - 1, where_from.join(", "))
+                    format!(
+                        " n={} from=[{}]",
+                        op.operands.len() - 1,
+                        where_from.join(", ")
+                    )
                 }
                 _ => String::new(),
             };
@@ -2297,21 +3183,19 @@ fn dbg_enabled(var: &str) -> bool {
 }
 
 /// Pick the merged definition declared on a named type (a `NewObj`'s klass).
-fn pick_by_named_type(
-    cands: &[MethodRef],
-    ty: &super::types::NamedType,
-) -> Option<usize> {
+fn pick_by_named_type(cands: &[MethodRef], ty: &super::types::NamedType) -> Option<usize> {
     if ty.type_def_index >= 0 {
-        if let Some(p) = cands.iter().position(|c| c.type_def_index == ty.type_def_index) {
+        if let Some(p) = cands
+            .iter()
+            .position(|c| c.type_def_index == ty.type_def_index)
+        {
             return Some(p);
         }
     }
     // Fall back to the NAME: a generic instantiation `List<string>` shares the
     // type-def index of `List<T>` but is spelled differently in the dump, and
     // the merged set may hold either spelling.
-    cands
-        .iter()
-        .position(|c| c.declaring_type_name == ty.name)
+    cands.iter().position(|c| c.declaring_type_name == ty.name)
 }
 
 fn ssa_def_of(insns: &[Insn], upto: usize, v: u32) -> Option<usize> {
@@ -2353,7 +3237,10 @@ fn is_delegate_class_ty(ty: &ManagedType) -> bool {
 }
 
 /// The delegate-typed `NamedType` a local provably holds, if it holds one.
-fn delegate_named_ty(table: &LocalTable, v: u32) -> Option<std::sync::Arc<super::types::NamedType>> {
+fn delegate_named_ty(
+    table: &LocalTable,
+    v: u32,
+) -> Option<std::sync::Arc<super::types::NamedType>> {
     let li = *table.index_of.get(&v)?;
     match &table.infos.get(li)?.ty {
         ManagedType::Class(nt) if is_delegate_class_ty(&ManagedType::Class(nt.clone())) => {
@@ -2373,7 +3260,9 @@ fn delegate_named_ty(table: &LocalTable, v: u32) -> Option<std::sync::Arc<super:
 /// known class agrees on the same delegate type. One untyped `is_this` among
 /// delegate-typed ones still proves (untyped is lack of evidence, not counter-
 /// evidence); two DIFFERENT delegate types refuse.
-fn this_delegate_base(table: &LocalTable) -> Option<(u32, std::sync::Arc<super::types::NamedType>)> {
+fn this_delegate_base(
+    table: &LocalTable,
+) -> Option<(u32, std::sync::Arc<super::types::NamedType>)> {
     let mut found: Option<(u32, std::sync::Arc<super::types::NamedType>)> = None;
     // Deterministic order: sort versions so the chosen receiver does not
     // depend on `HashMap` iteration (see `det_gate.sh`).
@@ -2384,7 +3273,9 @@ fn this_delegate_base(table: &LocalTable) -> Option<(u32, std::sync::Arc<super::
         if li == usize::MAX {
             continue;
         }
-        let Some(info) = table.infos.get(li) else { continue };
+        let Some(info) = table.infos.get(li) else {
+            continue;
+        };
         if !info.is_this {
             continue;
         }
@@ -2443,10 +3334,7 @@ fn delegate_invoke_ref(ns: String, tname: String) -> MethodRef {
 ///
 /// Anything else bumps `DELEGATE_REFUSED_UNPROVEN` and refuses — the site
 /// stays `fnptr_`. Inert: atomic increments only, no IR change.
-fn delegate_invoke_of_def(
-    src: &Operand,
-    table: &LocalTable,
-) -> Option<(MethodRef, u32)> {
+fn delegate_invoke_of_def(src: &Operand, table: &LocalTable) -> Option<(MethodRef, u32)> {
     match src {
         Operand::InstanceField { base, field } if is_invoke_impl_field(field) => {
             DELEGATE_LOOKUP_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -2512,19 +3400,14 @@ fn resolve_arith_slot(
     table: &LocalTable,
     maps: &ResolveMaps,
     parents: &HashMap<i32, Vec<i32>>,
-    vtable_base: i64,
-    entry: i64,
+    ptr_size: u64,
     depth: u8,
 ) -> Option<MethodRef> {
     ARITH_SLOT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     let miss = |m: ArithSlotMiss| {
         match m {
-            ArithSlotMiss::Dynamic => {
-                ARITH_SLOT_REFUSED_DYNAMIC.fetch_add(1, Ordering::Relaxed)
-            }
-            ArithSlotMiss::NoDef => {
-                ARITH_SLOT_REFUSED_NO_DEF.fetch_add(1, Ordering::Relaxed)
-            }
+            ArithSlotMiss::Dynamic => ARITH_SLOT_REFUSED_DYNAMIC.fetch_add(1, Ordering::Relaxed),
+            ArithSlotMiss::NoDef => ARITH_SLOT_REFUSED_NO_DEF.fetch_add(1, Ordering::Relaxed),
             ArithSlotMiss::UnknownKlass => {
                 ARITH_SLOT_REFUSED_UNKNOWN_KLASS.fetch_add(1, Ordering::Relaxed)
             }
@@ -2550,8 +3433,16 @@ fn resolve_arith_slot(
         }
         match &insns[d].op {
             Op::Arith(super::ir::ArithKind::Add) => {
-                let lhs = insns[d].operands.get(1).cloned().unwrap_or(Operand::Unknown);
-                let rhs = insns[d].operands.get(2).cloned().unwrap_or(Operand::Unknown);
+                let lhs = insns[d]
+                    .operands
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Operand::Unknown);
+                let rhs = insns[d]
+                    .operands
+                    .get(2)
+                    .cloned()
+                    .unwrap_or(Operand::Unknown);
                 match (lhs, rhs) {
                     (Operand::Local(w), Operand::Immediate(c)) => {
                         acc = acc.wrapping_add(c);
@@ -2579,7 +3470,11 @@ fn resolve_arith_slot(
             // itself. Refuse — do not fold a runtime value into a slot.
             Op::Arith(_) => return miss(ArithSlotMiss::Dynamic),
             Op::Move => {
-                let src = insns[d].operands.get(1).cloned().unwrap_or(Operand::Unknown);
+                let src = insns[d]
+                    .operands
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Operand::Unknown);
                 match src {
                     Operand::Local(w) if w != cur => {
                         cur = w;
@@ -2595,15 +3490,22 @@ fn resolve_arith_slot(
     let Some(tdi) = klass_tdi_of(insns, upto, &klass_op, table, maps, depth) else {
         return miss(ArithSlotMiss::UnknownKlass);
     };
-    let step = acc - vtable_base;
-    if step < 0 || step % entry != 0 {
+    // Same two candidate bases as `vtable_dispatch`: the accumulated constant is
+    // the entry offset, and which base it is relative to depends on the class
+    // layout this image was built with (see `vtable_slot_candidates`).
+    let (cands, n) = vtable_slot_candidates(acc, ptr_size);
+    if n == 0 {
         return miss(ArithSlotMiss::BadOffset);
     }
-    let slot = (step / entry) as usize;
-    let hit = lookup_vtable_slot(maps, parents, tdi, slot)
-        .or_else(|| lookup_interface_slot(parents, tdi, slot))?;
-    ARITH_SLOT_HITS.fetch_add(1, Ordering::Relaxed);
-    Some(hit)
+    for &slot in cands.iter().take(n) {
+        if let Some(hit) = lookup_vtable_slot(maps, parents, tdi, slot)
+            .or_else(|| lookup_interface_slot(parents, tdi, slot))
+        {
+            ARITH_SLOT_HITS.fetch_add(1, Ordering::Relaxed);
+            return Some(hit);
+        }
+    }
+    miss(ArithSlotMiss::BadOffset)
 }
 
 /// Resolve the TypeDef of the object a vtable load is dispatched through.
@@ -2644,8 +3546,14 @@ fn klass_tdi_of(
                 return None;
             }
             match insns[d].operands.get(1)? {
-                Operand::Memory { base: obj, addend: 0, index: None, .. } => match obj.as_ref() {
-                    Operand::Local(recv) => seed_class_tdi(table, *recv),
+                Operand::Memory {
+                    base: obj,
+                    addend: 0,
+                    index: None,
+                    ..
+                } => match obj.as_ref() {
+                    Operand::Local(recv) => seed_class_tdi(table, *recv)
+                        .or_else(|| receiver_tdi_through_fields(insns, d, *recv, 4)),
                     Operand::Immediate(k) => maps.klass_to_tdi.get(&(*k as u64)).copied(),
                     _ => None,
                 },
@@ -2882,7 +3790,9 @@ fn interface_slot_loss(
     }
     let (mut plain, mut generic) = (0usize, 0usize);
     for mi in start..start.saturating_add(count) {
-        let Some(md) = method_defs.get(mi) else { continue };
+        let Some(md) = method_defs.get(mi) else {
+            continue;
+        };
         if md.slot == u16::MAX {
             continue;
         }
@@ -3067,7 +3977,9 @@ pub fn build_interface_dispatch_detailed(
         }
         let start = type_defs[tdi].interface_offsets_start as usize;
         for k in start..start.saturating_add(count) {
-            let Some(pair) = interface_offsets.get(k) else { break };
+            let Some(pair) = interface_offsets.get(k) else {
+                break;
+            };
             stats.pairs_seen += 1;
             let Some(itdi) = iface_tdi_of(pair.type_index) else {
                 stats.pairs_unresolved_type += 1;
@@ -3223,7 +4135,7 @@ fn resolve_indirect_target(
     ptr_size: u64,
     depth: u8,
 ) -> Option<MethodRef> {
-    let (vtable_base, entry) = vtable_layout(ptr_size);
+    let _ = vtable_layout(ptr_size);
     match target {
         Operand::Method(m) => Some(m.clone()),
         Operand::Immediate(a) => maps.methods_by_rva.get(&(*a as u64)).cloned(),
@@ -3246,7 +4158,12 @@ fn resolve_indirect_target(
         // is no separate `Move` to walk back to. Without this arm every x64
         // virtual call stayed unnamed even once the lifter stopped discarding
         // the target.
-        Operand::Memory { base, addend, index: None, .. } => {
+        Operand::Memory {
+            base,
+            addend,
+            index: None,
+            ..
+        } => {
             // An `Arith`-computed base (`v60 = v59 + 312`) never forms the
             // constant `Memory` shape this arm keys on. Route it to the
             // proof-only folder instead of mis-keying it here.
@@ -3255,27 +4172,23 @@ fn resolve_indirect_target(
                     if let Some(d) = ssa_def_of(insns, upto, *bv) {
                         if matches!(insns[d].op, Op::Arith(_)) {
                             return resolve_arith_slot(
-                                insns, upto, *bv, *addend, table, maps, parents,
-                                vtable_base, entry, depth,
+                                insns,
+                                upto,
+                                *bv,
+                                *addend,
+                                table,
+                                maps,
+                                parents,
+                                ptr_size,
+                                depth,
                             );
                         }
                     }
                 }
             }
-            let step = *addend - vtable_base;
-            if step < 0 || step % entry != 0 {
-                return None;
-            }
-            let slot = (step / entry) as usize;
-            let Some(tdi) = klass_tdi_of(insns, upto, base, table, maps, depth) else {
-                count_unknown_klass_imm(base, insns, upto, maps);
-                return None;
-            };
-            // Class virtuals first; if the slot is not declared anywhere in the
-            // receiver's ancestry it may be an INTERFACE method, which lives at
-            // `interfaceOffset + method.slot` in the same vtable array.
-            lookup_vtable_slot(maps, parents, tdi, slot)
-                .or_else(|| lookup_interface_slot(parents, tdi, slot))
+            vtable_dispatch(
+                insns, upto, base, *addend, table, maps, parents, ptr_size, depth,
+            )
         }
         Operand::Local(v) if depth > 0 => {
             let Some(d) = ssa_def_of(insns, upto, *v) else {
@@ -3299,7 +4212,12 @@ fn resolve_indirect_target(
                     INDEXED_SLOT_REFUSALS.fetch_add(1, Ordering::Relaxed);
                     None
                 }
-                Operand::Memory { base, addend, index: None, .. } => {
+                Operand::Memory {
+                    base,
+                    addend,
+                    index: None,
+                    ..
+                } => {
                     // Same `Arith`-base routing as the inline arm: `fn =
                     // [v60]` with `v60 = v59 + 312` never forms a keyable
                     // `(tdi, slot)` here.
@@ -3307,26 +4225,30 @@ fn resolve_indirect_target(
                         if let Some(bd) = ssa_def_of(insns, d, *bv) {
                             if matches!(insns[bd].op, Op::Arith(_)) {
                                 return resolve_arith_slot(
-                                    insns, d, *bv, *addend, table, maps, parents,
-                                    vtable_base, entry, depth - 1,
+                                    insns,
+                                    d,
+                                    *bv,
+                                    *addend,
+                                    table,
+                                    maps,
+                                    parents,
+                                    ptr_size,
+                                    depth - 1,
                                 );
                             }
                         }
                     }
-                    let step = *addend - vtable_base;
-                    // The methodPtr half of an entry only: `step % entry ==
-                    // ptr_size` is the companion `MethodInfo*` of the entry
-                    // below it, which is not a call target.
-                    if step < 0 || step % entry != 0 {
-                        return None;
-                    }
-                    let slot = (step / entry) as usize;
-                    let Some(tdi) = klass_tdi_of(insns, d, base, table, maps, depth - 1) else {
-                        count_unknown_klass_imm(base, insns, d, maps);
-                        return None;
-                    };
-                    lookup_vtable_slot(maps, parents, tdi, slot)
-                        .or_else(|| lookup_interface_slot(parents, tdi, slot))
+                    vtable_dispatch(
+                        insns,
+                        d,
+                        base,
+                        *addend,
+                        table,
+                        maps,
+                        parents,
+                        ptr_size,
+                        depth - 1,
+                    )
                 }
                 // The delegate shape after typing: `t = base.invoke_impl`.
                 // Proven through [`delegate_invoke_of_def`]; unproven stays
@@ -3337,9 +4259,16 @@ fn resolve_indirect_target(
                     delegate_invoke_of_def(src, table).map(|(m, _)| m)
                 }
                 // `mov x9, x10` — the callee pointer moved through a register.
-                src @ Operand::Local(w) if *w != *v => {
-                    resolve_indirect_target(insns, d, src, table, maps, parents, ptr_size, depth - 1)
-                }
+                src @ Operand::Local(w) if *w != *v => resolve_indirect_target(
+                    insns,
+                    d,
+                    src,
+                    table,
+                    maps,
+                    parents,
+                    ptr_size,
+                    depth - 1,
+                ),
                 _ => None,
             }
         }
@@ -3354,18 +4283,15 @@ fn resolve_indirect_target(
 /// corpus) versus a computed/untyped receiver (a typing/shape gap). Only the
 /// first is counted here, so the residue splits into addressable buckets
 /// instead of one opaque "unknown klass".
-fn count_unknown_klass_imm(
-    base: &Operand,
-    insns: &[Insn],
-    upto: usize,
-    maps: &ResolveMaps,
-) {
+fn count_unknown_klass_imm(base: &Operand, insns: &[Insn], upto: usize, maps: &ResolveMaps) {
     let imm = match base {
         Operand::Immediate(k) => Some(*k as u64),
-        Operand::Local(kl) => ssa_def_of(insns, upto, *kl).and_then(|d| match insns[d].operands.get(1) {
-            Some(Operand::Immediate(k)) => Some(*k as u64),
-            _ => None,
-        }),
+        Operand::Local(kl) => {
+            ssa_def_of(insns, upto, *kl).and_then(|d| match insns[d].operands.get(1) {
+                Some(Operand::Immediate(k)) => Some(*k as u64),
+                _ => None,
+            })
+        }
         _ => None,
     };
     if let Some(k) = imm {
@@ -3384,7 +4310,9 @@ fn count_unknown_klass_imm(
 fn delegate_base_nocount(src: &Operand, table: &LocalTable) -> Option<u32> {
     match src {
         Operand::InstanceField { base, field } if is_invoke_impl_field(field) => {
-            let Operand::Local(d) = base.as_ref() else { return None };
+            let Operand::Local(d) = base.as_ref() else {
+                return None;
+            };
             delegate_named_ty(table, *d).map(|_| *d)
         }
         Operand::Field(field) if is_invoke_impl_field(field) => {
@@ -3406,12 +4334,7 @@ fn delegate_base_nocount(src: &Operand, table: &LocalTable) -> Option<u32> {
 /// off the delegate base, or a `Field` with a `Delegate` declaring type (the
 /// `this`-delegate hidden loads). Anything else — including the delegate
 /// base itself — is kept. Never drops a write, never invents a value.
-fn is_hidden_delegate_arg(
-    insns: &[Insn],
-    upto: usize,
-    op: &Operand,
-    delegate_base: u32,
-) -> bool {
+fn is_hidden_delegate_arg(insns: &[Insn], upto: usize, op: &Operand, delegate_base: u32) -> bool {
     // Direct field operand off the same base (not yet materialized).
     match op {
         Operand::InstanceField { base, field }
@@ -3427,7 +4350,9 @@ fn is_hidden_delegate_arg(
         _ => {}
     }
     let Operand::Local(v) = op else { return false };
-    let Some(d) = ssa_def_of(insns, upto, *v) else { return false };
+    let Some(d) = ssa_def_of(insns, upto, *v) else {
+        return false;
+    };
     if !matches!(insns[d].op, Op::Move) {
         return false;
     }
@@ -3530,6 +4455,92 @@ fn vtable_layout(ptr_size: u64) -> (i64, i64) {
     }
 }
 
+/// The vtable SLOT numbers an entry offset can denote, in preference order.
+///
+/// `Il2CppClass::vtable` is at **0x130 on the builds the constant was measured
+/// on, and at 0x138 on the v29+ layout**, where four `uint16_t` counters
+/// (method/property/field/event counts) were inserted before the array. This
+/// image is the second kind, and the machine code says so directly:
+///
+/// ```text
+/// 0x148a4f4  ldr x9, [x0]              ; x9 = klass
+/// 0x148a4fc  ldp x8, x1, [x9, #0x188] ; methodPtr = [klass+0x188], MethodInfo = [klass+0x190]
+/// 0x148a500  blr x8
+/// ```
+///
+/// The IR agrees: `Local(84) = [Local(82) + 392]`, `Local(85) = [Local(82) +
+/// 400]`, `Call [Local(84), …, Local(81), Local(85), …]` — the `methodPtr` /
+/// `MethodInfo` halves of ONE `VirtualInvokeData` (stride 16). 392 is
+/// `8 (mod 16)`, so the 0x130 rule rejects every site of this shape as "not a
+/// vtable methodPtr" — which is exactly what `ILR_VC` reports, at 100 % of the
+/// computed-callee misses on this corpus.
+///
+/// Trying both bases cannot mis-key a call, because the two accept DISJOINT
+/// offset sets (`base + k*16` for 0x130 is `≡0`; for 0x138 it is `≡8`) and a
+/// CALL TARGET is always the `methodPtr` half: the `MethodInfo` half is passed
+/// as an argument, never branched to. Under a 0x130 image the `≡8` offsets are
+/// therefore MethodInfo pointers that no `BLR` targets; under a 0x138 image
+/// the `≡0` offsets are not entry starts at all. Each candidate still has to
+/// land on a `(tdi, slot)` the receiver's class DECLARES, which is the same
+/// validation the single base had, so the accepted set only grows where the
+/// metadata can confirm it.
+///
+/// 32-bit keeps its single measured base: the ARM32 entry stride/offset set was
+/// measured, not derived, and no ARM32 image is available here to re-measure.
+fn vtable_slot_candidates(addend: i64, ptr_size: u64) -> ([usize; 2], usize) {
+    let (base, entry) = vtable_layout(ptr_size);
+    let mut out = [0usize; 2];
+    let mut n = 0;
+    let step = addend - base;
+    if step >= 0 && step % entry == 0 {
+        out[n] = (step / entry) as usize;
+        n += 1;
+    }
+    if ptr_size == 8 && entry % 2 == 0 {
+        let alt = base + entry / 2;
+        let step = addend - alt;
+        if step >= 0 && step % entry == 0 {
+            out[n] = (step / entry) as usize;
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
+/// Key a vtable entry offset against the receiver's class (and its ancestry).
+///
+/// The single place that turns "a call through `[klass + off]`" into a method,
+/// shared by the constant-`Memory` arm and the `Arith`-base arm so the two can
+/// never disagree about which bases are tried or how a hit is validated.
+fn vtable_dispatch(
+    insns: &[Insn],
+    upto: usize,
+    klass_op: &Operand,
+    addend: i64,
+    table: &LocalTable,
+    maps: &ResolveMaps,
+    parents: &HashMap<i32, Vec<i32>>,
+    ptr_size: u64,
+    depth: u8,
+) -> Option<MethodRef> {
+    let (cands, n) = vtable_slot_candidates(addend, ptr_size);
+    if n == 0 {
+        return None;
+    }
+    let Some(tdi) = klass_tdi_of(insns, upto, klass_op, table, maps, depth) else {
+        count_unknown_klass_imm(klass_op, insns, upto, maps);
+        return None;
+    };
+    for &slot in cands.iter().take(n) {
+        if let Some(m) =
+            lookup_vtable_slot(maps, parents, tdi, slot).or_else(|| lookup_interface_slot(parents, tdi, slot))
+        {
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// `ILR_VC=1` diagnostic: why an indirect call could not be named.
 fn report_vc_miss(
     insns: &[Insn],
@@ -3567,7 +4578,10 @@ fn report_vc_miss(
                 let proven = this_delegate_base(table)
                     .map(|(_, nt)| format!("{}.{}", nt.namespace, nt.name))
                     .unwrap_or_else(|| "(no delegate this)".into());
-                eprintln!("[vc] miss {addr:#x} v{v} delegate invoke_impl (this-field) {proven}: {:?}", ops);
+                eprintln!(
+                    "[vc] miss {addr:#x} v{v} delegate invoke_impl (this-field) {proven}: {:?}",
+                    ops
+                );
                 true
             }
             _ => false,
@@ -3616,8 +4630,12 @@ fn report_vc_miss(
             // slot is computed at runtime through the chain. Show the chain
             // head so the dynamic shape is auditable (the full chain is in
             // the stage dump; the counters say how many such sites exist).
-            if let Some(Operand::Memory { base, addend: _, index: None, .. }) =
-                insns[d].operands.get(1).cloned()
+            if let Some(Operand::Memory {
+                base,
+                addend: _,
+                index: None,
+                ..
+            }) = insns[d].operands.get(1).cloned()
             {
                 if let Operand::Local(bv) = base.as_ref() {
                     if let Some(bd) = ssa_def_of(insns, d, *bv) {
@@ -3631,28 +4649,47 @@ fn report_vc_miss(
                     }
                 }
             }
-            let Operand::Memory { base, addend, index: None, .. } =
-                insns[d].operands.get(1).cloned().unwrap_or(Operand::Unknown)
+            let Operand::Memory {
+                base,
+                addend,
+                index: None,
+                ..
+            } = insns[d]
+                .operands
+                .get(1)
+                .cloned()
+                .unwrap_or(Operand::Unknown)
             else {
-                eprintln!("[vc] miss {addr:#x} v{v} is not a memory load: {:?}", insns[d].operands);
+                eprintln!(
+                    "[vc] miss {addr:#x} v{v} is not a memory load: {:?}",
+                    insns[d].operands
+                );
                 return;
             };
             (base, addend, d, format!("v{v}"))
         }
-        Operand::Memory { base, addend, index: None, .. } => {
-            (base.clone(), *addend, i, "[mem] call".to_string())
-        }
+        Operand::Memory {
+            base,
+            addend,
+            index: None,
+            ..
+        } => (base.clone(), *addend, i, "[mem] call".to_string()),
         other => {
             eprintln!("[vc] miss {addr:#x} target is not a value: {other:?}");
             return;
         }
     };
     let (base, addend, d) = (base, addend, at);
-    if addend < vtable_base || (addend - vtable_base) % entry != 0 {
+    let _ = (vtable_base, entry);
+    // Same candidate arithmetic the resolver uses (both vtable bases), so the
+    // report can never call an offset "not a methodPtr" while the real pass
+    // was trying a valid slot derived from the alternate base.
+    let (cands, ncand) = vtable_slot_candidates(addend, ptr_size);
+    if ncand == 0 {
         eprintln!("[vc] miss {addr:#x} {what}: offset {addend} is not a vtable methodPtr");
         return;
     }
-    let slot = ((addend - vtable_base) / entry) as usize;
+    let slot = cands[0];
     let tdi = klass_tdi_of(insns, d, &base, table, maps, 4);
     let Some(tdi) = tdi else {
         // Say WHY the class is unknown, not just that it is: the klass-pointer
@@ -3683,7 +4720,10 @@ fn report_vc_miss(
         let recv = match base.as_ref() {
             Operand::Local(v) => ssa_def_of(insns, d, *v).and_then(|k| {
                 let op = insns[k].operands.get(1)?;
-                if let Operand::Memory { base, addend: 0, .. } = op {
+                if let Operand::Memory {
+                    base, addend: 0, ..
+                } = op
+                {
                     if let Operand::Local(r) = base.as_ref() {
                         return Some(*r);
                     }
@@ -3705,25 +4745,18 @@ fn report_vc_miss(
                 for _ in 0..6 {
                     let li = table.index_of.get(&cur).and_then(|i| table.infos.get(*i));
                     let (ty, is_this, origin) = match li {
-                        Some(i) => (
-                            format!("{:?}", i.ty),
-                            i.is_this,
-                            i.slot_origin.clone(),
-                        ),
+                        Some(i) => (format!("{:?}", i.ty), i.is_this, i.slot_origin.clone()),
                         None => ("(not in table)".to_string(), false, "?".to_string()),
                     };
                     let k = ssa_def_of(insns, d, cur);
                     let (shape, next) = match k.map(|k| &insns[k].operands) {
                         Some(ops) => match ops.get(1) {
-                            Some(Operand::Memory { base: b, addend, .. }) => {
-                                match b.as_ref() {
-                                    Operand::Local(w) => (
-                                        format!("[v{w} + {addend}]"),
-                                        Some(*w),
-                                    ),
-                                    other => (format!("[{other:?} + {addend}]"), None),
-                                }
-                            }
+                            Some(Operand::Memory {
+                                base: b, addend, ..
+                            }) => match b.as_ref() {
+                                Operand::Local(w) => (format!("[v{w} + {addend}]"), Some(*w)),
+                                other => (format!("[{other:?} + {addend}]"), None),
+                            },
                             // A pure register copy (`v20 = v19`, the `mov r4,
                             // r0` pin) is part of the chain, not its end:
                             // follow it so an untyped receiver is traced to
@@ -3771,6 +4804,496 @@ fn report_vc_miss(
     );
 }
 
+/// Does any instruction other than `skip` READ version `v`?
+///
+/// A rewritten call replaces the indirect expression with a direct call; when
+/// the resolved method returns VOID the renderer emits a bare statement and
+/// the destination assignment disappears. If something reads that
+/// destination — the IR modelled the x0 value although the managed method has
+/// none — naming it void leaves an undefined reader (`ptr8 = v349`). Such a
+/// site is refused and keeps its raw call, which still carries the value.
+fn version_read_elsewhere(insns: &[Insn], skip: usize, v: u32) -> bool {
+    let mut work = vec![v];
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    while let Some(cur) = work.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        for (k, insn) in insns.iter().enumerate() {
+            if k == skip {
+                continue;
+            }
+            for (j, op) in insn.operands.iter().enumerate() {
+                if !matches!(op, Operand::Local(w) if *w == cur) {
+                    continue;
+                }
+                let is_write = match insn.op {
+                    Op::Move | Op::Phi | Op::Arith(_) => j == 0,
+                    Op::Call | Op::CallVoid => j == 1,
+                    _ => false,
+                };
+                if is_write {
+                    continue;
+                }
+                // A copy or phi FORWARDS the value; follow its destination.
+                // A RETURN ends the chain: the renderer prints no value for a
+                // void return, so a value that only reaches returns is not a
+                // rendered use. Any other consumer is a real read and the
+                // site refuses.
+                match insn.op {
+                    Op::Move | Op::Phi => match insn.operands.first() {
+                        Some(Operand::Local(d)) => work.push(*d),
+                        _ => return true,
+                    },
+                    Op::Return => {}
+                    _ => return true,
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `(klass local, entry addend)` of the vtable slot load behind a call target.
+fn slot_load_of(insns: &[Insn], upto: usize, target: &Operand) -> Option<(u32, i64)> {
+    let Operand::Local(v) = target else {
+        return None;
+    };
+    let d = ssa_def_of(insns, upto, *v)?;
+    match insns[d].operands.get(1)? {
+        Operand::Memory {
+            base,
+            addend,
+            index: None,
+            ..
+        } => match base.as_ref() {
+            Operand::Local(b) => Some((*b, *addend)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Is `op` the `MethodInfo` half of the SAME `VirtualInvokeData` entry?
+fn is_companion_slot_load(
+    insns: &[Insn],
+    upto: usize,
+    op: &Operand,
+    vid_base: u32,
+    vt_off: i64,
+) -> bool {
+    let Operand::Local(v) = op else {
+        return false;
+    };
+    let Some(d) = ssa_def_of(insns, upto, *v) else {
+        return false;
+    };
+    matches!(
+        insns[d].operands.get(1),
+        Some(Operand::Memory {
+            base,
+            addend,
+            index: None,
+            ..
+        }) if *addend == vt_off + 8
+            && matches!(base.as_ref(), Operand::Local(b) if *b == vid_base)
+    )
+}
+
+/// Absolute address an operand denotes, following register moves and
+/// `base + constant` address arithmetic. Small immediates are values, not
+/// addresses, and are refused.
+#[allow(dead_code)]
+fn addr_of_operand(insns: &[Insn], upto: usize, op: &Operand, depth: u8) -> Option<u64> {
+    if depth == 0 {
+        return None;
+    }
+    match op {
+        Operand::Immediate(a) if (*a as u64) >= 0x10000 => Some(*a as u64),
+        Operand::Local(v) => {
+            let d = ssa_def_of(insns, upto, *v)?;
+            match insns[d].op {
+                Op::Move => match insns[d].operands.get(1)? {
+                    Operand::Immediate(a) if (*a as u64) >= 0x10000 => Some(*a as u64),
+                    Operand::Memory {
+                        base,
+                        addend,
+                        index: None,
+                        ..
+                    } => Some(addr_of_operand(insns, d, base, depth - 1)? + *addend as u64),
+                    src @ Operand::Local(w) if *w != *v => {
+                        addr_of_operand(insns, d, src, depth - 1)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Constant value an operand carries, following register moves.
+fn operand_const(insns: &[Insn], upto: usize, op: &Operand, depth: u8) -> Option<i64> {
+    if depth == 0 {
+        return None;
+    }
+    match op {
+        Operand::Immediate(k) => Some(*k),
+        Operand::Local(v) => {
+            let d = ssa_def_of(insns, upto, *v)?;
+            if matches!(insns[d].op, Op::Phi) {
+                if insns[d].operands.len() > 9 {
+                    return None;
+                }
+                let mut found: Option<i64> = None;
+                for arm in insns[d].operands.iter().skip(1) {
+                    let k = operand_const(insns, d, arm, depth - 1)?;
+                    match found {
+                        None => found = Some(k),
+                        Some(prev) if prev == k => {}
+                        Some(_) => return None,
+                    }
+                }
+                return found;
+            }
+            if !matches!(insns[d].op, Op::Move) {
+                return None;
+            }
+            match insns[d].operands.get(1)? {
+                src @ Operand::Local(w) if *w != *v => operand_const(insns, d, src, depth - 1),
+                other => operand_const(insns, d, other, depth - 1),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// TypeDef index named by a metadata cell at `addr`, following the GOT.
+fn klass_tdi_at_addr(maps: &ResolveMaps, addr: u64) -> Option<i32> {
+    if let Some(&tdi) = maps.klass_to_tdi.get(&addr) {
+        return Some(tdi);
+    }
+    if let Some(mt) = maps.usage_type_by_addr.get(&addr) {
+        if let ManagedType::Class(nt) = mt {
+            if nt.type_def_index >= 0 {
+                return Some(nt.type_def_index);
+            }
+        }
+    }
+    if let Some(&target) = maps.got_addend_by_addr.get(&addr) {
+        return klass_tdi_at_addr(maps, target);
+    }
+    None
+}
+
+/// TypeDef index of a KLASS-token operand: an immediate klass address or the
+/// value loaded from a metadata cell (an interface's `typeof` argument).
+/// TypeDef named by a metadata cell reached by folding `op + off` as an
+/// address. A PHI of cells is one type when every arm names the same one.
+fn cell_tdi_addr_expr(
+    insns: &[Insn],
+    upto: usize,
+    op: &Operand,
+    off: i64,
+    maps: &ResolveMaps,
+    depth: u8,
+) -> Option<i32> {
+    if depth == 0 {
+        return None;
+    }
+    match op {
+        Operand::Immediate(a) if (*a as u64) >= 0x10000 => {
+            klass_tdi_at_addr(maps, (*a as u64).wrapping_add(off as u64))
+        }
+        Operand::Local(v) => {
+            let d = ssa_def_of(insns, upto, *v)?;
+            match insns[d].op {
+                Op::Phi => {
+                    // A big phi is a data merge, not a materialised type
+                    // token; walking it multiplies work for no proof.
+                    if insns[d].operands.len() > 9 {
+                        return None;
+                    }
+                    let mut found: Option<i32> = None;
+                    for arm in insns[d].operands.iter().skip(1) {
+                        let t = cell_tdi_addr_expr(insns, d, arm, off, maps, depth - 1)?;
+                        match found {
+                            None => found = Some(t),
+                            Some(prev) if prev == t => {}
+                            Some(_) => return None,
+                        }
+                    }
+                    found
+                }
+                Op::Move => match insns[d].operands.get(1)? {
+                    // A load of a POINTER to the cell: keep folding.
+                    Operand::Memory {
+                        base,
+                        addend,
+                        index: None,
+                        ..
+                    } => cell_tdi_addr_expr(
+                        insns,
+                        d,
+                        base,
+                        addend.wrapping_add(off),
+                        maps,
+                        depth - 1,
+                    ),
+                    src => cell_tdi_addr_expr(insns, d, src, off, maps, depth - 1),
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn token_tdi_of(insns: &[Insn], upto: usize, op: &Operand, maps: &ResolveMaps) -> Option<i32> {
+    let mut memo: HashMap<u32, Option<i32>> = HashMap::new();
+    let mut busy: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    token_tdi_of_m(insns, upto, op, maps, 12, &mut memo, &mut busy)
+}
+
+/// Depth-bounded core. A loop-carried phi can reference versions defined
+/// LATER in the listing, so the phi walk is a graph, not a DAG; without the
+/// bound a cycle re-explores both arms at every level (exponential) and the
+/// whole dump dies.
+fn token_tdi_of_m(
+    insns: &[Insn],
+    upto: usize,
+    op: &Operand,
+    maps: &ResolveMaps,
+    depth: u8,
+    memo: &mut HashMap<u32, Option<i32>>,
+    busy: &mut std::collections::HashSet<u32>,
+) -> Option<i32> {
+    if depth == 0 {
+        return None;
+    }
+    match op {
+        Operand::Immediate(a) => klass_tdi_at_addr(maps, *a as u64),
+        Operand::Local(v) => {
+            if let Some(hit) = memo.get(v) {
+                return *hit;
+            }
+            // A loop-carried phi references versions defined LATER; a cycle
+            // is a refusal for this query, not a reason to spin.
+            if !busy.insert(*v) {
+                return None;
+            }
+            let d = ssa_def_of(insns, upto, *v);
+            let result = match d {
+                Some(d) => match insns[d].op {
+                    // A type token merged across branches is still ONE type:
+                    // every arm must name it (the cells may differ).
+                    Op::Phi => {
+                        if insns[d].operands.len() > 9 {
+                            busy.remove(v);
+                            memo.insert(*v, None);
+                            return None;
+                        }
+                        let mut found: Option<i32> = None;
+                        let mut ok = true;
+                        for arm in insns[d].operands.iter().skip(1) {
+                            match token_tdi_of_m(insns, d, arm, maps, depth - 1, memo, busy) {
+                                Some(t) => match found {
+                                    None => found = Some(t),
+                                    Some(prev) if prev == t => {}
+                                    Some(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                },
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            found
+                        } else {
+                            None
+                        }
+                    }
+                    Op::Move => match insns[d].operands.get(1) {
+                        Some(Operand::Memory {
+                            base,
+                            addend,
+                            index: None,
+                            ..
+                        }) => {
+                            cell_tdi_addr_expr(insns, d, base, *addend, maps, depth.min(6))
+                        }
+                        Some(src @ Operand::Local(w)) if *w != *v => {
+                            token_tdi_of_m(insns, d, src, maps, depth - 1, memo, busy)
+                        }
+                        Some(Operand::Immediate(a)) => klass_tdi_at_addr(maps, *a as u64),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                None => None,
+            };
+            busy.remove(v);
+            memo.insert(*v, result);
+            result
+        }
+        _ => None,
+    }
+}
+
+/// Interface invoke-data dispatch:
+/// `vid = get_interface_invoke_data(obj, typeof(I), slot); call [vid]`.
+///
+/// The helper returns a `VirtualInvokeData*` whose halves the call site loads
+/// (`[vid]` is the callee, `[vid + 8]` the hidden MethodInfo argument). The
+/// interface type comes from the helper's own `typeof(I)` argument and the
+/// slot from its constant argument, so the call resolves to the interface's
+/// DECLARED method without trusting any helper address. `vid` usually reaches
+/// the call through a phi (the inline interface-offset scan merges with the
+/// helper's result), so copies and phi arms are followed; arms that name
+/// different helpers make the site refuse.
+fn rewrite_interface_invoke_calls(
+    insns: &mut [Insn],
+    _table: &LocalTable,
+    maps: &ResolveMaps,
+    parents: &HashMap<i32, Vec<i32>>,
+    stats: &mut ResolveStats,
+) {
+    use std::collections::HashMap;
+    // dest version → (receiver version, interface tdi, slot)
+    let mut helpers: HashMap<u32, (u32, i32, usize)> = HashMap::new();
+    for i in 0..insns.len() {
+        if !matches!(insns[i].op, Op::Call) {
+            continue;
+        }
+        if !matches!(insns[i].operands.first(), Some(Operand::Immediate(_))) {
+            continue;
+        }
+        let ops = &insns[i].operands;
+        let Some(Operand::Local(dest)) = ops.get(1) else {
+            continue;
+        };
+        let Some(Operand::Local(obj)) = ops.get(2) else {
+            continue;
+        };
+        let Some(iface) = ops.get(3).and_then(|o| token_tdi_of(insns, i, o, maps)) else {
+            continue;
+        };
+        if !maps.interface_tdis.contains(&iface) {
+            continue;
+        }
+        let Some(slot) = ops.get(4).and_then(|o| operand_const(insns, i, o, 6)) else {
+            continue;
+        };
+        if !(0..4096).contains(&slot) {
+            continue;
+        }
+        helpers.insert(*dest, (*obj, iface, slot as usize));
+    }
+    if helpers.is_empty() {
+        return;
+    }
+    // Distinct helper shapes reaching one invoke-data local.
+    fn helper_of(
+        insns: &[Insn],
+        upto: usize,
+        v: u32,
+        helpers: &HashMap<u32, (u32, i32, usize)>,
+        depth: u8,
+        out: &mut Vec<(u32, i32, usize)>,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        if let Some(h) = helpers.get(&v) {
+            out.push(*h);
+            return;
+        }
+        let Some(d) = ssa_def_of(insns, upto, v) else {
+            return;
+        };
+        match insns[d].op {
+            Op::Phi => {
+                for src in insns[d].operands.iter().skip(1) {
+                    if let Operand::Local(w) = src {
+                        helper_of(insns, d, *w, helpers, depth - 1, out);
+                    }
+                }
+            }
+            Op::Move => {
+                if let Some(Operand::Local(w)) = insns[d].operands.get(1) {
+                    if *w != v {
+                        helper_of(insns, d, *w, helpers, depth - 1, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for i in 0..insns.len() {
+        if !matches!(insns[i].op, Op::Call) {
+            continue;
+        }
+        if matches!(insns[i].operands.first(), Some(Operand::Method(_))) {
+            continue;
+        }
+        let Some((vid, off)) = insns[i]
+            .operands
+            .first()
+            .and_then(|t| slot_load_of(insns, i, t))
+        else {
+            continue;
+        };
+        if off != 0 {
+            continue;
+        }
+        let Some(Operand::Local(recv)) = insns[i].operands.get(2) else {
+            continue;
+        };
+        let mut found = Vec::new();
+        helper_of(insns, i, vid, &helpers, 8, &mut found);
+        found.sort_unstable();
+        found.dedup();
+        let [(obj, iface, slot)] = found.as_slice() else {
+            continue;
+        };
+        if obj != recv {
+            continue;
+        }
+        let Some(m) = lookup_vtable_slot(maps, parents, *iface, *slot)
+            .or_else(|| maps.vtable_slots.get(&(*iface, *slot)).cloned())
+        else {
+            continue;
+        };
+        if m.sig.is_void_like() {
+            if let Some(Operand::Local(dv)) = insns[i].operands.get(1) {
+                if version_read_elsewhere(insns, i, *dv) {
+                    continue;
+                }
+            }
+        }
+        // Rebuild: receiver + the outer user arguments, dropping the hidden
+        // MethodInfo half of the invoke-data pair.
+        let mut ops: Vec<Operand> = Vec::with_capacity(insns[i].operands.len());
+        ops.push(Operand::Method(m.clone()));
+        ops.push(insns[i].operands.get(1).cloned().unwrap_or(Operand::Unknown));
+        ops.push(Operand::Local(*recv));
+        for op in insns[i].operands.iter().skip(3) {
+            if is_companion_slot_load(insns, i, op, vid, 0) {
+                continue;
+            }
+            ops.push(op.clone());
+        }
+        insns[i].operands = ops;
+        insns[i].dest_type = Some(m.sig.ret.clone());
+        stats.virtuals_resolved += 1;
+    }
+}
+
 /// Virtual dispatch: rewrite a call through a computed callee into a direct
 /// call once the callee's vtable slot is identified.
 /// (Structural subset of Cpp2IL `ResolveVirtualCalls`; interface dispatch
@@ -3812,7 +5335,8 @@ fn rewrite_virtual_calls(
         let Some(target) = insns[i].operands.first().cloned() else {
             continue;
         };
-        let Some(m) = resolve_indirect_target(insns, i, &target, table, maps, parents, ptr_size, 4) else {
+        let Some(m) = resolve_indirect_target(insns, i, &target, table, maps, parents, ptr_size, 4)
+        else {
             // Count only COMPUTED callees. A `BL` to a constant address that
             // `methods_by_rva` does not know is an unnamed direct call, not an
             // unresolved dispatch, and mixing the two made the counter read
@@ -3850,7 +5374,11 @@ fn rewrite_virtual_calls(
         if m.name == "Invoke" && m.type_def_index == -1 && m.image_index == usize::MAX {
             if let Some(dl) = delegate_base_of_target_nocount(insns, i, &target, table, 4) {
                 if insns[i].operands.len() >= 2 {
-                    let dest = insns[i].operands.get(1).cloned().unwrap_or(Operand::MissingAbiArg);
+                    let dest = insns[i]
+                        .operands
+                        .get(1)
+                        .cloned()
+                        .unwrap_or(Operand::MissingAbiArg);
                     let rest: Vec<Operand> = insns[i]
                         .operands
                         .iter()
@@ -3870,9 +5398,7 @@ fn rewrite_virtual_calls(
                     // filtered operand count, never a guessed slot; the types
                     // stay `Unknown`.
                     let mut effective = rest.len();
-                    while effective > 0
-                        && matches!(rest[effective - 1], Operand::MissingAbiArg)
-                    {
+                    while effective > 0 && matches!(rest[effective - 1], Operand::MissingAbiArg) {
                         effective -= 1;
                     }
                     let mut m = m.clone();
@@ -3896,6 +5422,26 @@ fn rewrite_virtual_calls(
             // Proof vanished between resolve and rewrite (same IR, so this
             // cannot happen): fall through to the preserving path rather than
             // fabricating a receiver.
+        }
+        // DROP THE COMPANION `MethodInfo`. A vtable entry is
+        // `VirtualInvokeData { methodPtr; method; }`; the lift loads BOTH
+        // halves (`ldp x9, x1, [klass + N]`) and passes `method` as x1, so the
+        // operand list is `[callee, dest, this, methodInfo, args…]`. Keeping it
+        // makes the signature trim consume the MethodInfo AS the first
+        // argument. The companion is proved, never guessed: a load from the
+        // SAME base local as the callee slot at an addend exactly 8 past it.
+        let target0 = insns[i].operands.first().cloned().unwrap_or(Operand::Unknown);
+        if let Some((vid_base, vt_off)) = slot_load_of(insns, i, &target0) {
+            let companion = insns[i]
+                .operands
+                .iter()
+                .enumerate()
+                .skip(2)
+                .find(|(_, op)| is_companion_slot_load(insns, i, op, vid_base, vt_off))
+                .map(|(j, _)| j);
+            if let Some(j) = companion {
+                insns[i].operands.remove(j);
+            }
         }
         // PRESERVE the operand list. For the `BLR`-shaped `Op::Call` it is
         // already `[target, ret-slot, receiver, args…]`, exactly what
@@ -3978,17 +5524,22 @@ pub fn recover_delegate_invokes(
         if matches!(insns[i].operands.first(), Some(Operand::Method(_))) {
             continue;
         }
-        let Some(target) = insns[i].operands.first().cloned() else { continue };
+        let Some(target) = insns[i].operands.first().cloned() else {
+            continue;
+        };
         let Some(dl) = delegate_base_of_target_nocount(insns, i, &target, table, 4) else {
             continue;
         };
-        let nt = delegate_named_ty(table, dl).or_else(|| {
-            this_delegate_base(table).map(|(_, nt)| nt)
-        });
+        let nt =
+            delegate_named_ty(table, dl).or_else(|| this_delegate_base(table).map(|(_, nt)| nt));
         let Some(nt) = nt else { continue };
         let mut m = delegate_invoke_ref(nt.namespace.clone(), nt.name.clone());
         if insns[i].operands.len() >= 2 {
-            let dest = insns[i].operands.get(1).cloned().unwrap_or(Operand::MissingAbiArg);
+            let dest = insns[i]
+                .operands
+                .get(1)
+                .cloned()
+                .unwrap_or(Operand::MissingAbiArg);
             let rest: Vec<Operand> = insns[i]
                 .operands
                 .iter()
@@ -4060,7 +5611,9 @@ pub fn recover_delegate_invokes(
                 }
             }
         }
-        let Some((_, d_local, _is_delegate)) = target_load else { continue };
+        let Some((_, d_local, _is_delegate)) = target_load else {
+            continue;
+        };
         let recv_ty = table
             .index_of
             .get(&d_local)
@@ -4086,7 +5639,11 @@ pub fn recover_delegate_invokes(
                 is_static: false,
             },
         };
-        let mut ops = vec![Operand::Method(m), Operand::Unknown, Operand::Local(d_local)];
+        let mut ops = vec![
+            Operand::Method(m),
+            Operand::Unknown,
+            Operand::Local(d_local),
+        ];
         ops.extend(insn_operands_after(insns, i));
         insns[i] = Insn::new(Op::CallVoid, ops, insns[i].address);
         stats.virtuals_resolved += 1;
@@ -4094,11 +5651,136 @@ pub fn recover_delegate_invokes(
 }
 
 fn insn_operands_after(insns: &[Insn], i: usize) -> impl Iterator<Item = Operand> + '_ {
-    insns[i]
-        .operands
-        .iter()
-        .skip(1)
-        .cloned()
+    insns[i].operands.iter().skip(1).cloned()
+}
+
+
+/// Split the generic argument list of a rendered type (`List<Vector3>` →
+/// `["Vector3"]`). Nested instantiations are split at top-level commas only.
+fn generic_args(text: &str) -> Option<Vec<String>> {
+    let start = text.find('<')?;
+    let end = text.rfind('>')?;
+    if end <= start {
+        return None;
+    }
+    let inner = &text[start + 1..end];
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut from = 0usize;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(inner[from..i].trim().to_string());
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(inner[from..].trim().to_string());
+    if out.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    Some(out)
+}
+
+fn named_managed(tdi: i32, maps: &ResolveMaps) -> Option<ManagedType> {
+    let (ns, name) = maps.tdi_names.get(&tdi)?;
+    Some(ManagedType::Class(std::sync::Arc::new(NamedType {
+        namespace: ns.clone(),
+        name: name.clone(),
+        assembly: None,
+        type_def_index: tdi,
+    })))
+}
+
+/// Resolve a rendered generic ARGUMENT (`Vector3`, `System.Int32`, `string`)
+/// to a managed type. The short name is accepted only when it identifies a
+/// single TypeDef.
+fn managed_from_type_text(text: &str, maps: &ResolveMaps) -> Option<ManagedType> {
+    let text = text.trim();
+    let prim = match text {
+        "bool" | "Boolean" | "System.Boolean" => Some(PrimKind::Boolean),
+        "char" | "Char" | "System.Char" => Some(PrimKind::Char),
+        "sbyte" | "SByte" | "System.SByte" => Some(PrimKind::I1),
+        "byte" | "Byte" | "System.Byte" => Some(PrimKind::U1),
+        "short" | "Int16" | "System.Int16" => Some(PrimKind::I2),
+        "ushort" | "UInt16" | "System.UInt16" => Some(PrimKind::U2),
+        "int" | "Int32" | "System.Int32" => Some(PrimKind::I4),
+        "uint" | "UInt32" | "System.UInt32" => Some(PrimKind::U4),
+        "long" | "Int64" | "System.Int64" => Some(PrimKind::I8),
+        "ulong" | "UInt64" | "System.UInt64" => Some(PrimKind::U8),
+        "float" | "Single" | "System.Single" => Some(PrimKind::R4),
+        "double" | "Double" | "System.Double" => Some(PrimKind::R8),
+        _ => None,
+    };
+    if let Some(p) = prim {
+        return Some(ManagedType::Primitive(p));
+    }
+    if matches!(text, "string" | "String" | "System.String") {
+        return Some(ManagedType::String);
+    }
+    if matches!(text, "object" | "Object" | "System.Object") {
+        return Some(ManagedType::Object);
+    }
+    if let Some(&tdi) = maps.tdi_names_reverse.get(text) {
+        return named_managed(tdi, maps);
+    }
+    let suffix = format!(".{text}");
+    let mut hit: Option<i32> = None;
+    for (name, &tdi) in &maps.tdi_names_reverse {
+        if name.ends_with(&suffix) {
+            if hit.is_some_and(|h| h != tdi) {
+                return None; // ambiguous short name — refuse rather than guess
+            }
+            hit = Some(tdi);
+        }
+    }
+    hit.and_then(|tdi| named_managed(tdi, maps))
+}
+
+/// Specialize a shared generic call's `T` return from the call site's
+/// declaring-type instantiation.
+///
+/// IL2CPP compiles one shared body for `List<T>.get_Item`, so its MethodRef
+/// returns `Opaque("T")` even when the receiver is `List<Vector3>`. That lost
+/// the HFA return layout: the call was treated as a scalar, its s-register
+/// components were never bound, and later reads reused pre-call SSA versions
+/// (measured as `(z - z)` in real distance math). The declaring type text is
+/// the call site's own evidence — `List<Vector3>` — so substituting its single
+/// argument is a proof, not a guess.
+pub fn specialize_generic_return_sigs(insns: &mut [Insn], maps: &ResolveMaps) -> usize {
+    let mut n = 0usize;
+    for insn in insns.iter_mut() {
+        if !matches!(insn.op, Op::Call) {
+            continue;
+        }
+        let Some(Operand::Method(m)) = insn.operands.first() else {
+            continue;
+        };
+        if !matches!(&m.sig.ret, ManagedType::Opaque(t) if t == "T") {
+            continue;
+        }
+        let Some(args) = generic_args(&m.declaring_type_name) else {
+            continue;
+        };
+        // Only a single-argument instantiation: managed_type_of names every
+        // generic parameter "T", so a multi-parameter definition cannot say
+        // WHICH parameter this is; substituting arg0 there would be a guess.
+        if args.len() != 1 {
+            continue;
+        }
+        let Some(mt) = managed_from_type_text(&args[0], maps) else {
+            continue;
+        };
+        if let Some(Operand::Method(m)) = insn.operands.first_mut() {
+            m.sig.ret = mt.clone();
+        }
+        insn.dest_type = Some(mt);
+        n += 1;
+    }
+    n
 }
 
 /// ResolveCallsViaMethodInfo (Cpp2IL port, usage-table variant):
@@ -4123,9 +5805,17 @@ pub fn resolve_methodinfo_usages(
         // See `resolve_static_fields`: on x64 the MethodInfo slot is loaded
         // RIP-relative (`Memory { base: abs, addend }`), so a bare `Immediate`
         // match meant no MethodInfo usage was ever materialized on a PE build.
-        let Some(a) = insns[i].operands.get(1).and_then(|s| absolute_address(insns, i, s)) else { continue };
+        let Some(a) = insns[i]
+            .operands
+            .get(1)
+            .and_then(|s| absolute_address(insns, i, s))
+        else {
+            continue;
+        };
         let a = a as i64;
-        let Some(d) = insns[i].dest().and_then(|d| d.as_local()) else { continue };
+        let Some(d) = insns[i].dest().and_then(|d| d.as_local()) else {
+            continue;
+        };
         // An `adrp` page is not an address: resolve the SUM at each use, and
         // leave the page alone. See `page_base_offset_uses`.
         let page_uses = is_page_materialization(insns, i)
@@ -4137,7 +5827,9 @@ pub fn resolve_methodinfo_usages(
                     continue;
                 };
                 let Some(m) = method_ref_of(mi) else { continue };
-                let Some(w) = insns[j].dest().and_then(|x| x.as_local()) else { continue };
+                let Some(w) = insns[j].dest().and_then(|x| x.as_local()) else {
+                    continue;
+                };
                 let addr = insns[j].address;
                 // `add` made `w` the slot's ADDRESS; `ldr` made `w` the slot's
                 // CONTENTS, which is this MethodInfo. Either way the use now
@@ -4152,7 +5844,9 @@ pub fn resolve_methodinfo_usages(
             }
             continue;
         }
-        let Some(&mi) = method_index_by_addr.get(&(a as u64)) else { continue };
+        let Some(&mi) = method_index_by_addr.get(&(a as u64)) else {
+            continue;
+        };
         let Some(m) = method_ref_of(mi) else { continue };
         method_locals.insert(d, m.clone());
         insns[i].operands[1] = Operand::Method(m);
@@ -4191,7 +5885,9 @@ pub fn resolve_methodinfo_usages(
         if !matches!(insns[i].op, Op::IndirectCall | Op::Call) {
             continue;
         }
-        let Some(target) = insns[i].operands.first().cloned() else { continue };
+        let Some(target) = insns[i].operands.first().cloned() else {
+            continue;
+        };
         // A direct call is already as precise as metadata allows.
         if matches!(target, Operand::Method(_)) {
             continue;
@@ -4422,11 +6118,7 @@ fn is_frame_base(base: &Operand) -> bool {
     match base {
         Operand::Register(r) => {
             let r = r.trim();
-            r == "sp"
-                || r == "fp"
-                || r == "rsp"
-                || r == "rbp"
-                || r.starts_with("stack")
+            r == "sp" || r == "fp" || r == "rsp" || r == "rbp" || r.starts_with("stack")
         }
         _ => false,
     }
@@ -4484,11 +6176,7 @@ fn signature_shaped_operands(
     // `Op::IndirectCall` is the legacy bare `[target, args…]` list; `Op::Call`
     // is `[target, dest, args…]`.
     let arg_start = if old_is_indirect { 1 } else { 2 };
-    let dump: Vec<Operand> = old
-        .iter()
-        .skip(arg_start.min(old.len()))
-        .cloned()
-        .collect();
+    let dump: Vec<Operand> = old.iter().skip(arg_start.min(old.len())).cloned().collect();
     let mut out: Vec<Operand> = Vec::with_capacity(m.sig.params.len() + 3);
     out.push(Operand::Method(m.clone()));
     out.push(if old_is_indirect {
@@ -4517,7 +6205,7 @@ static TEST_COUNTER_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod folded_pick_tests {
     use super::*;
     use crate::recovery::ir::NamedTypeRef;
-    use crate::recovery::types::{ManagedType, MethodSigInfo, MethodRef, NamedType};
+    use crate::recovery::types::{ManagedType, MethodRef, MethodSigInfo, NamedType};
 
     fn mref(method_index: u32, tdi: i32, tyname: &str, name: &str) -> MethodRef {
         MethodRef {
@@ -4617,6 +6305,7 @@ mod folded_pick_tests {
                 is_param: None,
                 param_comp: None,
                 is_incoming_arg: false,
+                is_call_clobber: false,
                 is_return_buffer: false,
             });
             t.index_of.insert(*v, t.infos.len() - 1);
@@ -4697,7 +6386,10 @@ mod folded_pick_tests {
     /// can count the guess instead of presenting it as a fact.
     #[test]
     fn no_evidence_is_reported_as_a_miss_not_a_guess() {
-        let cands = vec![mref(1, 10, "List", "get_Count"), mref(2, 20, "Dictionary", "get_Count")];
+        let cands = vec![
+            mref(1, 10, "List", "get_Count"),
+            mref(2, 20, "Dictionary", "get_Count"),
+        ];
         let insns = vec![
             Insn::new(
                 Op::Call,
@@ -4724,7 +6416,7 @@ mod folded_pick_tests {
 mod abi_recovery_tests {
     use super::*;
     use crate::il2cpp::structures::{
-        Il2CppInterfaceOffset, Il2CppMethodDefinition, Il2CppTypeDefinition,
+        Il2CppInterfaceOffset, Il2CppTypeDefinition,
     };
     use crate::recovery::types::{ManagedType, MethodSigInfo, PrimKind};
 
@@ -4757,6 +6449,7 @@ mod abi_recovery_tests {
                 is_param: None,
                 param_comp: None,
                 is_incoming_arg: false,
+                is_call_clobber: false,
                 is_return_buffer: false,
             });
             t.index_of.insert(*v, t.infos.len() - 1);
@@ -4778,11 +6471,7 @@ mod abi_recovery_tests {
     fn an_integer_hole_is_filled_from_its_live_argument_register() {
         let callee = method("Use", "C", vec![i4()], true);
         let mut insns = vec![
-            Insn::new(
-                Op::Move,
-                vec![Operand::Local(7), Operand::imm(41)],
-                0x1000,
-            ),
+            Insn::new(Op::Move, vec![Operand::Local(7), Operand::imm(41)], 0x1000),
             Insn::new(
                 Op::Call,
                 vec![
@@ -4805,11 +6494,7 @@ mod abi_recovery_tests {
     fn a_missing_receiver_is_filled_from_x0() {
         let callee = method("Tick", "Enemy", vec![], false);
         let mut insns = vec![
-            Insn::new(
-                Op::Move,
-                vec![Operand::Local(4), Operand::Local(9)],
-                0x2000,
-            ),
+            Insn::new(Op::Move, vec![Operand::Local(4), Operand::Local(9)], 0x2000),
             Insn::new(
                 Op::Call,
                 vec![
@@ -4822,7 +6507,10 @@ mod abi_recovery_tests {
         ];
         // `v9` is a computed value, not an argument register, so the rename gate
         // does not fire; `v4` is the x0 carrier.
-        let table = table_with(&[(4, "x0", ManagedType::Object), (9, "g3", ManagedType::Object)]);
+        let table = table_with(&[
+            (4, "x0", ManagedType::Object),
+            (9, "g3", ManagedType::Object),
+        ]);
         assert_eq!(recover_abi_arguments(&mut insns, &table), 1);
         assert_eq!(insns[1].operands[2], Operand::Local(9));
     }
@@ -4902,11 +6590,7 @@ mod abi_recovery_tests {
         let callee = method("Use", "C", vec![i4()], true);
         let mut insns = vec![
             Insn::new(Op::Move, vec![Operand::Local(5), Operand::imm(7)], 0x5000),
-            Insn::new(
-                Op::Move,
-                vec![Operand::Local(7), Operand::Local(5)],
-                0x5004,
-            ),
+            Insn::new(Op::Move, vec![Operand::Local(7), Operand::Local(5)], 0x5004),
             Insn::new(
                 Op::Call,
                 vec![
@@ -5195,8 +6879,16 @@ mod abi_recovery_tests {
         let a = method("Bar", "Foo", vec![], false);
         let b = method("Baz", "Foo", vec![], false);
         let mut insns = vec![
-            Insn::new(Op::Move, vec![Operand::Local(3), Operand::Method(a)], 0xE000),
-            Insn::new(Op::Move, vec![Operand::Local(5), Operand::Method(b)], 0xE004),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(3), Operand::Method(a)],
+                0xE000,
+            ),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(5), Operand::Method(b)],
+                0xE004,
+            ),
             Insn::new(
                 Op::Phi,
                 vec![Operand::Local(6), Operand::Local(3), Operand::Local(5)],
@@ -5448,10 +7140,14 @@ mod abi_recovery_tests {
         ];
         let mut slots: HashMap<(i32, usize), MethodRef> = HashMap::new();
         slots.insert((42, 2), method("Dispose", "IDisposable", vec![], false));
-        let (map, stats) =
-            build_interface_dispatch_detailed(&type_defs, &offsets, &[], &slots, &HashMap::new(), &|ti| {
-                (ti == 7).then_some(42)
-            });
+        let (map, stats) = build_interface_dispatch_detailed(
+            &type_defs,
+            &offsets,
+            &[],
+            &slots,
+            &HashMap::new(),
+            &|ti| (ti == 7).then_some(42),
+        );
         assert_eq!(map.get(&(0, 7)).map(|m| m.name.as_str()), Some("Dispose"));
         // BOTH types derive a count (neither stored a usable one): the first
         // owns [0,1), the second owns the tail [1,2). Only the first pair names
@@ -5504,9 +7200,8 @@ mod interface_dispatch_tests {
         let mut slots: HashMap<(i32, usize), MethodRef> = HashMap::new();
         slots.insert((42, 2), m("Dispose", "IDisposable", 42));
 
-        let map = build_interface_dispatch(&type_defs, &offsets, &slots, &|ti| {
-            (ti == 7).then_some(42)
-        });
+        let map =
+            build_interface_dispatch(&type_defs, &offsets, &slots, &|ti| (ti == 7).then_some(42));
         assert_eq!(
             map.get(&(0, 7)).map(|m| m.name.as_str()),
             Some("Dispose"),
@@ -5656,8 +7351,14 @@ mod interface_dispatch_tests {
 
         // Without the method table no claim is made — and the table can never
         // change the MAP, only the honesty of the breakdown.
-        let (map2, stats2) =
-            build_interface_dispatch_detailed(&type_defs, &offsets, &[], &slots, &HashMap::new(), &iface_of);
+        let (map2, stats2) = build_interface_dispatch_detailed(
+            &type_defs,
+            &offsets,
+            &[],
+            &slots,
+            &HashMap::new(),
+            &iface_of,
+        );
         assert_eq!(map2.len(), map.len());
         assert_eq!(stats2.pairs_without_slots, 3);
         assert_eq!(
@@ -5782,8 +7483,7 @@ mod interface_dispatch_tests {
         let (i_attempted_before, i_hit_before) = super::iface_lookup_counts();
         // A declared class slot: one attempt, one hit.
         let mut maps = super::ResolveMaps::default();
-        maps.vtable_slots
-            .insert((5, 3), m("Tick", "Enemy", 5));
+        maps.vtable_slots.insert((5, 3), m("Tick", "Enemy", 5));
         let parents: HashMap<i32, Vec<i32>> = HashMap::new();
         assert!(super::lookup_vtable_slot(&maps, &parents, 5, 3).is_some());
         // A constant slot no ancestry declares: attempted, missed.
@@ -5836,17 +7536,10 @@ mod interface_dispatch_tests {
         let before_i = super::iface_lookup_counts();
         // `0xdead_beef` names no klass in an empty map, so the lookup cannot
         // be keyed — `None` without touching either counter.
-        assert!(super::resolve_indirect_target(
-            &insns,
-            0,
-            &target,
-            &table,
-            &maps,
-            &parents,
-            8,
-            4
-        )
-        .is_none());
+        assert!(
+            super::resolve_indirect_target(&insns, 0, &target, &table, &maps, &parents, 8, 4)
+                .is_none()
+        );
         assert_eq!(
             super::vtable_lookup_counts(),
             before_v,
@@ -5888,6 +7581,7 @@ mod delegate_arith_tests {
                 is_param: None,
                 param_comp: None,
                 is_incoming_arg: false,
+                is_call_clobber: false,
                 is_return_buffer: false,
             });
             t.index_of.insert(*v, t.infos.len() - 1);
@@ -5988,11 +7682,7 @@ mod delegate_arith_tests {
                 ],
                 0x3000,
             ),
-            Insn::new(
-                Op::Call,
-                vec![Operand::Local(63), Operand::Unknown],
-                0x3004,
-            ),
+            Insn::new(Op::Call, vec![Operand::Local(63), Operand::Unknown], 0x3004),
         ];
         let target = insns[1].operands[0].clone();
         let maps = ResolveMaps::default();
@@ -6016,12 +7706,12 @@ mod delegate_arith_tests {
         let this_ty = ManagedType::Class(nt("System", "MulticastDelegate", 5400));
         let table = table_with_typed(&[(6, this_ty, true), (18, ManagedType::IntPtr, false)]);
         let insns = vec![
-            Insn::new(Op::Move, vec![Operand::Local(18), Operand::Field(field)], 0x1000),
             Insn::new(
-                Op::Call,
-                vec![Operand::Local(18), Operand::Unknown],
-                0x1004,
+                Op::Move,
+                vec![Operand::Local(18), Operand::Field(field)],
+                0x1000,
             ),
+            Insn::new(Op::Call, vec![Operand::Local(18), Operand::Unknown], 0x1004),
         ];
         let target = insns[1].operands[0].clone();
         let maps = ResolveMaps::default();
@@ -6037,16 +7727,20 @@ mod delegate_arith_tests {
     fn delegate_this_field_without_delegate_this_refuses() {
         let field = invoke_impl_field();
         let table = table_with_typed(&[
-            (6, ManagedType::Primitive(crate::recovery::types::PrimKind::I4), true),
+            (
+                6,
+                ManagedType::Primitive(crate::recovery::types::PrimKind::I4),
+                true,
+            ),
             (18, ManagedType::IntPtr, false),
         ]);
         let insns = vec![
-            Insn::new(Op::Move, vec![Operand::Local(18), Operand::Field(field)], 0x1000),
             Insn::new(
-                Op::Call,
-                vec![Operand::Local(18), Operand::Unknown],
-                0x1004,
+                Op::Move,
+                vec![Operand::Local(18), Operand::Field(field)],
+                0x1000,
             ),
+            Insn::new(Op::Call, vec![Operand::Local(18), Operand::Unknown], 0x1004),
         ];
         let target = insns[1].operands[0].clone();
         let maps = ResolveMaps::default();
@@ -6068,12 +7762,24 @@ mod delegate_arith_tests {
     fn klass_tdi_of_refuses_an_arith_address() {
         // v50 = [v46] (klass), v60 = v50 + 312 (address, NOT the klass).
         let recv_ty = ManagedType::Class(nt("", "IRandomGen", 18));
-        let table = table_with_typed(&[(46, recv_ty, false), (50, ManagedType::IntPtr, false), (60, ManagedType::IntPtr, false)]);
+        let table = table_with_typed(&[
+            (46, recv_ty, false),
+            (50, ManagedType::IntPtr, false),
+            (60, ManagedType::IntPtr, false),
+        ]);
         let insns = vec![
-            Insn::new(Op::Move, vec![Operand::Local(50), mem(Operand::Local(46), 0)], 0x1000),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(50), mem(Operand::Local(46), 0)],
+                0x1000,
+            ),
             Insn::new(
                 Op::Arith(ArithKind::Add),
-                vec![Operand::Local(60), Operand::Local(50), Operand::Immediate(312)],
+                vec![
+                    Operand::Local(60),
+                    Operand::Local(50),
+                    Operand::Immediate(312),
+                ],
                 0x1004,
             ),
         ];
@@ -6127,18 +7833,26 @@ mod delegate_arith_tests {
         let parents: HashMap<i32, Vec<i32>> = HashMap::new();
         // v50 = [v46] (klass), v60 = v50 + 320, fn = [v60].
         let insns = vec![
-            Insn::new(Op::Move, vec![Operand::Local(50), mem(Operand::Local(46), 0)], 0x1000),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(50), mem(Operand::Local(46), 0)],
+                0x1000,
+            ),
             Insn::new(
                 Op::Arith(ArithKind::Add),
-                vec![Operand::Local(60), Operand::Local(50), Operand::Immediate(320)],
+                vec![
+                    Operand::Local(60),
+                    Operand::Local(50),
+                    Operand::Immediate(320),
+                ],
                 0x1004,
             ),
-            Insn::new(Op::Move, vec![Operand::Local(61), mem(Operand::Local(60), 0)], 0x1008),
             Insn::new(
-                Op::Call,
-                vec![Operand::Local(61), Operand::Unknown],
-                0x100c,
+                Op::Move,
+                vec![Operand::Local(61), mem(Operand::Local(60), 0)],
+                0x1008,
             ),
+            Insn::new(Op::Call, vec![Operand::Local(61), Operand::Unknown], 0x100c),
         ];
         let target = insns[3].operands[0].clone();
         let m = super::resolve_indirect_target(&insns, 3, &target, &table, &maps, &parents, 8, 4)
@@ -6164,7 +7878,11 @@ mod delegate_arith_tests {
         let maps = ResolveMaps::default();
         let parents: HashMap<i32, Vec<i32>> = HashMap::new();
         let insns = vec![
-            Insn::new(Op::Move, vec![Operand::Local(50), mem(Operand::Local(46), 0)], 0x1000),
+            Insn::new(
+                Op::Move,
+                vec![Operand::Local(50), mem(Operand::Local(46), 0)],
+                0x1000,
+            ),
             Insn::new(
                 Op::Arith(ArithKind::Add),
                 vec![Operand::Local(59), Operand::Local(50), Operand::Local(58)],
@@ -6172,15 +7890,19 @@ mod delegate_arith_tests {
             ),
             Insn::new(
                 Op::Arith(ArithKind::Add),
-                vec![Operand::Local(60), Operand::Local(59), Operand::Immediate(312)],
+                vec![
+                    Operand::Local(60),
+                    Operand::Local(59),
+                    Operand::Immediate(312),
+                ],
                 0x1008,
             ),
-            Insn::new(Op::Move, vec![Operand::Local(61), mem(Operand::Local(60), 0)], 0x100c),
             Insn::new(
-                Op::Call,
-                vec![Operand::Local(61), Operand::Unknown],
-                0x1010,
+                Op::Move,
+                vec![Operand::Local(61), mem(Operand::Local(60), 0)],
+                0x100c,
             ),
+            Insn::new(Op::Call, vec![Operand::Local(61), Operand::Unknown], 0x1010),
         ];
         let target = insns[4].operands[0].clone();
         assert!(
@@ -6247,7 +7969,7 @@ mod delegate_arith_tests {
     /// args too and `OnTokenRefreshed` rendered `Invoke()`); passes after.
     #[test]
     fn delegate_rewrite_keeps_user_args_drops_hidden_fields() {
-        use crate::recovery::types::{FieldRef, MethodRef, MethodSigInfo, PrimKind};
+        use crate::recovery::types::{FieldRef, PrimKind};
         let base_ty = ManagedType::Class(nt("System", "Action", 5150));
         let table = table_with_typed(&[
             (62, base_ty, false),
@@ -6327,18 +8049,24 @@ mod delegate_arith_tests {
             "receiver must be the delegate base"
         );
         assert!(
-            call.operands.iter().skip(3).any(|o| *o == Operand::Local(80)),
+            call.operands
+                .iter()
+                .skip(3)
+                .any(|o| *o == Operand::Local(80)),
             "the USER argument must survive, got {:?}",
             call.operands
         );
         assert!(
-            !call.operands.iter().skip(3).any(|o| *o == Operand::Local(64) || *o == Operand::Local(65)),
+            !call
+                .operands
+                .iter()
+                .skip(3)
+                .any(|o| *o == Operand::Local(64) || *o == Operand::Local(65)),
             "hidden delegate fields must not render as Invoke params, got {:?}",
             call.operands
         );
     }
 }
-
 
 #[cfg(test)]
 mod metadata_init_phi_use_tests {
@@ -6363,8 +8091,432 @@ mod metadata_init_phi_use_tests {
             ..ResolveMaps::default()
         };
         let mut stats = ResolveStats::default();
-        key_function_recovery(&mut insns, &maps, &mut stats);
-        assert!(matches!(insns[1].op, Op::Call), "phi edge use keeps the result-producing call");
+        key_function_recovery(&mut insns, &maps, &HashMap::new(), &mut stats);
+        assert!(
+            matches!(insns[1].op, Op::Call),
+            "phi edge use keeps the result-producing call"
+        );
         assert_eq!(stats.key_functions, 0);
     }
 }
+
+#[cfg(test)]
+mod indirect_target_tests {
+    use super::*;
+    use crate::recovery::locals::LocalInfo;
+
+    fn widget_table() -> LocalTable {
+        LocalTable {
+            infos: vec![LocalInfo {
+                slot_origin: "x0".into(),
+                ty: ManagedType::Class(std::sync::Arc::new(NamedType {
+                    namespace: "Test".into(),
+                    name: "Widget".into(),
+                    assembly: None,
+                    type_def_index: 7,
+                })),
+                is_this: true,
+                is_param: None,
+                param_comp: None,
+                is_incoming_arg: false,
+                is_call_clobber: false,
+                is_return_buffer: false,
+            }],
+            index_of: [(0u32, 0usize)].into_iter().collect(),
+            param_names: vec![],
+            param_comp_names: vec![],
+        }
+    }
+
+    fn slot_method(name: &str) -> MethodRef {
+        MethodRef {
+            image_index: 0,
+            type_def_index: 7,
+            method_index: 0,
+            name: name.into(),
+            declaring_namespace: "Test".into(),
+            declaring_type_name: "Widget".into(),
+            assembly: String::new(),
+            sig: super::super::types::MethodSigInfo {
+                ret: ManagedType::Unknown,
+                params: vec![],
+                is_static: false,
+            },
+        }
+    }
+
+    /// The dispatch shape, at an arbitrary entry offset.
+    ///
+    /// `obj → [obj] = klass → [klass + off] = callee → call callee`, exactly the
+    /// three instructions `CircularScrollingList.Refresh` @0x148A47C contains.
+    fn dispatch_at(addend: i64) -> Vec<Insn> {
+        vec![
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(1),
+                    Operand::Memory {
+                        width: 0,
+                        base: Box::new(Operand::Local(0)),
+                        index: None,
+                        scale: 8,
+                        addend: 0,
+                    },
+                ],
+                0x1000,
+            ),
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(2),
+                    Operand::Memory {
+                        width: 0,
+                        base: Box::new(Operand::Local(1)),
+                        index: None,
+                        scale: 8,
+                        addend,
+                    },
+                ],
+                0x1004,
+            ),
+            Insn::new(Op::IndirectCall, vec![Operand::Local(2)], 0x1008),
+        ]
+    }
+
+    /// An entry whose `methodPtr` half sits at `0x138 + slot*16` — the v29+
+    /// `Il2CppClass` layout this image is built with.
+    ///
+    /// Real site (0x148A47C): `ldp x8, x1, [x9, #0x188]` loads the `methodPtr`
+    /// at 0x188 and the `MethodInfo` at 0x190, so 0x188 is `0x138 + 5*16` and
+    /// 392 is `8 (mod 16)`. Under the hardcoded 0x130 base the offset is
+    /// rejected outright ("not a vtable methodPtr") and the site renders
+    /// `fnptr_0x…` forever.
+    ///
+    /// Fails before the fix: 392 - 0x130 = 88, 88 % 16 = 8 → no slot.
+    #[test]
+    fn vtable_entry_at_0x138_keys_slot_five() {
+        let table = widget_table();
+        let mut insns = dispatch_at(0x188);
+        let mut maps = ResolveMaps::default();
+        maps.vtable_slots.insert((7, 5), slot_method("GetListLength"));
+
+        let stats = run(&mut insns, &table, &maps);
+
+        assert_eq!(
+            stats.virtuals_resolved, 1,
+            "the 0x138 grid must key slot 5, got {:?}",
+            insns[2].op
+        );
+        match insns[2].operands.first() {
+            Some(Operand::Method(m)) => assert_eq!(m.name, "GetListLength"),
+            other => panic!("expected the declared method, got {other:?}"),
+        }
+    }
+
+    /// A vtable call on a FIELD receiver whose local was never typed: the
+    /// FieldRef's declared type is enough to key the slot.
+    #[test]
+    fn a_field_receiver_supplies_its_declared_type() {
+        let table = widget_table();
+        let mut maps = ResolveMaps::default();
+        maps.vtable_slots.insert((7, 5), slot_method("GetListLength"));
+        let field = FieldRef {
+            type_def_index: 7,
+            field_index: 1,
+            name: "_ctrl".into(),
+            declaring_type_name: "Holder".into(),
+            field_type: ManagedType::Class(std::sync::Arc::new(NamedType {
+                namespace: "Test".into(),
+                name: "Widget".into(),
+                assembly: None,
+                type_def_index: 7,
+            })),
+            is_static: false,
+        };
+        let mut insns = vec![
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(0),
+                    Operand::InstanceField {
+                        base: Box::new(Operand::Local(8)),
+                        field,
+                    },
+                ],
+                0x1000,
+            ),
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(1),
+                    Operand::Memory {
+                        width: 0,
+                        base: Box::new(Operand::Local(0)),
+                        index: None,
+                        scale: 8,
+                        addend: 0,
+                    },
+                ],
+                0x1004,
+            ),
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(2),
+                    Operand::Memory {
+                        width: 8,
+                        base: Box::new(Operand::Local(1)),
+                        index: None,
+                        scale: 8,
+                        addend: 0x188,
+                    },
+                ],
+                0x1008,
+            ),
+            Insn::new(
+                Op::Call,
+                vec![Operand::Local(2), Operand::Local(9), Operand::Local(0)],
+                0x100c,
+            ),
+        ];
+        let stats = run(&mut insns, &table, &maps);
+        assert_eq!(stats.virtuals_resolved, 1, "{:?}", insns[3].op);
+        match insns[3].operands.first() {
+            Some(Operand::Method(m)) => assert_eq!(m.name, "GetListLength"),
+            other => panic!("expected the declared method, got {other:?}"),
+        }
+    }
+
+    /// Both entry grids in ONE run: an `≡0` offset keys the 0x130 grid and an
+    /// `≡8` offset keys the 0x138 grid, and neither may steal the other's slot.
+    ///
+    /// This is the disjointness the two-candidate design rests on: a call
+    /// target is always the `methodPtr` half, so the two bases can only add
+    /// sites, never reinterpret one the other already keyed.
+    #[test]
+    fn the_two_entry_grids_are_disjoint_and_both_resolve() {
+        let table = widget_table();
+        let mut maps = ResolveMaps::default();
+        maps.vtable_slots.insert((7, 1), slot_method("FromTheFirstGrid"));
+        maps.vtable_slots.insert((7, 5), slot_method("FromTheSecondGrid"));
+
+        // 0x140 = 0x130 + 1*16 (≡0 grid) → slot 1.
+        let mut a = dispatch_at(0x140);
+        let sa = run(&mut a, &table, &maps);
+        assert_eq!(sa.virtuals_resolved, 1);
+        match a[2].operands.first() {
+            Some(Operand::Method(m)) => assert_eq!(m.name, "FromTheFirstGrid"),
+            other => panic!("0x130 grid lost, got {other:?}"),
+        }
+
+        // 0x188 = 0x138 + 5*16 (≡8 grid) → slot 5.
+        let mut b = dispatch_at(0x188);
+        let sb = run(&mut b, &table, &maps);
+        assert_eq!(sb.virtuals_resolved, 1);
+        match b[2].operands.first() {
+            Some(Operand::Method(m)) => assert_eq!(m.name, "FromTheSecondGrid"),
+            other => panic!("0x138 grid lost, got {other:?}"),
+        }
+    }
+
+    /// A resolved virtual call drops the MethodInfo companion the entry's
+    /// SECOND half supplies, so the real argument list survives the
+    /// signature-shaped trim.
+    #[test]
+    fn a_resolved_vtable_call_drops_the_companion_method_info() {
+        let table = widget_table();
+        let mut insns = vec![
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(1),
+                    Operand::Memory {
+                        width: 0,
+                        base: Box::new(Operand::Local(0)),
+                        index: None,
+                        scale: 8,
+                        addend: 0,
+                    },
+                ],
+                0x1000,
+            ),
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(2),
+                    Operand::Memory {
+                        width: 8,
+                        base: Box::new(Operand::Local(1)),
+                        index: None,
+                        scale: 8,
+                        addend: 0x188,
+                    },
+                ],
+                0x1004,
+            ),
+            // Companion MethodInfo half of the same entry.
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(3),
+                    Operand::Memory {
+                        width: 8,
+                        base: Box::new(Operand::Local(1)),
+                        index: None,
+                        scale: 8,
+                        addend: 0x190,
+                    },
+                ],
+                0x1008,
+            ),
+            Insn::new(
+                Op::Call,
+                vec![
+                    Operand::Local(2),
+                    Operand::Local(9),
+                    Operand::Local(0),
+                    Operand::Local(3),
+                    Operand::Local(4),
+                ],
+                0x100c,
+            ),
+        ];
+        let mut maps = ResolveMaps::default();
+        let mut m = slot_method("GetRegionName");
+        m.sig.params = vec![ManagedType::Primitive(super::super::types::PrimKind::I4)];
+        maps.vtable_slots.insert((7, 5), m);
+
+        let stats = run(&mut insns, &table, &maps);
+        assert_eq!(stats.virtuals_resolved, 1, "{:?}", insns[3].op);
+        match insns[3].operands.as_slice() {
+            [Operand::Method(m), Operand::Local(9), Operand::Local(0), Operand::Local(4)] => {
+                assert_eq!(m.name, "GetRegionName");
+            }
+            other => panic!("expected the companion to be dropped, got {other:?}"),
+        }
+    }
+
+    /// A slot load at an offset that is on NEITHER grid stays unresolved.
+    #[test]
+    fn an_offset_off_both_grids_stays_unresolved() {
+        let table = widget_table();
+        let mut insns = dispatch_at(0x144); // ≡4 (mod 16)
+        let mut maps = ResolveMaps::default();
+        maps.vtable_slots.insert((7, 1), slot_method("A"));
+        maps.vtable_slots.insert((7, 5), slot_method("B"));
+
+        let stats = run(&mut insns, &table, &maps);
+
+        assert_eq!(stats.virtuals_resolved, 0);
+        assert!(matches!(insns[2].op, Op::IndirectCall));
+    }
+
+    /// The `il2cpp_codegen_initialize_runtime_metadata(&slot)` shape: the
+    /// argument is the ADDRESS of a metadata-usage cell, reached through a GOT
+    /// load whose page SSA has materialized into its own local.
+    ///
+    /// ```text
+    /// 0x148a514  adrp x0, 0x2f69000
+    /// 0x148a518  ldr  x0, [x0, #0x7b0]   ; x0 = &cell
+    /// 0x148a51c  bl   0x1302420
+    /// ```
+    ///
+    /// Fails before the fix twice over: the gate was `Op::CallVoid` (no lifter
+    /// emits it) and `static_addr_of` cannot see through the page local.
+    fn init_call_shape(with_reader: bool) -> (Vec<Insn>, ResolveMaps) {
+        let page: i64 = 0x2f69000;
+        let cell: u64 = 0x3065b18;
+        let mut insns = vec![
+            // adrp x0, page
+            Insn::new(Op::Move, vec![Operand::Local(1), Operand::Immediate(page)], 0x1000),
+            // ldr x0, [x0, #0x7b0]  →  &cell
+            Insn::new(
+                Op::Move,
+                vec![
+                    Operand::Local(2),
+                    Operand::Memory {
+                        width: 0,
+                        base: Box::new(Operand::Local(1)),
+                        index: None,
+                        scale: 8,
+                        addend: 0x7b0,
+                    },
+                ],
+                0x1004,
+            ),
+            // bl 0x1302420   [target, result, x0]
+            Insn::new(
+                Op::Call,
+                vec![
+                    Operand::Immediate(0x1302420),
+                    Operand::Local(3),
+                    Operand::Local(2),
+                ],
+                0x1008,
+            ),
+        ];
+        if with_reader {
+            // Someone consumes the result: the call is not void.
+            insns.push(Insn::new(
+                Op::Move,
+                vec![Operand::Local(4), Operand::Local(3)],
+                0x100c,
+            ));
+        }
+        let mut maps = ResolveMaps::default();
+        maps.got_addend_by_addr
+            .insert(page as u64 + 0x7b0, cell);
+        maps.literal_index_by_addr.insert(cell, 0);
+        maps.literals.insert(0, "text".into());
+        (insns, maps)
+    }
+
+    #[test]
+    fn metadata_init_call_with_an_unread_result_is_dropped() {
+        let (mut insns, maps) = init_call_shape(false);
+        let mut stats = ResolveStats::default();
+        key_function_recovery(&mut insns, &maps, &HashMap::new(), &mut stats);
+
+        assert!(
+            matches!(insns[2].op, Op::Nop),
+            "the init call must be dropped, got {:?}",
+            insns[2].op
+        );
+        assert_eq!(stats.key_functions, 1);
+        assert_eq!(
+            super::super::runtime_helpers::role_of(0x1302420),
+            Some(super::super::runtime_helpers::RuntimeHelper::MetadataInit)
+        );
+    }
+
+    /// The same call with a live result must be KEPT: dropping it would delete
+    /// the value every later statement reads.
+    #[test]
+    fn metadata_init_call_with_a_read_result_is_kept() {
+        let (mut insns, maps) = init_call_shape(true);
+        let mut stats = ResolveStats::default();
+        key_function_recovery(&mut insns, &maps, &HashMap::new(), &mut stats);
+
+        assert!(
+            matches!(insns[2].op, Op::Call),
+            "a consumed result must keep the call, got {:?}",
+            insns[2].op
+        );
+        assert_eq!(stats.key_functions, 0);
+    }
+
+    /// A call with the same argument shape but a RESOLVED target is managed
+    /// code, not a runtime helper: it must never be dropped.
+    #[test]
+    fn a_resolved_method_taking_a_cell_is_not_dropped() {
+        let (mut insns, mut maps) = init_call_shape(false);
+        maps.methods_by_rva
+            .insert(0x1302420, slot_method("RealManagedMethod"));
+        let mut stats = ResolveStats::default();
+        key_function_recovery(&mut insns, &maps, &HashMap::new(), &mut stats);
+
+        assert!(matches!(insns[2].op, Op::Call));
+        assert_eq!(stats.key_functions, 0);
+    }
+}
+

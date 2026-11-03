@@ -109,32 +109,52 @@ impl Il2CppTypeEnum {
     }
 
     pub fn is_il2cpp_primitive(&self) -> bool {
-        matches!(self,
-            Self::Boolean | Self::Char |
-            Self::I1 | Self::U1 |
-            Self::I2 | Self::U2 |
-            Self::I4 | Self::U4 |
-            Self::I8 | Self::U8 |
-            Self::R4 | Self::R8 |
-            Self::I | Self::U
+        matches!(
+            self,
+            Self::Boolean
+                | Self::Char
+                | Self::I1
+                | Self::U1
+                | Self::I2
+                | Self::U2
+                | Self::I4
+                | Self::U4
+                | Self::I8
+                | Self::U8
+                | Self::R4
+                | Self::R8
+                | Self::I
+                | Self::U
         )
     }
 
     pub fn is_numeric(&self) -> bool {
-        matches!(self,
-            Self::I1 | Self::U1 |
-            Self::I2 | Self::U2 |
-            Self::I4 | Self::U4 |
-            Self::I8 | Self::U8 |
-            Self::R4 | Self::R8 |
-            Self::I | Self::U
+        matches!(
+            self,
+            Self::I1
+                | Self::U1
+                | Self::I2
+                | Self::U2
+                | Self::I4
+                | Self::U4
+                | Self::I8
+                | Self::U8
+                | Self::R4
+                | Self::R8
+                | Self::I
+                | Self::U
         )
     }
 
     pub fn is_reference_type(&self) -> bool {
-        matches!(self,
-            Self::String | Self::Object | Self::Class | Self::Array |
-            Self::SzArray | Self::GenericInst
+        matches!(
+            self,
+            Self::String
+                | Self::Object
+                | Self::Class
+                | Self::Array
+                | Self::SzArray
+                | Self::GenericInst
         )
     }
 }

@@ -1,7 +1,7 @@
 mod arm;
 mod x86;
 
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -66,9 +66,17 @@ impl Architecture {
 
     pub fn from_bitness(is_32bit: bool, is_pe: bool) -> Self {
         if is_pe {
-            if is_32bit { Architecture::X86 } else { Architecture::X64 }
+            if is_32bit {
+                Architecture::X86
+            } else {
+                Architecture::X64
+            }
         } else {
-            if is_32bit { Architecture::Arm32 } else { Architecture::Arm64 }
+            if is_32bit {
+                Architecture::Arm32
+            } else {
+                Architecture::Arm64
+            }
         }
     }
 
@@ -98,13 +106,35 @@ pub struct LoadInfo {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConstantOp {
-    MovImm { dest_reg: u16, value: u64 },
-    MovKeep { dest_reg: u16, imm16: u16, shift: u8 },
-    AddSubImm { dest_reg: u16, src_reg: u16, imm: i64 },
-    MovReg { dest_reg: u16, src_reg: u16 },
-    Adrp { dest_reg: u16, page: u64 },
-    Kill { dest_reg: u16 },
-    KillPair { dest_reg1: u16, dest_reg2: u16 },
+    MovImm {
+        dest_reg: u16,
+        value: u64,
+    },
+    MovKeep {
+        dest_reg: u16,
+        imm16: u16,
+        shift: u8,
+    },
+    AddSubImm {
+        dest_reg: u16,
+        src_reg: u16,
+        imm: i64,
+    },
+    MovReg {
+        dest_reg: u16,
+        src_reg: u16,
+    },
+    Adrp {
+        dest_reg: u16,
+        page: u64,
+    },
+    Kill {
+        dest_reg: u16,
+    },
+    KillPair {
+        dest_reg1: u16,
+        dest_reg2: u16,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -264,7 +294,13 @@ impl Disassembler {
         self.unbox_helper_rvas.insert(rva);
     }
 
-    pub fn add_static_field(&mut self, type_info_rva: u64, type_short_name: &str, offset: i64, field_name: &str) {
+    pub fn add_static_field(
+        &mut self,
+        type_info_rva: u64,
+        type_short_name: &str,
+        offset: i64,
+        field_name: &str,
+    ) {
         self.static_field_offsets_by_typeinfo
             .entry(type_info_rva)
             .or_insert_with(HashMap::new)
@@ -317,7 +353,8 @@ impl Disassembler {
             .replace('\t', "\\t")
             .replace('\0', "\\0");
         let truncated = if escaped.len() > 60 {
-            let safe_end = escaped.char_indices()
+            let safe_end = escaped
+                .char_indices()
                 .map(|(i, _)| i)
                 .take_while(|&i| i <= 57)
                 .last()
@@ -326,34 +363,51 @@ impl Disassembler {
         } else {
             escaped
         };
-        self.global_annotations.insert(rva, MetadataAnnotation {
-            kind: MetadataAnnotationKind::StringLiteral,
-            label: format!("\"{}\"", truncated),
-        });
+        self.global_annotations.insert(
+            rva,
+            MetadataAnnotation {
+                kind: MetadataAnnotationKind::StringLiteral,
+                label: format!("\"{}\"", truncated),
+            },
+        );
     }
 
     pub fn add_type_info(&mut self, rva: u64, type_name: String) {
-        self.global_annotations.insert(rva, MetadataAnnotation {
-            kind: MetadataAnnotationKind::TypeInfo,
-            label: format!("typeof({})", type_name),
-        });
+        self.global_annotations.insert(
+            rva,
+            MetadataAnnotation {
+                kind: MetadataAnnotationKind::TypeInfo,
+                label: format!("typeof({})", type_name),
+            },
+        );
     }
 
     pub fn add_method_ref(&mut self, rva: u64, full_name: String) {
-        self.global_annotations.insert(rva, MetadataAnnotation {
-            kind: MetadataAnnotationKind::MethodRef,
-            label: full_name,
-        });
+        self.global_annotations.insert(
+            rva,
+            MetadataAnnotation {
+                kind: MetadataAnnotationKind::MethodRef,
+                label: full_name,
+            },
+        );
     }
 
     pub fn add_field_ref(&mut self, rva: u64, full_name: String) {
-        self.global_annotations.insert(rva, MetadataAnnotation {
-            kind: MetadataAnnotationKind::FieldRef,
-            label: full_name,
-        });
+        self.global_annotations.insert(
+            rva,
+            MetadataAnnotation {
+                kind: MetadataAnnotationKind::FieldRef,
+                label: full_name,
+            },
+        );
     }
 
-    pub fn disassemble(&self, bytes: &[u8], base_address: u64, max_instructions: usize) -> Vec<DisassembledInstruction> {
+    pub fn disassemble(
+        &self,
+        bytes: &[u8],
+        base_address: u64,
+        max_instructions: usize,
+    ) -> Vec<DisassembledInstruction> {
         match self.arch {
             Architecture::Arm64 => arm::disassemble_arm64(bytes, base_address, max_instructions),
             Architecture::Arm32 => arm::disassemble_arm32(bytes, base_address, max_instructions),
@@ -456,10 +510,7 @@ impl Disassembler {
         for (idx, insn) in instructions.iter().enumerate() {
             if let Some(ref cfg) = cfg {
                 if let Some(block_header) = cfg.block_headers.get(&insn.address) {
-                    buf.push_str(&format!(
-                        "{indent}\t\t   // {}\n",
-                        block_header,
-                    ));
+                    buf.push_str(&format!("{indent}\t\t   // {}\n", block_header,));
                 }
             }
 
@@ -470,10 +521,7 @@ impl Disassembler {
                     insn.address, hex, insn
                 ));
             } else {
-                buf.push_str(&format!(
-                    "{indent}\t\t   0x{:08X}:  {}",
-                    insn.address, insn
-                ));
+                buf.push_str(&format!("{indent}\t\t   0x{:08X}:  {}", insn.address, insn));
             }
 
             let mut annotated = false;
@@ -492,18 +540,30 @@ impl Disassembler {
                             buf.push_str(&format!("  // switch: table base = 0x{:X}", table_va));
                             annotated = true;
                         }
-                        SwitchAnnotation::OffsetLoad { table_va, index_reg, shift } => {
+                        SwitchAnnotation::OffsetLoad {
+                            table_va,
+                            index_reg,
+                            shift,
+                        } => {
                             buf.push_str(&format!(
                                 "  // switch: offset = table[X{}] (table=0x{:X}, entry={}B)",
-                                index_reg, table_va, 1u32 << shift,
+                                index_reg,
+                                table_va,
+                                1u32 << shift,
                             ));
                             annotated = true;
                         }
                         SwitchAnnotation::TargetCompute { table_va } => {
-                            buf.push_str(&format!("  // switch: target = table+offset (table=0x{:X})", table_va));
+                            buf.push_str(&format!(
+                                "  // switch: target = table+offset (table=0x{:X})",
+                                table_va
+                            ));
                             annotated = true;
                         }
-                        SwitchAnnotation::Dispatch { table_va, index_reg } => {
+                        SwitchAnnotation::Dispatch {
+                            table_va,
+                            index_reg,
+                        } => {
                             buf.push_str(&format!(
                                 "  // switch (X{}) → table 0x{:X}",
                                 index_reg, table_va,
@@ -535,7 +595,10 @@ impl Disassembler {
                         if let Some(&w0) = call_arg_w0.get(&insn.address) {
                             let idx = w0 as u32;
                             if let Some(s) = self.string_literals_by_index.get(&idx) {
-                                buf.push_str(&format!("  // string_new(\"{}\")", crate::utils::escape_string_preview(s, 60)));
+                                buf.push_str(&format!(
+                                    "  // string_new(\"{}\")",
+                                    crate::utils::escape_string_preview(s, 60)
+                                ));
                                 annotated = true;
                             } else {
                                 buf.push_str(&format!("  // string_new(#{idx})"));
@@ -568,9 +631,11 @@ impl Disassembler {
                             annotated = true;
                         }
                     } else if self.unbox_helper_rvas.contains(&target) {
-                        let type_via_x1 = call_arg_x1_va.get(&insn.address)
+                        let type_via_x1 = call_arg_x1_va
+                            .get(&insn.address)
                             .and_then(|&va| self.type_name_at_va(va));
-                        let type_via_x0 = call_arg_x0_va.get(&insn.address)
+                        let type_via_x0 = call_arg_x0_va
+                            .get(&insn.address)
                             .and_then(|&va| self.type_name_at_va(va));
                         if let Some(type_name) = type_via_x1.or(type_via_x0) {
                             buf.push_str(&format!("  // unbox<{type_name}>"));
@@ -616,7 +681,8 @@ impl Disassembler {
                 adrp_page = page;
             }
 
-            if !annotated && show_annotations && (insn.mnemonic == "LDR" || insn.mnemonic == "ADD") {
+            if !annotated && show_annotations && (insn.mnemonic == "LDR" || insn.mnemonic == "ADD")
+            {
                 if let Some(page_base) = adrp_page {
                     if let Some(offset) = insn.memory_offset {
                         let full_addr = page_base.wrapping_add(offset as u64);
@@ -650,13 +716,19 @@ impl Disassembler {
             }
 
             if !annotated && show_annotations {
-                if let Some(&(typeinfo_va, field_offset)) = static_field_accesses.get(&insn.address) {
-                    if let Some((type_name, field_name)) = self.lookup_static_field(typeinfo_va, field_offset) {
+                if let Some(&(typeinfo_va, field_offset)) = static_field_accesses.get(&insn.address)
+                {
+                    if let Some((type_name, field_name)) =
+                        self.lookup_static_field(typeinfo_va, field_offset)
+                    {
                         buf.push_str(&format!("  // {}.{}", type_name, field_name));
                         annotated = true;
                     } else {
                         if let Some(ann) = self.global_annotations.get(&typeinfo_va) {
-                            buf.push_str(&format!("  // {}.<static+0x{:X}>", ann.label, field_offset));
+                            buf.push_str(&format!(
+                                "  // {}.<static+0x{:X}>",
+                                ann.label, field_offset
+                            ));
                             annotated = true;
                         }
                     }
@@ -692,14 +764,17 @@ impl Disassembler {
                 if !annotated {
                     if let Some(&effective_offset) = reg_reg_offsets.get(&insn.address) {
                         if let Some(ctx) = ctx {
-                            let is_sp_access = insn.reg_reg_access
+                            let is_sp_access = insn
+                                .reg_reg_access
                                 .map(|rra| rra.base_reg == 31)
                                 .unwrap_or(false)
                                 || insn.operands.contains("sp,")
                                 || insn.operands.contains("SP,");
 
                             if !is_sp_access {
-                                if let Some(field_name) = ctx.field_offsets.get(&(effective_offset as i32)) {
+                                if let Some(field_name) =
+                                    ctx.field_offsets.get(&(effective_offset as i32))
+                                {
                                     if !insn.is_call {
                                         buf.push_str(&format!("  // this.{field_name}"));
                                         annotated = true;
@@ -707,7 +782,9 @@ impl Disassembler {
                                 }
 
                                 if !annotated {
-                                    if let Some(vtable_method) = ctx.vtable_methods.get(&(effective_offset as i32)) {
+                                    if let Some(vtable_method) =
+                                        ctx.vtable_methods.get(&(effective_offset as i32))
+                                    {
                                         buf.push_str(&format!("  // vtable: {vtable_method}"));
                                         annotated = true;
                                     }
@@ -716,7 +793,9 @@ impl Disassembler {
                         }
 
                         if !annotated && show_annotations {
-                            if let Some(ann) = self.global_annotations.get(&(effective_offset as u64)) {
+                            if let Some(ann) =
+                                self.global_annotations.get(&(effective_offset as u64))
+                            {
                                 let prefix = match ann.kind {
                                     MetadataAnnotationKind::StringLiteral => "str",
                                     MetadataAnnotationKind::TypeInfo => "type",
@@ -731,8 +810,10 @@ impl Disassembler {
                 }
             }
 
-            if insn.mnemonic == "CMP" || insn.mnemonic == "TST"
-                || insn.mnemonic == "TEST" || insn.mnemonic == "SUBS"
+            if insn.mnemonic == "CMP"
+                || insn.mnemonic == "TST"
+                || insn.mnemonic == "TEST"
+                || insn.mnemonic == "SUBS"
                 || insn.mnemonic == "CCMP"
             {
                 _last_cmp_operands = Some(insn.operands.clone());
@@ -743,10 +824,7 @@ impl Disassembler {
             if let Some(ref cfg) = cfg {
                 if insn.is_branch && !insn.is_call {
                     if let Some(separator) = cfg.block_separators.get(&insn.address) {
-                        buf.push_str(&format!(
-                            "{indent}\t\t   // {}\n",
-                            separator,
-                        ));
+                        buf.push_str(&format!("{indent}\t\t   // {}\n", separator,));
                     }
                 }
             }
@@ -781,7 +859,10 @@ struct BlockInfo {
 }
 
 impl CfgAnalysis {
-    fn build(instructions: &[DisassembledInstruction], reg_names: Option<&HashMap<String, String>>) -> Self {
+    fn build(
+        instructions: &[DisassembledInstruction],
+        reg_names: Option<&HashMap<String, String>>,
+    ) -> Self {
         if instructions.is_empty() {
             return Self {
                 blocks: Vec::new(),
@@ -802,8 +883,10 @@ impl CfgAnalysis {
         let mut last_cmp: Option<String> = None;
 
         for (_idx, insn) in instructions.iter().enumerate() {
-            if insn.mnemonic == "CMP" || insn.mnemonic == "TST"
-                || insn.mnemonic == "TEST" || insn.mnemonic == "SUBS"
+            if insn.mnemonic == "CMP"
+                || insn.mnemonic == "TST"
+                || insn.mnemonic == "TEST"
+                || insn.mnemonic == "SUBS"
                 || insn.mnemonic == "CCMP"
             {
                 last_cmp = Some(resolve_operands_with_names(&insn.operands, reg_names));
@@ -867,7 +950,9 @@ impl CfgAnalysis {
 
         let mut blocks: Vec<BlockInfo> = Vec::new();
         for (id, &start) in sorted_starts.iter().enumerate() {
-            let end = sorted_starts.get(id + 1).copied()
+            let end = sorted_starts
+                .get(id + 1)
+                .copied()
                 .unwrap_or(last_addr + instructions.last().unwrap().size as u64);
             blocks.push(BlockInfo {
                 _start_addr: start,
@@ -883,17 +968,21 @@ impl CfgAnalysis {
         let mut edge_labels: HashMap<u64, String> = HashMap::new();
 
         if blocks.len() > 1 {
-            block_headers.insert(first_addr, format!(
-                "═══ Block 0 (entry) {}",
-                "═".repeat(30)
-            ));
+            block_headers.insert(
+                first_addr,
+                format!("═══ Block 0 (entry) {}", "═".repeat(30)),
+            );
         }
 
         for (target_addr, edges) in &branch_targets {
-            if *target_addr == first_addr { continue; }
+            if *target_addr == first_addr {
+                continue;
+            }
 
             let block_idx = sorted_starts.iter().position(|a| *a == *target_addr);
-            let block_label = block_idx.map(|i| format!("Block {}", i)).unwrap_or_default();
+            let block_label = block_idx
+                .map(|i| format!("Block {}", i))
+                .unwrap_or_default();
 
             let mut header_parts: Vec<String> = Vec::new();
             let mut has_back_edge = false;
@@ -914,7 +1003,11 @@ impl CfgAnalysis {
                     "──── ↑ loop target ({}) {} (from 0x{:X})",
                     header_parts.first().unwrap_or(&String::new()),
                     "─".repeat(20),
-                    edges.iter().find(|e| e.is_back_edge).map(|e| e.from_addr).unwrap_or(0),
+                    edges
+                        .iter()
+                        .find(|e| e.is_back_edge)
+                        .map(|e| e.from_addr)
+                        .unwrap_or(0),
                 );
                 block_headers.insert(*target_addr, header);
             } else if header_parts.len() == 1 {
@@ -934,20 +1027,20 @@ impl CfgAnalysis {
                 );
                 block_headers.insert(*target_addr, header);
             } else {
-                let header = format!(
-                    "──── {} {}",
-                    block_label,
-                    "─".repeat(30),
-                );
+                let header = format!("──── {} {}", block_label, "─".repeat(30),);
                 block_headers.insert(*target_addr, header);
             }
         }
 
         for insn in instructions {
-            if !insn.is_branch || insn.is_call || insn.is_return { continue; }
+            if !insn.is_branch || insn.is_call || insn.is_return {
+                continue;
+            }
 
             if let Some(target) = insn.branch_target {
-                if !addr_set.contains(&target) { continue; }
+                if !addr_set.contains(&target) {
+                    continue;
+                }
 
                 let is_back_edge = target <= insn.address;
 
@@ -963,7 +1056,11 @@ impl CfgAnalysis {
 
             if insn.condition_code.is_some() && !insn.is_unconditional_branch {
                 let sep_addr = insn.address;
-                if insn.branch_target.map(|t| t > insn.address).unwrap_or(false) {
+                if insn
+                    .branch_target
+                    .map(|t| t > insn.address)
+                    .unwrap_or(false)
+                {
                     block_separators.insert(sep_addr, String::new());
                 }
             }
@@ -974,8 +1071,9 @@ impl CfgAnalysis {
         if blocks.len() > 1 && has_ret_in_last {
             for insn in instructions.iter().rev() {
                 if insn.is_return {
-                    if insn.address >= last_block_entry && !block_headers.contains_key(&insn.address) {
-                    }
+                    if insn.address >= last_block_entry
+                        && !block_headers.contains_key(&insn.address)
+                    {}
                     break;
                 }
             }
@@ -1008,7 +1106,10 @@ fn resolve_reg(reg: &str, reg_names: Option<&HashMap<String, String>>) -> String
     reg.to_string()
 }
 
-fn resolve_operands_with_names(operands: &str, reg_names: Option<&HashMap<String, String>>) -> String {
+fn resolve_operands_with_names(
+    operands: &str,
+    reg_names: Option<&HashMap<String, String>>,
+) -> String {
     let names = match reg_names {
         Some(n) if !n.is_empty() => n,
         _ => return operands.to_string(),
@@ -1185,42 +1286,82 @@ fn negate_operator(op: &str) -> &str {
     }
 }
 
-fn build_branch_label(insn: &DisassembledInstruction, cond: &str, reg_names: Option<&HashMap<String, String>>) -> String {
+fn build_branch_label(
+    insn: &DisassembledInstruction,
+    cond: &str,
+    reg_names: Option<&HashMap<String, String>>,
+) -> String {
     match insn.mnemonic.as_str() {
         "CBZ" => {
             let reg = insn.operands.split(',').next().unwrap_or("?").trim();
             let name = resolve_reg(reg, reg_names);
-            format!("if ({} == null) goto 0x{:08X}", name, insn.branch_target.unwrap_or(0))
+            format!(
+                "if ({} == null) goto 0x{:08X}",
+                name,
+                insn.branch_target.unwrap_or(0)
+            )
         }
         "CBNZ" => {
             let reg = insn.operands.split(',').next().unwrap_or("?").trim();
             let name = resolve_reg(reg, reg_names);
-            format!("if ({} != null) goto 0x{:08X}", name, insn.branch_target.unwrap_or(0))
+            format!(
+                "if ({} != null) goto 0x{:08X}",
+                name,
+                insn.branch_target.unwrap_or(0)
+            )
         }
         "TBZ" => {
             let parts: Vec<&str> = insn.operands.splitn(3, ',').collect();
             let reg = parts.first().map(|s| s.trim()).unwrap_or("?");
             let name = resolve_reg(reg, reg_names);
-            let bit = parts.get(1).map(|s| s.trim().trim_start_matches('#')).unwrap_or("0");
+            let bit = parts
+                .get(1)
+                .map(|s| s.trim().trim_start_matches('#'))
+                .unwrap_or("0");
             if bit == "0" {
-                format!("if (!{}.initialized) goto 0x{:08X}", name, insn.branch_target.unwrap_or(0))
+                format!(
+                    "if (!{}.initialized) goto 0x{:08X}",
+                    name,
+                    insn.branch_target.unwrap_or(0)
+                )
             } else {
-                format!("if (bit{} of {} == 0) goto 0x{:08X}", bit, name, insn.branch_target.unwrap_or(0))
+                format!(
+                    "if (bit{} of {} == 0) goto 0x{:08X}",
+                    bit,
+                    name,
+                    insn.branch_target.unwrap_or(0)
+                )
             }
         }
         "TBNZ" => {
             let parts: Vec<&str> = insn.operands.splitn(3, ',').collect();
             let reg = parts.first().map(|s| s.trim()).unwrap_or("?");
             let name = resolve_reg(reg, reg_names);
-            let bit = parts.get(1).map(|s| s.trim().trim_start_matches('#')).unwrap_or("0");
+            let bit = parts
+                .get(1)
+                .map(|s| s.trim().trim_start_matches('#'))
+                .unwrap_or("0");
             if bit == "0" {
-                format!("if ({}.initialized) goto 0x{:08X}", name, insn.branch_target.unwrap_or(0))
+                format!(
+                    "if ({}.initialized) goto 0x{:08X}",
+                    name,
+                    insn.branch_target.unwrap_or(0)
+                )
             } else {
-                format!("if (bit{} of {} != 0) goto 0x{:08X}", bit, name, insn.branch_target.unwrap_or(0))
+                format!(
+                    "if (bit{} of {} != 0) goto 0x{:08X}",
+                    bit,
+                    name,
+                    insn.branch_target.unwrap_or(0)
+                )
             }
         }
         _ => {
-            format!("if ({}) goto 0x{:08X}", cond, insn.branch_target.unwrap_or(0))
+            format!(
+                "if ({}) goto 0x{:08X}",
+                cond,
+                insn.branch_target.unwrap_or(0)
+            )
         }
     }
 }
@@ -1237,21 +1378,29 @@ fn extract_adrp_page(insn: &DisassembledInstruction) -> Option<u64> {
     let operands = &insn.operands;
     if let Some(dollar_pos) = operands.find("$+") {
         let after = &operands[dollar_pos + 2..];
-        let hex_str = after.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let hex_str = after
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
         if let Ok(offset) = u64::from_str_radix(hex_str, 16) {
             return Some(insn.address.wrapping_add(offset));
         }
     }
     if let Some(dollar_pos) = operands.find("$-") {
         let after = &operands[dollar_pos + 2..];
-        let hex_str = after.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let hex_str = after
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
         if let Ok(offset) = u64::from_str_radix(hex_str, 16) {
             return Some(insn.address.wrapping_sub(offset));
         }
     }
     if let Some(hash_pos) = operands.find("#0x") {
         let after = &operands[hash_pos + 3..];
-        let end = after.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(after.len());
+        let end = after
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(after.len());
         if let Ok(val) = u64::from_str_radix(&after[..end], 16) {
             return Some(val);
         }
@@ -1287,14 +1436,19 @@ fn compute_propagation(
     let mut call_arg_x0_va: HashMap<u64, u64> = HashMap::new();
     let mut call_arg_x1_va: HashMap<u64, u64> = HashMap::new();
 
-    let branch_targets: HashSet<u64> = instructions.iter()
+    let branch_targets: HashSet<u64> = instructions
+        .iter()
         .filter_map(|i| i.branch_target)
         .chain(instructions.iter().filter_map(|i| i.call_target))
         .collect();
 
     let internal_targets: HashSet<u64> = {
         let addr_set: HashSet<u64> = instructions.iter().map(|i| i.address).collect();
-        branch_targets.iter().filter(|a| addr_set.contains(a)).copied().collect()
+        branch_targets
+            .iter()
+            .filter(|a| addr_set.contains(a))
+            .copied()
+            .collect()
     };
 
     for insn in instructions {
@@ -1346,7 +1500,10 @@ fn compute_propagation(
                 | ConstantOp::MovReg { dest_reg, .. }
                 | ConstantOp::Adrp { dest_reg, .. }
                 | ConstantOp::Kill { dest_reg } => kill_load(dest_reg),
-                ConstantOp::KillPair { dest_reg1, dest_reg2 } => {
+                ConstantOp::KillPair {
+                    dest_reg1,
+                    dest_reg2,
+                } => {
                     kill_load(dest_reg1);
                     kill_load(dest_reg2);
                 }
@@ -1356,14 +1513,22 @@ fn compute_propagation(
                 ConstantOp::MovImm { dest_reg, value } => {
                     reg_state.insert(dest_reg, value);
                 }
-                ConstantOp::MovKeep { dest_reg, imm16, shift } => {
+                ConstantOp::MovKeep {
+                    dest_reg,
+                    imm16,
+                    shift,
+                } => {
                     if let Some(&current) = reg_state.get(&dest_reg) {
                         let mask = !(0xFFFFu64 << shift);
                         let new_val = (current & mask) | ((imm16 as u64) << shift);
                         reg_state.insert(dest_reg, new_val);
                     }
                 }
-                ConstantOp::AddSubImm { dest_reg, src_reg, imm } => {
+                ConstantOp::AddSubImm {
+                    dest_reg,
+                    src_reg,
+                    imm,
+                } => {
                     if let Some(&src_val) = reg_state.get(&src_reg) {
                         reg_state.insert(dest_reg, (src_val as i64 + imm) as u64);
                     } else {
@@ -1383,7 +1548,10 @@ fn compute_propagation(
                 ConstantOp::Kill { dest_reg } => {
                     reg_state.remove(&dest_reg);
                 }
-                ConstantOp::KillPair { dest_reg1, dest_reg2 } => {
+                ConstantOp::KillPair {
+                    dest_reg1,
+                    dest_reg2,
+                } => {
                     reg_state.remove(&dest_reg1);
                     reg_state.remove(&dest_reg2);
                 }
@@ -1462,10 +1630,21 @@ fn compute_propagation(
 
 #[derive(Debug, Clone, Copy)]
 pub enum SwitchAnnotation {
-    TableBase { table_va: u64 },
-    OffsetLoad { table_va: u64, index_reg: u16, shift: u8 },
-    TargetCompute { table_va: u64 },
-    Dispatch { table_va: u64, index_reg: u16 },
+    TableBase {
+        table_va: u64,
+    },
+    OffsetLoad {
+        table_va: u64,
+        index_reg: u16,
+        shift: u8,
+    },
+    TargetCompute {
+        table_va: u64,
+    },
+    Dispatch {
+        table_va: u64,
+        index_reg: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1487,19 +1666,24 @@ fn detect_switch_dispatches(
     }
 }
 
-fn detect_switch_arm64(
-    instructions: &[DisassembledInstruction],
-) -> HashMap<u64, SwitchAnnotation> {
+fn detect_switch_arm64(instructions: &[DisassembledInstruction]) -> HashMap<u64, SwitchAnnotation> {
     let mut out: HashMap<u64, SwitchAnnotation> = HashMap::new();
-    if instructions.is_empty() { return out; }
+    if instructions.is_empty() {
+        return out;
+    }
 
-    let branch_targets: HashSet<u64> = instructions.iter()
+    let branch_targets: HashSet<u64> = instructions
+        .iter()
         .filter_map(|i| i.branch_target)
         .chain(instructions.iter().filter_map(|i| i.call_target))
         .collect();
     let internal_targets: HashSet<u64> = {
         let addrs: HashSet<u64> = instructions.iter().map(|i| i.address).collect();
-        branch_targets.iter().filter(|a| addrs.contains(a)).copied().collect()
+        branch_targets
+            .iter()
+            .filter(|a| addrs.contains(a))
+            .copied()
+            .collect()
     };
 
     let mut state: HashMap<u16, SwOrigin> = HashMap::new();
@@ -1519,7 +1703,11 @@ fn detect_switch_arm64(
                     state.insert(dest_reg, SwOrigin::Page(page));
                     handled = true;
                 }
-                ConstantOp::AddSubImm { dest_reg, src_reg, imm } if imm >= 0 => {
+                ConstantOp::AddSubImm {
+                    dest_reg,
+                    src_reg,
+                    imm,
+                } if imm >= 0 => {
                     if let Some(&SwOrigin::Page(page)) = state.get(&src_reg) {
                         let table_va = page.wrapping_add(imm as u64);
                         state.insert(dest_reg, SwOrigin::TableBase(table_va));
@@ -1545,7 +1733,10 @@ fn detect_switch_arm64(
                     state.remove(&dest_reg);
                     handled = true;
                 }
-                ConstantOp::KillPair { dest_reg1, dest_reg2 } => {
+                ConstantOp::KillPair {
+                    dest_reg1,
+                    dest_reg2,
+                } => {
                     state.remove(&dest_reg1);
                     state.remove(&dest_reg2);
                     handled = true;
@@ -1558,22 +1749,38 @@ fn detect_switch_arm64(
                 if load_mnemonics.contains(&insn.mnemonic.as_str()) {
                     if let Some(&SwOrigin::TableBase(table_va)) = state.get(&rra.base_reg) {
                         if let Some(ref li) = insn.load_info {
-                            state.insert(li.dest_reg, SwOrigin::LoadedOffset {
-                                table_va,
-                                index_reg: rra.index_reg,
-                            });
-                            out.insert(insn.address, SwitchAnnotation::OffsetLoad {
-                                table_va, index_reg: rra.index_reg, shift: rra.shift,
-                            });
+                            state.insert(
+                                li.dest_reg,
+                                SwOrigin::LoadedOffset {
+                                    table_va,
+                                    index_reg: rra.index_reg,
+                                },
+                            );
+                            out.insert(
+                                insn.address,
+                                SwitchAnnotation::OffsetLoad {
+                                    table_va,
+                                    index_reg: rra.index_reg,
+                                    shift: rra.shift,
+                                },
+                            );
                             handled = true;
                         } else if let Some(dest) = parse_first_register(&insn.operands) {
-                            state.insert(dest, SwOrigin::LoadedOffset {
-                                table_va,
-                                index_reg: rra.index_reg,
-                            });
-                            out.insert(insn.address, SwitchAnnotation::OffsetLoad {
-                                table_va, index_reg: rra.index_reg, shift: rra.shift,
-                            });
+                            state.insert(
+                                dest,
+                                SwOrigin::LoadedOffset {
+                                    table_va,
+                                    index_reg: rra.index_reg,
+                                },
+                            );
+                            out.insert(
+                                insn.address,
+                                SwitchAnnotation::OffsetLoad {
+                                    table_va,
+                                    index_reg: rra.index_reg,
+                                    shift: rra.shift,
+                                },
+                            );
                             handled = true;
                         }
                     }
@@ -1589,7 +1796,12 @@ fn detect_switch_arm64(
                     if let Some(&SwOrigin::TableBase(va)) = state.get(s) {
                         table_va = Some(va);
                     }
-                    if let Some(&SwOrigin::LoadedOffset { table_va: lva, index_reg: ir, .. }) = state.get(s) {
+                    if let Some(&SwOrigin::LoadedOffset {
+                        table_va: lva,
+                        index_reg: ir,
+                        ..
+                    }) = state.get(s)
+                    {
                         if table_va == Some(lva) || table_va.is_none() {
                             table_va = Some(lva);
                             index_reg = Some(ir);
@@ -1597,8 +1809,17 @@ fn detect_switch_arm64(
                     }
                 }
                 if let (Some(va), Some(ir)) = (table_va, index_reg) {
-                    state.insert(dest, SwOrigin::Target { table_va: va, index_reg: ir });
-                    out.insert(insn.address, SwitchAnnotation::TargetCompute { table_va: va });
+                    state.insert(
+                        dest,
+                        SwOrigin::Target {
+                            table_va: va,
+                            index_reg: ir,
+                        },
+                    );
+                    out.insert(
+                        insn.address,
+                        SwitchAnnotation::TargetCompute { table_va: va },
+                    );
                     handled = true;
                 } else {
                     state.remove(&dest);
@@ -1609,15 +1830,27 @@ fn detect_switch_arm64(
 
         if insn.mnemonic == "BR" {
             if let Some(target_reg) = insn.indirect_call_reg {
-                if let Some(&SwOrigin::Target { table_va, index_reg }) = state.get(&target_reg) {
-                    out.insert(insn.address, SwitchAnnotation::Dispatch { table_va, index_reg });
+                if let Some(&SwOrigin::Target {
+                    table_va,
+                    index_reg,
+                }) = state.get(&target_reg)
+                {
+                    out.insert(
+                        insn.address,
+                        SwitchAnnotation::Dispatch {
+                            table_va,
+                            index_reg,
+                        },
+                    );
                 }
             }
             state.clear();
         }
 
         if insn.is_call {
-            for r in 0..=18u16 { state.remove(&r); }
+            for r in 0..=18u16 {
+                state.remove(&r);
+            }
             state.remove(&30);
         }
         let _ = handled;
@@ -1626,19 +1859,24 @@ fn detect_switch_arm64(
     out
 }
 
-fn detect_switch_x86(
-    instructions: &[DisassembledInstruction],
-) -> HashMap<u64, SwitchAnnotation> {
+fn detect_switch_x86(instructions: &[DisassembledInstruction]) -> HashMap<u64, SwitchAnnotation> {
     let mut out: HashMap<u64, SwitchAnnotation> = HashMap::new();
-    if instructions.is_empty() { return out; }
+    if instructions.is_empty() {
+        return out;
+    }
 
-    let branch_targets: HashSet<u64> = instructions.iter()
+    let branch_targets: HashSet<u64> = instructions
+        .iter()
         .filter_map(|i| i.branch_target)
         .chain(instructions.iter().filter_map(|i| i.call_target))
         .collect();
     let internal_targets: HashSet<u64> = {
         let addrs: HashSet<u64> = instructions.iter().map(|i| i.address).collect();
-        branch_targets.iter().filter(|a| addrs.contains(a)).copied().collect()
+        branch_targets
+            .iter()
+            .filter(|a| addrs.contains(a))
+            .copied()
+            .collect()
     };
 
     let mut state: HashMap<u16, SwOrigin> = HashMap::new();
@@ -1649,8 +1887,7 @@ fn detect_switch_x86(
         }
 
         let has_reg_reg = insn.reg_reg_access.is_some();
-        let is_load_mnem = matches!(insn.mnemonic.as_str(),
-            "MOV" | "MOVZX" | "MOVSX" | "MOVSXD");
+        let is_load_mnem = matches!(insn.mnemonic.as_str(), "MOV" | "MOVZX" | "MOVSX" | "MOVSXD");
 
         if let Some(ref op) = insn.constant_op {
             match *op {
@@ -1668,13 +1905,23 @@ fn detect_switch_x86(
                         state.remove(&dest_reg);
                     }
                 }
-                ConstantOp::AddSubImm { dest_reg, src_reg, imm: 0 } => {
+                ConstantOp::AddSubImm {
+                    dest_reg,
+                    src_reg,
+                    imm: 0,
+                } => {
                     let dest_origin = state.get(&dest_reg).copied();
                     let src_origin = state.get(&src_reg).copied();
                     let combined = x86_switch_combine(dest_origin, src_origin)
                         .or_else(|| x86_switch_combine(src_origin, dest_origin));
                     if let Some((table_va, index_reg)) = combined {
-                        state.insert(dest_reg, SwOrigin::Target { table_va, index_reg });
+                        state.insert(
+                            dest_reg,
+                            SwOrigin::Target {
+                                table_va,
+                                index_reg,
+                            },
+                        );
                         out.insert(insn.address, SwitchAnnotation::TargetCompute { table_va });
                     } else {
                         state.remove(&dest_reg);
@@ -1683,15 +1930,21 @@ fn detect_switch_x86(
                 ConstantOp::Kill { dest_reg } if has_reg_reg && is_load_mnem => {
                     if let Some(ref rra) = insn.reg_reg_access {
                         if let Some(&SwOrigin::TableBase(table_va)) = state.get(&rra.base_reg) {
-                            state.insert(dest_reg, SwOrigin::LoadedOffset {
-                                table_va,
-                                index_reg: rra.index_reg,
-                            });
-                            out.insert(insn.address, SwitchAnnotation::OffsetLoad {
-                                table_va,
-                                index_reg: rra.index_reg,
-                                shift: rra.shift,
-                            });
+                            state.insert(
+                                dest_reg,
+                                SwOrigin::LoadedOffset {
+                                    table_va,
+                                    index_reg: rra.index_reg,
+                                },
+                            );
+                            out.insert(
+                                insn.address,
+                                SwitchAnnotation::OffsetLoad {
+                                    table_va,
+                                    index_reg: rra.index_reg,
+                                    shift: rra.shift,
+                                },
+                            );
                         } else {
                             state.remove(&dest_reg);
                         }
@@ -1703,7 +1956,10 @@ fn detect_switch_x86(
                 | ConstantOp::AddSubImm { dest_reg, .. } => {
                     state.remove(&dest_reg);
                 }
-                ConstantOp::KillPair { dest_reg1, dest_reg2 } => {
+                ConstantOp::KillPair {
+                    dest_reg1,
+                    dest_reg2,
+                } => {
                     state.remove(&dest_reg1);
                     state.remove(&dest_reg2);
                 }
@@ -1713,22 +1969,44 @@ fn detect_switch_x86(
         if insn.is_unconditional_branch && !insn.is_call {
             if let Some(target_reg) = insn.indirect_call_reg {
                 match state.get(&target_reg).copied() {
-                    Some(SwOrigin::Target { table_va, index_reg })
-                    | Some(SwOrigin::LoadedOffset { table_va, index_reg }) => {
-                        out.insert(insn.address, SwitchAnnotation::Dispatch { table_va, index_reg });
+                    Some(SwOrigin::Target {
+                        table_va,
+                        index_reg,
+                    })
+                    | Some(SwOrigin::LoadedOffset {
+                        table_va,
+                        index_reg,
+                    }) => {
+                        out.insert(
+                            insn.address,
+                            SwitchAnnotation::Dispatch {
+                                table_va,
+                                index_reg,
+                            },
+                        );
                     }
                     _ => {}
                 }
             }
             if let Some(ref rra) = insn.reg_reg_access {
-                let table_va = state.get(&rra.base_reg)
-                    .and_then(|o| if let SwOrigin::TableBase(va) = *o { Some(va) } else { None })
+                let table_va = state
+                    .get(&rra.base_reg)
+                    .and_then(|o| {
+                        if let SwOrigin::TableBase(va) = *o {
+                            Some(va)
+                        } else {
+                            None
+                        }
+                    })
                     .or_else(|| insn.memory_offset.map(|d| d as u64));
                 if let Some(tva) = table_va {
-                    out.insert(insn.address, SwitchAnnotation::Dispatch {
-                        table_va: tva,
-                        index_reg: rra.index_reg,
-                    });
+                    out.insert(
+                        insn.address,
+                        SwitchAnnotation::Dispatch {
+                            table_va: tva,
+                            index_reg: rra.index_reg,
+                        },
+                    );
                 }
             }
             state.clear();
@@ -1744,8 +2022,13 @@ fn detect_switch_x86(
 
 fn x86_switch_combine(a: Option<SwOrigin>, b: Option<SwOrigin>) -> Option<(u64, u16)> {
     match (a, b) {
-        (Some(SwOrigin::TableBase(va)), Some(SwOrigin::LoadedOffset { table_va, index_reg }))
-            if va == table_va => Some((va, index_reg)),
+        (
+            Some(SwOrigin::TableBase(va)),
+            Some(SwOrigin::LoadedOffset {
+                table_va,
+                index_reg,
+            }),
+        ) if va == table_va => Some((va, index_reg)),
         _ => None,
     }
 }
@@ -1757,13 +2040,18 @@ fn detect_static_field_accesses(
 ) -> HashMap<u64, (u64, i64)> {
     let mut out: HashMap<u64, (u64, i64)> = HashMap::new();
 
-    let branch_targets: HashSet<u64> = instructions.iter()
+    let branch_targets: HashSet<u64> = instructions
+        .iter()
         .filter_map(|i| i.branch_target)
         .chain(instructions.iter().filter_map(|i| i.call_target))
         .collect();
     let internal_targets: HashSet<u64> = {
         let addrs: HashSet<u64> = instructions.iter().map(|i| i.address).collect();
-        branch_targets.iter().filter(|a| addrs.contains(a)).copied().collect()
+        branch_targets
+            .iter()
+            .filter(|a| addrs.contains(a))
+            .copied()
+            .collect()
     };
 
     let mut reg_state: HashMap<u16, u64> = HashMap::new();
@@ -1771,7 +2059,8 @@ fn detect_static_field_accesses(
     let mut reg_static_fields_for: HashMap<u16, u64> = HashMap::new();
 
     let is_typeinfo = |va: u64| -> bool {
-        global_annotations.get(&va)
+        global_annotations
+            .get(&va)
             .map(|a| matches!(a.kind, MetadataAnnotationKind::TypeInfo))
             .unwrap_or(false)
     };
@@ -1820,14 +2109,22 @@ fn detect_static_field_accesses(
                     reg_state.insert(dest_reg, value);
                     kill(dest_reg);
                 }
-                ConstantOp::MovKeep { dest_reg, imm16, shift } => {
+                ConstantOp::MovKeep {
+                    dest_reg,
+                    imm16,
+                    shift,
+                } => {
                     if let Some(&current) = reg_state.get(&dest_reg) {
                         let mask = !(0xFFFFu64 << shift);
                         reg_state.insert(dest_reg, (current & mask) | ((imm16 as u64) << shift));
                     }
                     kill(dest_reg);
                 }
-                ConstantOp::AddSubImm { dest_reg, src_reg, imm } => {
+                ConstantOp::AddSubImm {
+                    dest_reg,
+                    src_reg,
+                    imm,
+                } => {
                     if let Some(&src_val) = reg_state.get(&src_reg) {
                         reg_state.insert(dest_reg, (src_val as i64 + imm) as u64);
                     } else {
@@ -1860,7 +2157,10 @@ fn detect_static_field_accesses(
                     reg_state.remove(&dest_reg);
                     kill(dest_reg);
                 }
-                ConstantOp::KillPair { dest_reg1, dest_reg2 } => {
+                ConstantOp::KillPair {
+                    dest_reg1,
+                    dest_reg2,
+                } => {
                     reg_state.remove(&dest_reg1);
                     reg_state.remove(&dest_reg2);
                     kill(dest_reg1);
@@ -1891,7 +2191,9 @@ fn parse_first_register(operands: &str) -> Option<u16> {
 
 fn parse_add_three_regs(operands: &str) -> Option<(u16, Vec<u16>)> {
     let parts: Vec<&str> = operands.split(',').map(|s| s.trim()).collect();
-    if parts.len() < 3 { return None; }
+    if parts.len() < 3 {
+        return None;
+    }
     let dest = parse_arm64_reg(parts[0])?;
     let src1 = parse_arm64_reg(parts[1])?;
     let src2 = parse_arm64_reg(parts[2])?;
@@ -1899,9 +2201,16 @@ fn parse_add_three_regs(operands: &str) -> Option<(u16, Vec<u16>)> {
 }
 
 fn parse_arm64_reg(s: &str) -> Option<u16> {
-    let s = s.trim().trim_start_matches('[').trim_end_matches(']').trim_end_matches(',').trim();
+    let s = s
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches(',')
+        .trim();
     let s = s.trim_start_matches(|c: char| c == 'X' || c == 'x' || c == 'W' || c == 'w');
-    if s == "sp" || s == "SP" || s == "zr" || s == "ZR" { return Some(31); }
+    if s == "sp" || s == "SP" || s == "zr" || s == "ZR" {
+        return Some(31);
+    }
     s.parse::<u16>().ok()
 }
 
@@ -1969,7 +2278,10 @@ fn detect_init_check_arm64(
 
         let tbz_idx = match tbz_idx {
             Some(t) => t,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         let test_insn = &instructions[tbz_idx];
@@ -2006,7 +2318,10 @@ fn detect_init_check_arm64(
 
         let end_idx = match end_idx {
             Some(e) if has_runtime_call => e,
-            _ => { i += 1; continue; }
+            _ => {
+                i += 1;
+                continue;
+            }
         };
 
         out.range_starts.insert(insn.address);
@@ -2025,7 +2340,9 @@ fn detect_init_check_x86(
     rva_to_name: &HashMap<u64, String>,
 ) -> InitCheckRanges {
     let mut out = InitCheckRanges::default();
-    if instructions.len() < 4 { return out; }
+    if instructions.len() < 4 {
+        return out;
+    }
 
     let scan_limit = instructions.len().min(24);
     let mut i = 0;
@@ -2035,8 +2352,8 @@ fn detect_init_check_x86(
 
         let is_mem_load = insn.load_info.is_some()
             && matches!(insn.mnemonic.as_str(), "MOV" | "MOVZX" | "MOVSX" | "MOVSXD");
-        let is_cmp_test_mem = matches!(insn.mnemonic.as_str(), "CMP" | "TEST")
-            && insn.memory_offset.is_some();
+        let is_cmp_test_mem =
+            matches!(insn.mnemonic.as_str(), "CMP" | "TEST") && insn.memory_offset.is_some();
 
         if !is_mem_load && !is_cmp_test_mem {
             i += 1;
@@ -2053,9 +2370,17 @@ fn detect_init_check_x86(
                     found = Some(j);
                     break;
                 }
-                if instructions[j].is_branch || instructions[j].is_return { break; }
+                if instructions[j].is_branch || instructions[j].is_return {
+                    break;
+                }
             }
-            match found { Some(f) => f, None => { i += 1; continue; } }
+            match found {
+                Some(f) => f,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            }
         };
 
         let mut jcc_idx: Option<usize> = None;
@@ -2071,30 +2396,48 @@ fn detect_init_check_x86(
                     }
                 }
             }
-            if instructions[j].is_unconditional_branch || instructions[j].is_return { break; }
+            if instructions[j].is_unconditional_branch || instructions[j].is_return {
+                break;
+            }
         }
 
-        let jcc_idx = match jcc_idx { Some(j) => j, None => { i += 1; continue; } };
+        let jcc_idx = match jcc_idx {
+            Some(j) => j,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
         let target = instructions[jcc_idx].branch_target.unwrap();
 
         let mut end_idx: Option<usize> = None;
         let mut has_runtime_call = false;
         for j in (jcc_idx + 1)..instructions.len().min(jcc_idx + 20) {
             let cand = &instructions[j];
-            if cand.address >= target { end_idx = Some(j); break; }
+            if cand.address >= target {
+                end_idx = Some(j);
+                break;
+            }
             if cand.is_call {
                 if let Some(t) = cand.call_target {
-                    if !rva_to_name.contains_key(&t) { has_runtime_call = true; }
+                    if !rva_to_name.contains_key(&t) {
+                        has_runtime_call = true;
+                    }
                 } else {
                     has_runtime_call = true;
                 }
             }
-            if cand.is_return { break; }
+            if cand.is_return {
+                break;
+            }
         }
 
         let end_idx = match end_idx {
             Some(e) if has_runtime_call => e,
-            _ => { i += 1; continue; }
+            _ => {
+                i += 1;
+                continue;
+            }
         };
 
         out.range_starts.insert(instructions[start_idx].address);

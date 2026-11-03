@@ -1,6 +1,6 @@
 [package]
 name = "il2cpp_dumper"
-version = "8.0.0"
+version = "8.5.0"
 edition = "2024"
 authors = ["Rodroidmods"]
 license = "MIT"
